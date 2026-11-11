@@ -650,7 +650,14 @@ llama_context::llama_context(
 
         // the draft vocabulary subset belongs to this context; contexts that ask for the same N share one copy
         if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && params.mtp_draft_vocab > 0) {
-            mtp_draft = model.mtp_draft_vocab_get(params.mtp_draft_vocab);
+            const ggml_tensor * head = nullptr;
+            if (model.arch == LLM_ARCH_QWEN4EXP && model.hparams.n_layer_nextn == 1) {
+                // the draft block's own head, else its output, else the target's output (a shared sidecar)
+                head = model.layers[model.hparams.n_layer()].nextn.shared_head_head;
+                if (head == nullptr) { head = model.output; }
+                if (head == nullptr && cparams.ctx_other != nullptr) { head = llama_get_model(cparams.ctx_other)->output; }
+            }
+            mtp_draft = model.mtp_draft_vocab_get(params.mtp_draft_vocab, head);
             if (mtp_draft) {
                 cparams.mtp_draft_vocab = mtp_draft->n_keep;
             }

@@ -2778,15 +2778,17 @@ static bool mtp_draft_vocab_ids_follow_merge_order(const llama_vocab & vocab, st
     return true;
 }
 
-std::shared_ptr<const llama_mtp_draft_vocab> llama_model::mtp_draft_vocab_get(int32_t n_keep) const {
-    const ggml_tensor * out = output;
+std::shared_ptr<const llama_mtp_draft_vocab> llama_model::mtp_draft_vocab_get(int32_t n_keep, const ggml_tensor * head) const {
+    const ggml_tensor * out = head ? head : output;
     // probe contexts (common_fit_params) use a model with unallocated weights: no subset
     if (n_keep <= 0 || out == nullptr || out->buffer == nullptr || out->data == nullptr) {
         return nullptr;
     }
     // only the qwen35 and qwen35moe MTP graphs use the subset, and only when the MTP block scores with the model LM head
-    if ((arch != LLM_ARCH_QWEN35 && arch != LLM_ARCH_QWEN35MOE) || hparams.n_layer_nextn == 0 ||
-            layers[hparams.n_layer()].nextn.shared_head_head != nullptr) {
+    // qwen4exp (single MTP block): the caller passes the head the draft block scores with
+    const bool qwen4exp_ok = arch == LLM_ARCH_QWEN4EXP && hparams.n_layer_nextn == 1;
+    if (!qwen4exp_ok && ((arch != LLM_ARCH_QWEN35 && arch != LLM_ARCH_QWEN35MOE) || hparams.n_layer_nextn == 0 ||
+            layers[hparams.n_layer()].nextn.shared_head_head != nullptr)) {
         LLAMA_LOG_WARN("%s: mtp_draft_vocab = %d ignored: not supported for this model\n", __func__, n_keep);
         return nullptr;
     }
@@ -2806,7 +2808,10 @@ std::shared_ptr<const llama_mtp_draft_vocab> llama_model::mtp_draft_vocab_get(in
     }
     const auto key = std::make_pair(n_keep, buft);
     if (auto it = cache.find(key); it != cache.end()) {
-        return it->second.lock();
+        auto hit = it->second.lock();
+        if (hit && hit->src == out) {
+            return hit;
+        }
     }
 
     std::string why;
@@ -2839,6 +2844,7 @@ std::shared_ptr<const llama_mtp_draft_vocab> llama_model::mtp_draft_vocab_get(in
 
     auto res = std::make_shared<llama_mtp_draft_vocab>();
     res->n_keep = n_keep;
+    res->src    = out;
 
     ggml_init_params ip = { 2 * ggml_tensor_overhead(), nullptr, true };
     res->ctx.reset(ggml_init(ip));

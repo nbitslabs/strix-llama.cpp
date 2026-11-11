@@ -697,6 +697,7 @@ struct llama_mtp_draft_vocab {
 
     ggml_tensor * head = nullptr; // [n_embd, n_rows], same type as the LM head
     ggml_tensor * ids  = nullptr; // [n_rows] I64, token id of each row
+    const ggml_tensor * src = nullptr; // the LM head the rows were copied from (the graph applies the subset only to it)
 
     ggml_context_ptr        ctx;
     ggml_backend_buffer_ptr buf;
@@ -889,7 +890,9 @@ struct llama_model {
 
     // draft vocabulary subset for mtp_draft_vocab = n_keep, built on first request and freed with the last context
     // holding it; nullptr if the subset cannot be used with this model (thread-safe)
-    std::shared_ptr<const llama_mtp_draft_vocab> mtp_draft_vocab_get(int32_t n_keep) const;
+    // head: the LM head the draft scores with when it is not this model's own output (qwen4exp: the draft block's
+    // nextn.shared_head_head, or the target's output for a shared sidecar); nullptr = this model's output
+    std::shared_ptr<const llama_mtp_draft_vocab> mtp_draft_vocab_get(int32_t n_keep, const ggml_tensor * head = nullptr) const;
 
     float get_rope_freq_base (const llama_cparams & cparams, int il) const;
     float get_rope_freq_scale(const llama_cparams & cparams, int il) const;
