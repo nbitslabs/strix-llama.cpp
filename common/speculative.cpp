@@ -1750,10 +1750,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         llama_batch_ext * resident_batch = nullptr;
 
         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
+        // --spec-draft-mtp-prefill-window: a prefill batch longer than the window feeds the head only its tail.
+        // Positions keep their values, so the draft attends over a gap; verification is exact, so only acceptance moves.
+        const int32_t win = params.mtp_prefill_window;
+        const int32_t k0  = (!is_mem_shared && !chain_heads && n_seq == 1 && win > 0 && n_tokens > win) ? n_tokens - win : 0;
+
         if (!is_mem_shared) {
             batch.clear();
 
-            for (int k = 0; k < n_tokens; ++k) {
+            for (int k = k0; k < n_tokens; ++k) {
                 const auto & t = batch_in.tokens[k];
                 if (t.id != LLAMA_TOKEN_NULL) {
                     batch.add(t.id, t.pos[0], t.seq_id, false);
@@ -1761,7 +1766,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     batch.add_embd(t.embd, t.pos.data(), t.seq_id, false);
                 }
             }
-            if (n_seq == 1 && !chain_heads) {
+            if (n_seq == 1 && !chain_heads && k0 == 0) {
                 resident_batch = batch.get();
                 resident_input = llama_nextn_resident_prepare(ctx_tgt, resident_batch, pending_h[0].data());
             }
@@ -1774,14 +1779,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             // TODO:this is generally true, but would be nice to assert it
             const float * h_tgt = resident_input ? nullptr : llama_get_embeddings_nextn(ctx_tgt);
 
-            for (int k = 0; !resident_input && k < n_tokens; ++k) {
+            for (int k = k0; !resident_input && k < n_tokens; ++k) {
                 const llama_seq_id seq_id = batch_in.tokens[k].seq_id;
 
                 const float * h_row = k == i_batch_beg[seq_id]
                     ? pending_h[seq_id].data()
                     : h_tgt + (size_t) (k - 1) * n_embd;
 
-                batch.set_embd_state(k, { h_row, 1, (size_t) n_embd });
+                batch.set_embd_state(k - k0, { h_row, 1, (size_t) n_embd });
             }
 
             auto * mem_dft = llama_get_memory(ctx_dft);

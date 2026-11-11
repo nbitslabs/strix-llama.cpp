@@ -384,6 +384,9 @@ struct common_params_speculative_draft {
     // probabilities below this (0 = off); the first draft token is always kept. Width-only: the emitted stream is unchanged
     // (hi5/ITEM7-DRAFT-POLICY.md section 1) when the verify batch computes each row as the one-row decode does.
     float mtp_pcum = 0.0f;
+    // MTP: during prefill, catch the draft head up only on the last N tokens of each batch (0 = all tokens).
+    // Lossless for the output (verification is exact); trades a little draft acceptance for no prefill tax.
+    int32_t mtp_prefill_window = 0;
 
     common_cpu_params cpuparams;
     common_cpu_params cpuparams_batch;

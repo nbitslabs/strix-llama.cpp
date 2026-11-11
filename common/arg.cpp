@@ -4421,6 +4421,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_MTP_PCUM"));
     add_opt(common_arg(
+        {"--spec-draft-mtp-prefill-window"}, "N",
+        string_format("MTP: during prefill run the draft head only over the last N tokens of each batch; the output is unchanged, only draft acceptance can drop (0 = every token, default: %d)", params.speculative.draft.mtp_prefill_window),
+        [](common_params & params, int value) {
+            params.speculative.draft.mtp_prefill_window = std::max(0, value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_MTP_PREFILL_WINDOW"));
+    add_opt(common_arg(
         {"--spec-draft-backend-sampling"},
         {"--no-spec-draft-backend-sampling"},
         string_format("offload draft sampling to the backend (default: %s)",
