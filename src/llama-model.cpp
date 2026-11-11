@@ -2044,9 +2044,8 @@ static bool llama_dense_shadow_eligible(const std::string & name, const ggml_ten
             (need_data && t->data == nullptr) || t->ne[0] % 32 != 0 || t->nb[1] != ggml_row_size(t->type, t->ne[0])) {
         return false;
     }
-    if (ggml_backend_buffer_is_host(t->buffer)) {
-        return false;
-    }
+    // device type, not ggml_backend_buffer_is_host: unified-memory GPU buffers (HIP UMA) report host and must stay eligible;
+    // CPU and CPU-repack buffer types belong to the CPU device and are excluded here
     ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(t->buffer));
     return dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU;
 }
