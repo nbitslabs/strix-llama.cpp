@@ -503,7 +503,10 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
         auto * inp_hyb = build_inp_mem_hybrid();
         const auto * m = static_cast<const llama_memory_hybrid_idx_context *>(inp_hyb->mctx);
         if (m->get_idx() != nullptr && layer.index_q_proj && layer.index_k_proj && layer.index_q_norm && layer.index_k_norm) {
-            mctx_hyb = m;
+            // LLAMA_MTP_DENSE_ATTN=1 (ablation): the draft block attends to every cached key instead of the indexer's
+            // selection, through the same hybrid memory's attention cache
+            static const bool dense = [] { const char * e = getenv("LLAMA_MTP_DENSE_ATTN"); return e && atoi(e) != 0; }();
+            mctx_hyb = dense ? nullptr : m;
             inp_attn = inp_hyb->get_attn();
         }
     }
