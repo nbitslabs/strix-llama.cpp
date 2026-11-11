@@ -1,4 +1,5 @@
 #include "llama-batch.h"
+#include "llama-graph.h"
 
 #include "llama-impl.h"
 #include "llama-vocab.h"
@@ -821,6 +822,22 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
         }
 
         n_seqs = n_keep;
+    }
+
+    // [TAG_RECURRENT_ROLLBACK_SPLITS] tail cut: a single sequence that finishes in this ubatch with a long head hands its
+    //   last n_keep_tail tokens back, so they form their own ubatch and the long one needs no rollback snapshots
+    //   (llm_graph_context::rs_bulk_ubatch() relies on exactly this condition)
+    if (n_keep_tail > 0 && n_seqs == 1 && llama_rs_tail_cut_enabled()) {
+        auto & idxs0 = idxs_per_seq[0];
+        const bool finishes = cur_idx[0] >= (int32_t) seq_set_map[cur_seq_set[0]].size();
+        if (finishes && idxs0.size() >= n_keep_tail + LLAMA_RS_TAIL_MIN_HEAD) {
+            for (uint32_t i = 0; i < n_keep_tail; ++i) {
+                used[idxs0.back()] = false;
+                --n_used;
+                idxs0.pop_back();
+                --cur_idx[0];
+            }
+        }
     }
 
     // concat the per-sequence-set lists

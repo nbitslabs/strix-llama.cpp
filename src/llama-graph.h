@@ -1062,6 +1062,16 @@ struct llm_graph_qkv {
     ggml_tensor * v; // [n_embd_head, n_head_kv, n_tokens]
 };
 
+// [TAG_RECURRENT_ROLLBACK_SPLITS] tail cut (LLAMA_RS_TAIL_CUT, default on): with rollback snapshots on, split_equal()
+// hands the last (n_rs_seq + 1) tokens of a sequence that finishes in a long ubatch back as their own ubatch, so a
+// single-sequence ubatch of at least n_rs_seq + 1 + LLAMA_RS_TAIL_MIN_HEAD tokens is never a sequence tail and needs no
+// snapshots: it takes the plain recurrent path (chunked GDN kernels and their fusions).
+static constexpr uint32_t LLAMA_RS_TAIL_MIN_HEAD = 256;
+inline bool llama_rs_tail_cut_enabled() {
+    static const bool v = [] { const char * e = getenv("LLAMA_RS_TAIL_CUT"); return e == nullptr || atoi(e) != 0; }();
+    return v;
+}
+
 struct llm_graph_context {
     const llm_arch arch;
 
@@ -1129,6 +1139,13 @@ struct llm_graph_context {
     ggml_cgraph  * gf   = nullptr;
 
     llm_graph_context(const llm_graph_params & params);
+
+    // a ubatch that rollback can never reach (see llama_rs_tail_cut_enabled): skip the snapshot slots
+    bool rs_bulk_ubatch() const {
+        const uint32_t K = cparams.n_rs_seq + 1;
+        return cparams.n_rs_seq > 0 && llama_rs_tail_cut_enabled() && ubatch.n_seqs == 1 &&
+               ubatch.n_seq_tokens >= K + LLAMA_RS_TAIL_MIN_HEAD;
+    }
     virtual ~llm_graph_context() = default;
 
     void cb(ggml_tensor * cur, const char * name, int il) const;
