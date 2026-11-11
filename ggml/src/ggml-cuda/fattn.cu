@@ -801,6 +801,7 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 #if defined(GGML_USE_HIP) && defined(RDNA3_5)
 #define FA7_ENABLED 1
 #endif
+#if defined(GGML_USE_HIP)
 namespace fa7 {
 constexpr int HQ = 24, HKV = 2, D = 256, G = HQ / HKV;
 constexpr int NH = 1, NK = 32, PD = 1;
@@ -1049,6 +1050,7 @@ __global__ void pack_kv(const _Float16 * __restrict__ K, const _Float16 * __rest
 #endif
 }
 } // namespace fa7
+#endif
 
 static bool ggml_cuda_fa7_supported(const ggml_backend_cuda_context & ctx, const ggml_tensor * dst) {
 #if defined(GGML_USE_HIP)
@@ -1106,6 +1108,7 @@ bool ggml_cuda_fa7_gate_ok(const ggml_backend_cuda_context & ctx, const ggml_ten
 
 void ggml_cuda_fa7_gated(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_tensor * gate, float * out32,
         uint16_t * dst16, bool dst16_f16) {
+#if defined(GGML_USE_HIP)
     ggml_cuda_set_device(ctx.device);
     const ggml_tensor * Q = dst->src[0], * K = dst->src[1], * V = dst->src[2];
     cudaStream_t stream = ctx.stream();
@@ -1122,8 +1125,14 @@ void ggml_cuda_fa7_gated(ggml_backend_cuda_context & ctx, ggml_tensor * dst, con
     fa7::fa_kernel<true><<<grid, fa7::NTH, 0, stream>>>((const float *) Q->data, Kp.get(), Vp.get(), out32, scale_log2, T, Q->nb[1] / 4, Q->nb[2] / 4,
         (const float *) gate->data, gate->nb[2] / 4, gate->nb[1] / 4, dst16, dst16_f16);
     CUDA_CHECK(cudaGetLastError());
+#else
+    GGML_UNUSED(ctx); GGML_UNUSED(dst); GGML_UNUSED(gate); GGML_UNUSED(out32);
+    GGML_UNUSED(dst16); GGML_UNUSED(dst16_f16);
+    GGML_ABORT("fa7 requires HIP");
+#endif
 }
 
+#if defined(GGML_USE_HIP)
 static void ggml_cuda_fa7(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * Q = dst->src[0], * K = dst->src[1], * V = dst->src[2];
     cudaStream_t stream = ctx.stream();
@@ -1145,6 +1154,7 @@ static void ggml_cuda_fa7(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     }
     CUDA_CHECK(cudaGetLastError());
 }
+#endif
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);

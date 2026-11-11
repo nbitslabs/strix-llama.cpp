@@ -1884,7 +1884,13 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
 
     static const bool env_pdl_enabled = []() {
         const char * env = getenv("GGML_CUDA_PDL");
+#if defined(GGML_USE_HIP)
         return env == nullptr || std::atoi(env) != 0;
+#else
+        // Fork kernels do not all implement PDL input synchronization. Default PDL corrupts
+        // Qwen3.8 output on GB10/CUDA 13; keep it opt-in until those kernels are audited.
+        return env != nullptr && std::atoi(env) != 0;
+#endif
     }();
 
     if (env_pdl_enabled && ggml_cuda_kernel_can_use_pdl(reinterpret_cast<const void *>(kernel))) {

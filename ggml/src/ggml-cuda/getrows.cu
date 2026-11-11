@@ -43,7 +43,42 @@ static __global__ void k_get_rows(
     }
 }
 
+#if !defined(GGML_USE_HIP)
+// Keep overloaded function pointers out of CUDA 13's kernel host stubs.
+#define DEFINE_GET_ROWS_DEQUANTIZER(name) \
+    template<typename dst_t> struct name##_op { \
+        static __device__ __forceinline__ void apply(const void * x, int64_t ib, dst_t * y, int tid) { \
+            name<dst_t>(x, ib, y, tid); \
+        } \
+    };
+DEFINE_GET_ROWS_DEQUANTIZER(dequantize_q2_K)
+DEFINE_GET_ROWS_DEQUANTIZER(dequantize_q3_K)
+DEFINE_GET_ROWS_DEQUANTIZER(dequantize_q4_K)
+DEFINE_GET_ROWS_DEQUANTIZER(dequantize_q5_K)
+DEFINE_GET_ROWS_DEQUANTIZER(dequantize_q6_K)
+DEFINE_GET_ROWS_DEQUANTIZER(dequantize_iq2_xxs)
+DEFINE_GET_ROWS_DEQUANTIZER(dequantize_iq2_xs)
+DEFINE_GET_ROWS_DEQUANTIZER(dequantize_iq2_s)
+DEFINE_GET_ROWS_DEQUANTIZER(dequantize_iq3_xxs)
+DEFINE_GET_ROWS_DEQUANTIZER(dequantize_iq3_s)
+DEFINE_GET_ROWS_DEQUANTIZER(dequantize_iq1_s)
+DEFINE_GET_ROWS_DEQUANTIZER(dequantize_iq1_m)
+DEFINE_GET_ROWS_DEQUANTIZER(dequantize_iq4_nl)
+DEFINE_GET_ROWS_DEQUANTIZER(dequantize_iq4_xs)
+DEFINE_GET_ROWS_DEQUANTIZER(dequantize_mxfp4)
+DEFINE_GET_ROWS_DEQUANTIZER(dequantize_rocmfp4)
+DEFINE_GET_ROWS_DEQUANTIZER(dequantize_rocmfp4_fast)
+#undef DEFINE_GET_ROWS_DEQUANTIZER
+#define GET_ROWS_DEQUANTIZER(name) name##_op<dst_t>
+#else
+#define GET_ROWS_DEQUANTIZER(name) name<dst_t>
+#endif
+
+#if defined(GGML_USE_HIP)
 template<typename dst_t, dequantize_kq_t<dst_t> dequantize_kq>
+#else
+template<typename dst_t, typename dequantizer>
+#endif
 static __global__ void k_get_rows_kq(
         const void * __restrict__ src0, const int32_t * __restrict__ src1, dst_t * __restrict__ dst,
         const int64_t ne00, /*const int64_t ne01, const int64_t ne02, const int64_t ne03,*/
@@ -67,7 +102,11 @@ static __global__ void k_get_rows_kq(
         const void * src0_row = (const char *) src0 + i01*nb01 + i11*nb02 + i12*nb03;
 
         for (int64_t ib = blockIdx.y; ib < nsb; ib += gridDim.y) {
+#if defined(GGML_USE_HIP)
             dequantize_kq(src0_row, ib, dst_row + ib*QK_K, threadIdx.x);
+#else
+            dequantizer::apply(src0_row, ib, dst_row + ib*QK_K, threadIdx.x);
+#endif
         }
     }
 }
@@ -228,7 +267,11 @@ static void get_rows_cuda_q(
         s10, s11, s12/*, s13*/);
 }
 
+#if defined(GGML_USE_HIP)
 template<int block_dim, typename dst_t, dequantize_kq_t<dst_t> dequantize_kq>
+#else
+template<int block_dim, typename dst_t, typename dequantizer>
+#endif
 static void get_rows_cuda_kq(
         const void * src0_d, const int32_t * src1_d, dst_t * dst_d,
         const int64_t ne00, const size_t nb01, const size_t nb02, const size_t nb03,
@@ -256,7 +299,11 @@ static void get_rows_cuda_kq(
     GGML_ASSERT(ne11 <= std::numeric_limits<uint32_t>::max() / ne12);
     const uint3 ne12_fdv = init_fastdiv_values(ne12);
 
+#if defined(GGML_USE_HIP)
     k_get_rows_kq<dst_t, dequantize_kq><<<block_nums, block_dims, 0, stream>>>(
+#else
+    k_get_rows_kq<dst_t, dequantizer><<<block_nums, block_dims, 0, stream>>>(
+#endif
         src0_d, src1_d, dst_d,
         ne00, /*ne01, ne02, ne03,*/
         /*ne10,*/ ne11, ne12_fdv, /*ne13,*/
@@ -489,71 +536,71 @@ static void ggml_cuda_get_rows_switch_src0_type(
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_Q2_K:
-            get_rows_cuda_kq<64, dst_t, dequantize_q2_K<dst_t>>(src0_d, src1_d, dst_d,
+            get_rows_cuda_kq<64, dst_t, GET_ROWS_DEQUANTIZER(dequantize_q2_K)>(src0_d, src1_d, dst_d,
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_Q3_K:
-            get_rows_cuda_kq<64, dst_t, dequantize_q3_K<dst_t>>(src0_d, src1_d, dst_d,
+            get_rows_cuda_kq<64, dst_t, GET_ROWS_DEQUANTIZER(dequantize_q3_K)>(src0_d, src1_d, dst_d,
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_Q4_K:
-            get_rows_cuda_kq<32, dst_t, dequantize_q4_K<dst_t>>(src0_d, src1_d, dst_d,
+            get_rows_cuda_kq<32, dst_t, GET_ROWS_DEQUANTIZER(dequantize_q4_K)>(src0_d, src1_d, dst_d,
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_Q5_K:
-            get_rows_cuda_kq<64, dst_t, dequantize_q5_K<dst_t>>(src0_d, src1_d, dst_d,
+            get_rows_cuda_kq<64, dst_t, GET_ROWS_DEQUANTIZER(dequantize_q5_K)>(src0_d, src1_d, dst_d,
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_Q6_K:
-            get_rows_cuda_kq<64, dst_t, dequantize_q6_K<dst_t>>(src0_d, src1_d, dst_d,
+            get_rows_cuda_kq<64, dst_t, GET_ROWS_DEQUANTIZER(dequantize_q6_K)>(src0_d, src1_d, dst_d,
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_IQ2_XXS:
-            get_rows_cuda_kq<32, dst_t, dequantize_iq2_xxs<dst_t>>(src0_d, src1_d, dst_d,
+            get_rows_cuda_kq<32, dst_t, GET_ROWS_DEQUANTIZER(dequantize_iq2_xxs)>(src0_d, src1_d, dst_d,
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_IQ2_XS:
-            get_rows_cuda_kq<32, dst_t, dequantize_iq2_xs<dst_t>>(src0_d, src1_d, dst_d,
+            get_rows_cuda_kq<32, dst_t, GET_ROWS_DEQUANTIZER(dequantize_iq2_xs)>(src0_d, src1_d, dst_d,
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_IQ2_S:
-            get_rows_cuda_kq<32, dst_t, dequantize_iq2_s<dst_t>>(src0_d, src1_d, dst_d,
+            get_rows_cuda_kq<32, dst_t, GET_ROWS_DEQUANTIZER(dequantize_iq2_s)>(src0_d, src1_d, dst_d,
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_IQ3_XXS:
-            get_rows_cuda_kq<32, dst_t, dequantize_iq3_xxs<dst_t>>(src0_d, src1_d, dst_d,
+            get_rows_cuda_kq<32, dst_t, GET_ROWS_DEQUANTIZER(dequantize_iq3_xxs)>(src0_d, src1_d, dst_d,
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_IQ3_S:
-            get_rows_cuda_kq<32, dst_t, dequantize_iq3_s<dst_t>>(src0_d, src1_d, dst_d,
+            get_rows_cuda_kq<32, dst_t, GET_ROWS_DEQUANTIZER(dequantize_iq3_s)>(src0_d, src1_d, dst_d,
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_IQ1_S:
-            get_rows_cuda_kq<32, dst_t, dequantize_iq1_s<dst_t>>(src0_d, src1_d, dst_d,
+            get_rows_cuda_kq<32, dst_t, GET_ROWS_DEQUANTIZER(dequantize_iq1_s)>(src0_d, src1_d, dst_d,
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_IQ1_M:
-            get_rows_cuda_kq<32, dst_t, dequantize_iq1_m<dst_t>>(src0_d, src1_d, dst_d,
+            get_rows_cuda_kq<32, dst_t, GET_ROWS_DEQUANTIZER(dequantize_iq1_m)>(src0_d, src1_d, dst_d,
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_IQ4_NL:
-            get_rows_cuda_kq<32, dst_t, dequantize_iq4_nl<dst_t>>(src0_d, src1_d, dst_d,
+            get_rows_cuda_kq<32, dst_t, GET_ROWS_DEQUANTIZER(dequantize_iq4_nl)>(src0_d, src1_d, dst_d,
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_IQ4_XS:
-            get_rows_cuda_kq<32, dst_t, dequantize_iq4_xs<dst_t>>(src0_d, src1_d, dst_d,
+            get_rows_cuda_kq<32, dst_t, GET_ROWS_DEQUANTIZER(dequantize_iq4_xs)>(src0_d, src1_d, dst_d,
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_MXFP4:
-            get_rows_cuda_kq<32, dst_t, dequantize_mxfp4<dst_t>>(src0_d, src1_d, dst_d,
+            get_rows_cuda_kq<32, dst_t, GET_ROWS_DEQUANTIZER(dequantize_mxfp4)>(src0_d, src1_d, dst_d,
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_Q4_0_ROCMFP4:
-            get_rows_cuda_kq<32, dst_t, dequantize_rocmfp4<dst_t>>(src0_d, src1_d, dst_d,
+            get_rows_cuda_kq<32, dst_t, GET_ROWS_DEQUANTIZER(dequantize_rocmfp4)>(src0_d, src1_d, dst_d,
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_Q4_0_ROCMFP4_FAST:
-            get_rows_cuda_kq<32, dst_t, dequantize_rocmfp4_fast<dst_t>>(src0_d, src1_d, dst_d,
+            get_rows_cuda_kq<32, dst_t, GET_ROWS_DEQUANTIZER(dequantize_rocmfp4_fast)>(src0_d, src1_d, dst_d,
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
 #ifdef GGML_USE_TRELLIS

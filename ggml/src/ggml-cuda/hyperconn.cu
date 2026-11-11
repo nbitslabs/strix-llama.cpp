@@ -4,6 +4,12 @@
 #include "convert.cuh"
 #include "mmb.cuh"
 #include "ggml-backend-impl.h"
+#if defined(GGML_USE_HIP)
+#define hc_shfl_xor(x, off) __shfl_xor(x, off)
+#else
+#define hc_shfl_xor(x, off) __shfl_xor_sync(0xffffffff, x, off)
+#endif
+
 
 // Explicitly rounded mul/add: keeps the fused kernels from being contracted into FMAs so that
 // the results match the separate MUL and ADD kernels of the unfused graph bit for bit.
@@ -482,7 +488,7 @@ static __device__ __forceinline__ void hc_combine_norm_row_b256(
                 // per-32-element-block absmax over the 16-lane group (j = col/2), then the int8 codes and scale
                 float amax = fmaxf(fabsf(v0), fabsf(v1));
 #pragma unroll
-                for (int off = 1; off < 16; off <<= 1) amax = fmaxf(amax, __shfl_xor(amax, off));
+                for (int off = 1; off < 16; off <<= 1) amax = fmaxf(amax, hc_shfl_xor(amax, off));
                 const float d = amax / 127.0f;
                 const float id = d > 0.0f ? 1.0f / d : 0.0f;
                 const int j = col >> 1;
@@ -772,8 +778,8 @@ static __global__ void __launch_bounds__(1024) hc_combine_norm_inject_v2(
             float amax = 0.0f;
 #pragma unroll
             for (int q = 0; q < NC; ++q) amax = fmaxf(amax, fabsf(v[q]));
-            amax = fmaxf(amax, __shfl_xor(amax, 1));
-            amax = fmaxf(amax, __shfl_xor(amax, 2));
+            amax = fmaxf(amax, hc_shfl_xor(amax, 1));
+            amax = fmaxf(amax, hc_shfl_xor(amax, 2));
             const float d  = amax / 127.0f;
             const float id = d > 0.0f ? 1.0f / d : 0.0f;
             const int kb = c * q8_blocks + (e0 >> 5);

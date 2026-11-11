@@ -1,5 +1,8 @@
 #include <functional>
 #include "mmb.cuh"
+
+// RDNA WMMA kernels have no CUDA implementation.
+#if defined(GGML_USE_HIP)
 #include "unary.cuh"
 #include <unordered_map>
 #include <map>
@@ -4298,3 +4301,57 @@ void ggml_cuda_mmb_dense_r2_prepare(ggml_backend_cuda_context & ctx, const ggml_
     g_dq_packed[key] = bytes;
     g_dq_count.store((int) g_dq_packed.size());
 }
+
+#else
+
+bool ggml_cuda_mmb_supported_mm (ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *, const ggml_tensor *) { return false; }
+bool ggml_cuda_mmb_supported_mmid(ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *, const ggml_tensor *, const ggml_tensor *) { return false; }
+void ggml_cuda_mul_mat_mmb (ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *, ggml_tensor *) { GGML_ABORT("MMB requires HIP"); }
+bool ggml_cuda_mmb_idx_score_supported(ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *, const ggml_tensor *, int) { return false; }
+void ggml_cuda_mmb_idx_score(ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *, ggml_tensor *, const int32_t *, const int32_t *) { GGML_ABORT("MMB requires HIP"); }
+void ggml_cuda_mul_mat_id_mmb(ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *, const ggml_tensor *, ggml_tensor *) { GGML_ABORT("MMB requires HIP"); }
+void ggml_cuda_mmb_begin_graph(ggml_backend_cuda_context &) {}
+uint16_t * ggml_cuda_mmb_cache_produce(ggml_backend_cuda_context &, const ggml_tensor *, size_t, bool) { return nullptr; }
+uint16_t * ggml_cuda_mmb_cache_reserve(ggml_backend_cuda_context &, const ggml_tensor *, size_t) { return nullptr; }
+uint16_t * ggml_cuda_mmb_blas_f16_reserve(ggml_backend_cuda_context &, const ggml_tensor *, size_t) { return nullptr; }
+const uint16_t * ggml_cuda_mmb_blas_f16_lookup(ggml_backend_cuda_context &, const ggml_tensor *) { return nullptr; }
+const uint16_t * ggml_cuda_mmb_cache_lookup(ggml_backend_cuda_context &, const ggml_tensor *) { return nullptr; }
+void ggml_cuda_mmb_cache_unproduce(ggml_backend_cuda_context &, const uint16_t *) {}
+uint16_t * ggml_cuda_mmb_slot_reserve(ggml_backend_cuda_context &, int, const ggml_tensor *, size_t, bool) { return nullptr; }
+uint8_t * ggml_cuda_mmb_xnq8_buf(ggml_backend_cuda_context &, const ggml_tensor *, size_t, size_t) { return nullptr; }
+float * ggml_cuda_mmb_xnq8_scale(ggml_backend_cuda_context &) { return nullptr; }
+const uint8_t * ggml_cuda_mmb_xnq8_get(ggml_backend_cuda_context &, const ggml_tensor *, const float ** , int *) { return nullptr; }
+void ggml_cuda_mmb_xnq8_set_layout(ggml_backend_cuda_context &, int) {}
+void ggml_cuda_mmb_marks_clear(ggml_backend_cuda_context &) {}
+size_t ggml_cuda_mmb_marks_count(ggml_backend_cuda_context &) { return 0; }
+void ggml_cuda_mmb_mark_bf16_only(ggml_backend_cuda_context &, const ggml_tensor *) {}
+bool ggml_cuda_mmb_is_bf16_only(ggml_backend_cuda_context &, const ggml_tensor *) { return false; }
+void ggml_cuda_mmb_mark_f16(ggml_backend_cuda_context &, const ggml_tensor *, int) {}
+int ggml_cuda_mmb_f16_marks(ggml_backend_cuda_context &, const ggml_tensor *) { return 0; }
+int ggml_cuda_mmb_f16_reader(ggml_backend_cuda_context &, const ggml_tensor *) { return 0; }
+bool ggml_cuda_mmb_gatemix() { return false; }
+bool ggml_cuda_mmb_f32_dual(ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *, const ggml_tensor *, ggml_tensor *, ggml_tensor *) { return false; }
+bool ggml_cuda_mmb_down16() { return false; }
+bool ggml_cuda_mmb_res16() { return false; }
+bool ggml_cuda_mmb_blk16() { return false; }
+bool ggml_cuda_hc_gate_mix_supported(ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *, const ggml_tensor *, const ggml_tensor *, int) { return false; }
+bool ggml_cuda_hc_gate_mix(ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *, const ggml_tensor *, ggml_tensor *, int, float, float) { return false; }
+bool ggml_cuda_mmb_supported_glu(ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *, const ggml_tensor *, const ggml_tensor *, const ggml_tensor *) { return false; }
+void ggml_cuda_mul_mat_id_mmb_glu(ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *, const ggml_tensor *, const ggml_tensor *, ggml_tensor *) { GGML_ABORT("MMB requires HIP"); }
+void ggml_cuda_mmb_shadow_prepare(ggml_backend_cuda_context &, const ggml_tensor *) {}
+void ggml_cuda_mmb_down_r2_prepare(ggml_backend_cuda_context &, const ggml_tensor *) {}
+bool ggml_cuda_mmb_r2_packed(const ggml_tensor *) { return false; }
+void ggml_cuda_mmb_r2_forget(const void *, size_t) {}
+const char * ggml_cuda_mmb_r2_layout(const void *, size_t) { return nullptr; }
+void ggml_cuda_mul_mat_id_r2_gemv(ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *, const ggml_tensor *, ggml_tensor *) { GGML_ABORT("MMB requires HIP"); }
+bool ggml_cuda_mmb_g2_packed(const ggml_tensor *) { return false; }
+void ggml_cuda_mmb_glu_r2_prepare(ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *) {}
+void ggml_cuda_mul_mat_id_g2_gemv(ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *, const ggml_tensor *, ggml_tensor *) { GGML_ABORT("MMB requires HIP"); }
+bool ggml_cuda_mmb_g2_glu_gemv_ok(const ggml_tensor *, const ggml_tensor *, const ggml_tensor *, const ggml_tensor *, const ggml_tensor *) { return false; }
+void ggml_cuda_mul_mat_id_g2_gemv_glu(ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *, const ggml_tensor *, const ggml_tensor *, ggml_tensor *) { GGML_ABORT("MMB requires HIP"); }
+bool ggml_cuda_mmb_dq_packed(const ggml_tensor *) { return false; }
+void ggml_cuda_mmb_dense_r2_prepare(ggml_backend_cuda_context &, const ggml_tensor *) {}
+void ggml_cuda_mul_mat_dq(ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *, ggml_tensor *) { GGML_ABORT("MMB requires HIP"); }
+void ggml_cuda_mmb_release_all(ggml_backend_cuda_context &) {}
+
+#endif // GGML_USE_HIP
