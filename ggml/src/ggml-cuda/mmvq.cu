@@ -2017,7 +2017,12 @@ struct mmvq_group_args_dev {
 template <int nwarps, int pf>
 __launch_bounds__(nwarps * ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_fq_group(
+#if defined(GGML_USE_HIP)
         const mmvq_group_args_dev args, const float * GGML_CUDA_RESTRICT y_ptr, const int ncols_x,
+#else
+        // CUDA 13 drops restrict from the generated host wrapper specialization.
+        const mmvq_group_args_dev args, const float * y_ptr, const int ncols_x,
+#endif
         const float y_scale, const float y_bias, const int y_op) {
     constexpr int qk  = QK8_0;
     constexpr int qi  = QI8_0;
