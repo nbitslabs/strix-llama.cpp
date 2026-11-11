@@ -2027,7 +2027,70 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     load_tensors_hadamard();
 
+    if (arch == LLM_ARCH_QWEN4EXP) {
+        const char * e = getenv("LLAMA_DENSE_Q8_SHADOW");
+        if (e == nullptr || atoi(e) != 0) {
+            make_dense_shadows();
+        }
+    }
+
     return true;
+}
+
+void llama_model::make_dense_shadows() {
+    static const int8_t kv_iq4nl[16] = { -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113 };
+    GGML_ASSERT(ggml_type_size(GGML_TYPE_IQ4_NL) == 18 && ggml_type_size(GGML_TYPE_Q8_0) == 34 &&
+                ggml_blck_size(GGML_TYPE_IQ4_NL) == 32 && ggml_blck_size(GGML_TYPE_Q8_0) == 32);
+    std::map<ggml_backend_buffer_type_t, std::vector<ggml_tensor *>> by_buft;
+    for (auto & [name, t] : tensors_by_name) {
+        if (t->type != GGML_TYPE_IQ4_NL || ggml_n_dims(t) != 2 || name.rfind("blk.", 0) != 0 || t->buffer == nullptr || t->data == nullptr) {
+            continue;
+        }
+        by_buft[ggml_backend_buffer_get_type(t->buffer)].push_back(t);
+    }
+    size_t n_total = 0, bytes = 0;
+    for (auto & [buft, ts] : by_buft) {
+        ggml_init_params ip = { ts.size() * ggml_tensor_overhead(), nullptr, true };
+        ggml_context_ptr ctx(ggml_init(ip));
+        std::vector<std::pair<ggml_tensor *, ggml_tensor *>> pairs;
+        for (ggml_tensor * t : ts) {
+            ggml_tensor * q = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_Q8_0, t->ne[0], t->ne[1]);
+            ggml_set_name(q, t->name);   // name-keyed matchers see the same weight
+            pairs.emplace_back(t, q);
+        }
+        ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft));
+        if (!buf) {
+            LLAMA_LOG_WARN("%s: could not allocate the Q8_0 prefill shadows on %s, skipping\n", __func__, ggml_backend_buft_name(buft));
+            continue;
+        }
+        ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        std::vector<uint8_t> src, dst;
+        for (auto & [t, q] : pairs) {
+            const size_t nb = (size_t) ggml_nelements(t) / 32;
+            src.resize(ggml_nbytes(t));
+            dst.resize(ggml_nbytes(q));
+            GGML_ASSERT(src.size() == nb * 18 && dst.size() == nb * 34);
+            ggml_backend_tensor_get(t, src.data(), 0, src.size());
+            for (size_t b = 0; b < nb; ++b) {
+                const uint8_t * x = src.data() + b * 18;
+                uint8_t       * y = dst.data() + b * 34;
+                y[0] = x[0]; y[1] = x[1];                       // fp16 scale d
+                for (int j = 0; j < 16; ++j) {
+                    y[2 + j]      = (uint8_t) kv_iq4nl[x[2 + j] & 0x0f];
+                    y[2 + j + 16] = (uint8_t) kv_iq4nl[x[2 + j] >> 4];
+                }
+            }
+            ggml_backend_tensor_set(q, dst.data(), 0, dst.size());
+            dense_shadow.map[t] = q;
+            ++n_total; bytes += dst.size();
+        }
+        dense_shadow.ctxs.push_back(std::move(ctx));
+        dense_shadow.bufs.push_back(std::move(buf));
+    }
+    if (n_total > 0) {
+        LLAMA_LOG_INFO("%s: %zu IQ4_NL weights get exact Q8_0 shadows for batches >= %lld tokens (%.1f MiB)\n", __func__,
+                n_total, (long long) dense_shadow.min_tokens, bytes / 1048576.0);
+    }
 }
 
 // read and check the prism.hadamard metadata, and record the folded weights (load_tensors_hadamard makes the tensors)

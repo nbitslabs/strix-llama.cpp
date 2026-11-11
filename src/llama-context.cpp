@@ -3063,6 +3063,7 @@ llm_graph_params llama_context::graph_params(
         /*.moe_cache   =*/ moe_cache.get(),
         /*.prec_policy =*/ &model.prec_policy,
         /*.hdmd        =*/ model.hdmd.rot.empty() ? nullptr : &model.hdmd,
+        /*.dshadow     =*/ model.dense_shadow.map.empty() ? nullptr : &model.dense_shadow,
         /*.samplers    =*/ sampling.samplers,
         /*.mtp_draft   =*/ mtp_draft.get(),
         /*.n_outputs   =*/ n_outputs,
