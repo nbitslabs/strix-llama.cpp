@@ -2719,7 +2719,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
     const size_t row_size = ggml_row_size(conv_states_all->type, row_total);
     const uint32_t mem_size = mctx_cur->get_size();
 
-    const int64_t n_slots = (int64_t) cparams.n_rs_seq + 1;
+    const int64_t n_slots = rs_bulk_ubatch() ? 1 : (int64_t) cparams.n_rs_seq + 1;
 
     for (int64_t slot = 0; slot < n_slots; ++slot) {
         const int64_t s_idx = std::max<int64_t>(0, conv_input->ne[0] - state_cols - slot);
