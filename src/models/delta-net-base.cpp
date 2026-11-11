@@ -3,6 +3,8 @@
 #include "llama-impl.h"
 #include "llama-memory-recurrent.h"
 
+#include <cstdlib>
+
 // utility to get one slice from the third dimension
 // input dim:  [x, y, c, b]
 // output dim: [x, y, 1, b]
@@ -560,29 +562,57 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     const int64_t D = S_v * S_v * H_v;
     const int64_t K = cparams.n_rs_seq + 1;
 
+    // Rollback snapshots are needed only for the last K tokens of a batch, but a K > 1 op is excluded from the chunked
+    // prefill kernels, so a whole prompt ubatch ran on the slow per-token path (Halo R0: GDN 0.34 s -> 3.6 s per 16k
+    // ubatch with MTP on). Split a long single-sequence batch: the head [0, T-K) runs as a plain K = 1 delta net (chunked
+    // kernels), the tail [T-K, T) runs the snapshot op from the head's final state. Same math, different summation order
+    // only at the split. LLAMA_GDN_ROLLBACK_SPLIT=0 restores the single op.
+    static const bool split_enabled = [] {
+        const char * e = getenv("LLAMA_GDN_ROLLBACK_SPLIT");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    ggml_tensor * head_out = nullptr;
+    if (split_enabled && n_seqs == 1 && n_seq_tokens >= K + 256) {
+        const int64_t T0 = n_seq_tokens - K;
+        auto tok_view = [&](ggml_tensor * t, int64_t off, int64_t n) {
+            return ggml_view_4d(ctx0, t, t->ne[0], t->ne[1], n, t->ne[3], t->nb[1], t->nb[2], t->nb[3], (size_t) off * t->nb[2]);
+        };
+        auto head = build_delta_net(tok_view(q, 0, T0), tok_view(k, 0, T0), tok_view(v, 0, T0),
+                                    tok_view(g, 0, T0), tok_view(b, 0, T0), s, il);
+        head_out = head.first;
+        cb(head_out, "attn_output_head", il);
+        s = ggml_cont_4d(ctx0, head.second, S_v, S_v, H_v, n_seqs);
+        q = tok_view(q, T0, K); k = tok_view(k, T0, K); v = tok_view(v, T0, K);
+        g = tok_view(g, T0, K); b = tok_view(b, T0, K);
+    }
+    const int64_t n_tok_op = q->ne[2];
+
     // state s is 4D [S_v, S_v, H_v, n_seqs]; K snapshot slots are written into the output.
     ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K);
-    if (n_seq_tokens > 1) {
+    if (n_tok_op > 1) {
         res->add_fused_node({LLM_FUSED_OP_GDN_CH, gdn_out, il});
     } else {
         res->add_fused_node({LLM_FUSED_OP_GDN_AR, gdn_out, il});
     }
 
-    const int64_t attn_score_elems    = S_v * H_v * n_seq_tokens * n_seqs;
+    const int64_t attn_score_elems    = S_v * H_v * n_tok_op * n_seqs;
     const int64_t state_size_per_snap = S_v * S_v * H_v * n_seqs;
 
     ggml_tensor * output = ggml_view_4d(ctx0, gdn_out,
-        S_v, H_v, n_seq_tokens, n_seqs,
+        S_v, H_v, n_tok_op, n_seqs,
         ggml_row_size(gdn_out->type, S_v),
         ggml_row_size(gdn_out->type, S_v * H_v),
-        ggml_row_size(gdn_out->type, S_v * H_v * n_seq_tokens),
+        ggml_row_size(gdn_out->type, S_v * H_v * n_tok_op),
         0);
+    if (head_out) {
+        output = ggml_concat(ctx0, head_out, output, 2);
+    }
     cb(output, "attn_output", il);
 
     const size_t row_size = hparams.n_embd_s() * ggml_element_size(ssm_states_all);
 
-    // op writes the last min(n_seq_tokens, K) snapshots; trailing slots are left unwritten
-    const int64_t n_written = std::min<int64_t>(n_seq_tokens, K);
+    // op writes the last min(n_tok_op, K) snapshots; trailing slots are left unwritten
+    const int64_t n_written = std::min<int64_t>(n_tok_op, K);
 
     // write the produced snapshots into the recurrent cache (snapshot slot i -> rollback group i)
     ggml_tensor * src = ggml_view_3d(ctx0, gdn_out,
