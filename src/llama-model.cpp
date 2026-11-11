@@ -1565,6 +1565,10 @@ void llama_model_base::load_vocab(llama_model_loader & ml) {
     vocab.load(ml, kv);
 }
 
+// dense Q8_0 prefill shadows (defined next to llama_model::make_dense_shadows)
+static bool llama_dense_shadow_eligible(const std::string & name, const ggml_tensor * t, bool need_data);
+static bool llama_dense_shadow_enabled(llm_arch arch);
+
 bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const auto & split_mode   = params.split_mode;
     const bool use_mlock      = params.load_mode == LLAMA_LOAD_MODE_MLOCK || params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK;
