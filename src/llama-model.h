@@ -702,6 +702,15 @@ struct llama_mtp_draft_vocab {
     ggml_backend_buffer_ptr buf;
 };
 
+// Exact Q8_0 copies of 2D IQ4_NL weights for prefill-size batches (LLAMA_DENSE_Q8_SHADOW, default on for qwen4exp):
+// IQ4_NL -> Q8_0 keeps every value (same fp16 block scale, int8 codebook), and the HIP prefill fusions are keyed to Q8_0
+struct llama_dense_shadow {
+    std::unordered_map<const ggml_tensor *, ggml_tensor *> map;
+    std::vector<ggml_context_ptr>        ctxs;
+    std::vector<ggml_backend_buffer_ptr> bufs;
+    int64_t min_tokens = 32;
+};
+
 struct llama_model {
     llm_type type = LLM_TYPE_UNKNOWN;
     llm_arch arch = LLM_ARCH_UNKNOWN;
@@ -715,6 +724,7 @@ struct llama_model {
     llama_prec_policy prec_policy;
 
     llama_hadamard hdmd;
+    llama_dense_shadow dense_shadow;
 
     // see llama_model_set_attn_rot
     bool attn_rot = true;
@@ -890,6 +900,9 @@ struct llama_model {
     // draft vocabulary subset for mtp_draft_vocab = n_keep, built on first request and freed with the last context
     // holding it; nullptr if the subset cannot be used with this model (thread-safe)
     std::shared_ptr<const llama_mtp_draft_vocab> mtp_draft_vocab_get(int32_t n_keep) const;
+
+    // exact Q8_0 prefill copies of 2D IQ4_NL GPU weights (see llama_dense_shadow)
+    void make_dense_shadows();
 
     float get_rope_freq_base (const llama_cparams & cparams, int il) const;
     float get_rope_freq_scale(const llama_cparams & cparams, int il) const;

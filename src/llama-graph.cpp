@@ -1628,6 +1628,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     moe_cache        (params.moe_cache),
     prec_policy      (params.prec_policy),
     hdmd             (params.hdmd),
+    dshadow          (params.dshadow),
     samplers         (params.samplers),
     mtp_draft        (params.mtp_draft),
     prefetch         (params.prefetch),
@@ -1688,7 +1689,12 @@ ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w,
           ggml_tensor * cur,
           ggml_tensor * w_s) const {
-    cur = build_hadamard_input(w, cur);
+    cur = build_hadamard_input(w, cur);   // keyed on the original weight
+    if (dshadow != nullptr && ggml_n_dims(cur) <= 2 && cur->ne[1] >= dshadow->min_tokens && (loras == nullptr || loras->empty())) {
+        if (const auto it = dshadow->map.find(w); it != dshadow->map.end()) {
+            w = it->second;
+        }
+    }
     if (vsub != nullptr && loras->empty()) {
         // Q8_0 2560x248320 with one output is byte-exact on gfx1151 HIP (2026-10-15).
         // Keep LoRA and other output widths full until their picked logits pass the byte comparison.
