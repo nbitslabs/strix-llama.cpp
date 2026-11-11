@@ -2043,7 +2043,16 @@ void llama_model::make_dense_shadows() {
                 ggml_blck_size(GGML_TYPE_IQ4_NL) == 32 && ggml_blck_size(GGML_TYPE_Q8_0) == 32);
     std::map<ggml_backend_buffer_type_t, std::vector<ggml_tensor *>> by_buft;
     for (auto & [name, t] : tensors_by_name) {
-        if (t->type != GGML_TYPE_IQ4_NL || ggml_n_dims(t) != 2 || name.rfind("blk.", 0) != 0 || t->buffer == nullptr || t->data == nullptr) {
+        if (t->type != GGML_TYPE_IQ4_NL || ggml_n_dims(t) != 2 || name.rfind("blk.", 0) != 0 || t->buffer == nullptr || t->data == nullptr ||
+                t->ne[0] % 32 != 0 || t->nb[1] != ggml_row_size(t->type, t->ne[0])) {
+            continue;
+        }
+        // only weights on a GPU device: the fusions this serves are GPU kernels, and host/repack buffers may not support get_tensor
+        if (ggml_backend_buffer_is_host(t->buffer)) {
+            continue;
+        }
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(t->buffer));
+        if (dev == nullptr || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
             continue;
         }
         by_buft[ggml_backend_buffer_get_type(t->buffer)].push_back(t);
@@ -2082,6 +2091,9 @@ void llama_model::make_dense_shadows() {
             }
             ggml_backend_tensor_set(q, dst.data(), 0, dst.size());
             dense_shadow.map[t] = q;
+            // per-weight policies keyed on the original pointer apply to the shadow too
+            if (auto p = prec_policy.prec_src1.find(t); p != prec_policy.prec_src1.end()) { prec_policy.prec_src1.emplace(q, p->second); }
+            if (auto p = prec_policy.prec_acc.find(t);  p != prec_policy.prec_acc.end())  { prec_policy.prec_acc.emplace(q, p->second); }
             ++n_total; bytes += dst.size();
         }
         dense_shadow.ctxs.push_back(std::move(ctx));
