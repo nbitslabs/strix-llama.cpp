@@ -1752,8 +1752,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
         // --spec-draft-mtp-prefill-window: a prefill batch longer than the window feeds the head only its tail.
         // Positions keep their values, so the draft attends over a gap; verification is exact, so only acceptance moves.
+        // Only multi-section RoPE drafts accept a position jump (the batch allocator requires plain-RoPE batches to start
+        // at pos_max+1), and never on a verify batch (n_tokens <= n_max+1), so the draft KV has no gaps during decode.
         const int32_t win = params.mtp_prefill_window;
-        const int32_t k0  = (!is_mem_shared && !chain_heads && n_seq == 1 && win > 0 && n_tokens > win) ? n_tokens - win : 0;
+        const auto    rt  = llama_model_rope_type(llama_get_model(this->params.ctx_dft));
+        const bool    mrope = rt == LLAMA_ROPE_TYPE_MROPE || rt == LLAMA_ROPE_TYPE_IMROPE;
+        const int32_t k0  = (mrope && !is_mem_shared && !chain_heads && n_seq == 1 && win > 0 &&
+                             n_tokens > std::max(win, this->params.n_max + 1)) ? n_tokens - win : 0;
 
         if (!is_mem_shared) {
             batch.clear();
