@@ -2027,14 +2027,29 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     load_tensors_hadamard();
 
-    if (arch == LLM_ARCH_QWEN4EXP) {
-        const char * e = getenv("LLAMA_DENSE_Q8_SHADOW");
-        if (e == nullptr || atoi(e) != 0) {
-            make_dense_shadows();
-        }
+    if (llama_dense_shadow_enabled(arch)) {
+        make_dense_shadows();
     }
 
     return true;
+}
+
+// a 2D IQ4_NL block weight on a GPU device buffer (need_data: the weight is loaded, i.e. not a no_alloc fit probe)
+static bool llama_dense_shadow_eligible(const std::string & name, const ggml_tensor * t, bool need_data) {
+    if (t->type != GGML_TYPE_IQ4_NL || ggml_n_dims(t) != 2 || name.rfind("blk.", 0) != 0 || t->buffer == nullptr ||
+            (need_data && t->data == nullptr) || t->ne[0] % 32 != 0 || t->nb[1] != ggml_row_size(t->type, t->ne[0])) {
+        return false;
+    }
+    if (ggml_backend_buffer_is_host(t->buffer)) {
+        return false;
+    }
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(t->buffer));
+    return dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU;
+}
+
+static bool llama_dense_shadow_enabled(llm_arch arch) {
+    const char * e = getenv("LLAMA_DENSE_Q8_SHADOW");
+    return arch == LLM_ARCH_QWEN4EXP && (e == nullptr || atoi(e) != 0);
 }
 
 void llama_model::make_dense_shadows() {
@@ -2043,16 +2058,8 @@ void llama_model::make_dense_shadows() {
                 ggml_blck_size(GGML_TYPE_IQ4_NL) == 32 && ggml_blck_size(GGML_TYPE_Q8_0) == 32);
     std::map<ggml_backend_buffer_type_t, std::vector<ggml_tensor *>> by_buft;
     for (auto & [name, t] : tensors_by_name) {
-        if (t->type != GGML_TYPE_IQ4_NL || ggml_n_dims(t) != 2 || name.rfind("blk.", 0) != 0 || t->buffer == nullptr || t->data == nullptr ||
-                t->ne[0] % 32 != 0 || t->nb[1] != ggml_row_size(t->type, t->ne[0])) {
-            continue;
-        }
         // only weights on a GPU device: the fusions this serves are GPU kernels, and host/repack buffers may not support get_tensor
-        if (ggml_backend_buffer_is_host(t->buffer)) {
-            continue;
-        }
-        ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(t->buffer));
-        if (dev == nullptr || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+        if (!llama_dense_shadow_eligible(name, t, /*need_data =*/ true)) {
             continue;
         }
         by_buft[ggml_backend_buffer_get_type(t->buffer)].push_back(t);
@@ -2506,6 +2513,20 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() con
                 // GGML_ASSERT(ggml_backend_buffer_get_base(buf.get()) != nullptr); // multi_buffer does not have a defined base
                 ret[ggml_backend_buffer_get_type(buf.get())] += ggml_backend_buffer_get_size(buf.get());
             }
+        }
+    }
+    // the Q8_0 prefill shadows: real buffers once loaded, the expected size in a no_alloc fit probe
+    if (hparams.no_alloc) {
+        if (llama_dense_shadow_enabled(arch)) {
+            for (const auto & [name, t] : tensors_by_name) {
+                if (llama_dense_shadow_eligible(name, t, /*need_data =*/ false)) {
+                    ret[ggml_backend_buffer_get_type(t->buffer)] += ggml_row_size(GGML_TYPE_Q8_0, t->ne[0]) * t->ne[1];
+                }
+            }
+        }
+    } else {
+        for (const auto & buf : dense_shadow.bufs) {
+            ret[ggml_backend_buffer_get_type(buf.get())] += ggml_backend_buffer_get_size(buf.get());
         }
     }
     return ret;
