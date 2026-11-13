@@ -1938,6 +1938,13 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
     return true;
 }
 
+// Largest matmul batch (dst->ne[1]) that may take the fused matvec path. Default: the matvec kernels' own cap;
+// GGML_CUDA_FUSE_MAX_COLS overrides (1 = the previous behaviour, fusion only for a single column).
+static int ggml_cuda_fuse_max_cols(int kernel_cap) {
+    static const int env_cap = [] { const char * e = getenv("GGML_CUDA_FUSE_MAX_COLS"); return e ? atoi(e) : 0; }();
+    return env_cap > 0 ? std::min(env_cap, kernel_cap) : kernel_cap;
+}
+
 static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
     ggml_tensor *       src0 = tensor->src[0];
     ggml_tensor *       src1 = tensor->src[1];
@@ -1953,8 +1960,9 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
     use_mul_mat_vec_f = use_mul_mat_vec_f && ggml_cuda_should_use_mmvf(src0->type, cc, warp_size, src0->ne, src0->nb, is_mul_mat_id ? src1->ne[2] : src1->ne[1]);
 
-    //we only support fusion for ncols_dst = 1
-    if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] != 1) {
+    // The fused matvec kernels are templated on ncols_dst and apply bias / gate per column, so a small batch
+    // (an MTP verify of 2-8 rows) can take the fused path too. GGML_CUDA_FUSE_MAX_COLS=1 restores the old rule.
+    if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] > ggml_cuda_fuse_max_cols(MMVF_MAX_BATCH_SIZE)) {
         return false;
     }
 
@@ -1990,8 +1998,8 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     if (cc <= GGML_CUDA_CC_PASCAL) {
         return false;
     }
-    //we only support fusion for ncols_dst = 1
-    if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] != 1) {
+    // see ggml_cuda_should_fuse_mul_mat_vec_f: fusion for small batches, GGML_CUDA_FUSE_MAX_COLS=1 restores ncols_dst = 1
+    if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] > ggml_cuda_fuse_max_cols(MMVQ_MAX_BATCH_SIZE)) {
         return false;
     }
 
@@ -6310,6 +6318,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             const ggml_tensor * src1 = up_n->src[1];
             const ggml_tensor * ids  = up_n->src[2];
 
+            // with several columns the fused kernels index the bias with the output's column stride
+            if (!ids && up_n->ne[1] > 1 && (up_bias_tensor->nb[1] != up_n->nb[1] || gate_bias_tensor->nb[1] != gate_n->nb[1])) {
+                continue;
+            }
+
             if (ggml_cuda_should_fuse_mul_mat_vec_f(up_n)) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
                 fusion_data.gate      = gate_n->src[0];
@@ -6531,6 +6544,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
 
         ggml_cuda_mm_fusion_args_host fusion_data{};
+        // with several columns the fused kernels index the bias with the output's column stride
+        if (!ids && mm_node->ne[1] > 1 && bias_tensor->nb[1] != mm_node->nb[1]) {
+            continue;
+        }
+
         fusion_data.x_bias = bias_tensor;
 
         if (ggml_cuda_should_fuse_mul_mat_vec_f(mm_node)) {

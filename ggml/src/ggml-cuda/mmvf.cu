@@ -497,8 +497,9 @@ static void mul_mat_vec_f_switch_fusion(
     const ggml_cuda_kernel_launch_params launch_params = {block_nums, block_dims, nbytes_shared, stream};
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
-    // fusion needs a single dst column, the multi-token launches have more (ggml_cuda_mul_mat_vec_f)
-    if constexpr (ncols_dst == 1 && !is_multi_token_id) {
+    // the fused kernel applies bias and gate per dst column; instantiate it up to the matvec batch cap
+    // (the multi-token MUL_MAT_ID launches stay unfused)
+    if constexpr (ncols_dst <= MMVF_MAX_BATCH_SIZE && !is_multi_token_id) {
         if (has_fusion) {
             ggml_cuda_kernel_launch(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, true, is_multi_token_id, tokens_in_block>, launch_params,
                 x, y, ids, fusion, dst, ncols, nchannels_y, stride_row, stride_col_y, stride_col_dst,
@@ -508,7 +509,7 @@ static void mul_mat_vec_f_switch_fusion(
        }
     }
 
-    GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst=1");
+    GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst <= MMVF_MAX_BATCH_SIZE");
 
     ggml_cuda_kernel_launch(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, false, is_multi_token_id, tokens_in_block>, launch_params,
         x, y, ids, fusion, dst, ncols, nchannels_y, stride_row, stride_col_y, stride_col_dst,
@@ -817,7 +818,7 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
 
     if (fusion) {
         GGML_ASSERT( !ids || dst->ne[2] == 1);
-        GGML_ASSERT(  ids || dst->ne[1] == 1);
+        GGML_ASSERT(  ids || dst->ne[1] <= MMVF_MAX_BATCH_SIZE);   // fused epilogue is per column
         if (fusion->x_bias) {
             GGML_ASSERT(fusion->x_bias->type == GGML_TYPE_F32);
             GGML_ASSERT(fusion->x_bias->ne[0] == dst->ne[0]);
