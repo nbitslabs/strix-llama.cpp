@@ -2133,28 +2133,6 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
         return;
     }
-    // gfx1151 MTP verification: the qwen4exp indexer scorer multiplies F32 pooled keys by n_idx_heads x n_tokens query
-    // columns (4 x 4 = 16 for a 3-token draft). Past the matvec cap (8) and below the MMB minimum (32) that went to rocBLAS:
-    // 3.24 ms per verify graph vs 0.17 ms for the 4-column decode case (OP_PROF, 8k). Run it as matvec chunks of <= 8
-    // columns instead; the keys are re-read once per chunk, which is cheap next to rocBLAS's small-M split-K.
-    // GGML_CUDA_F32_CHUNKED_MMVF=0 disables.
-    static const bool f32_chunked_mmvf = [] { const char * e = getenv("GGML_CUDA_F32_CHUNKED_MMVF"); return e == nullptr || atoi(e) != 0; }();
-    if (f32_chunked_mmvf && GGML_CUDA_CC_IS_AMD(cc) && src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
-            dst->type == GGML_TYPE_F32 && ne11 > MMVF_MAX_BATCH_SIZE && ne11 <= 32 &&
-            ggml_cuda_should_use_mmvf(src0->type, cc, warp_size, src0->ne, src0->nb, MMVF_MAX_BATCH_SIZE)) {
-        for (int64_t col = 0; col < ne11; col += MMVF_MAX_BATCH_SIZE) {
-            const int64_t n = std::min<int64_t>(MMVF_MAX_BATCH_SIZE, ne11 - col);
-            ggml_tensor src1_chunk = *src1;
-            ggml_tensor dst_chunk  = *dst;
-            src1_chunk.ne[1] = n;
-            dst_chunk.ne[1]  = n;
-            src1_chunk.data = (char *) src1->data + col*nb11;
-            dst_chunk.data  = (char *) dst->data  + col*nb1;
-            dst_chunk.src[1] = &src1_chunk;
-            ggml_cuda_mul_mat_vec_f(ctx, src0, &src1_chunk, nullptr, &dst_chunk);
-        }
-        return;
-    }
     // A transposed vector can still use MMVQ (i.e. ne01 == 1)
     if (ne01 == 1 && ne11 > MMVF_MAX_BATCH_SIZE && ne2 == 1 && ne3 == 1
             && src0->type == GGML_TYPE_F32
