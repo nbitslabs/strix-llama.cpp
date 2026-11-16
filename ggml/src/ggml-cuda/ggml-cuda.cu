@@ -4362,13 +4362,13 @@ static bool ggml_cuda_try_topk_moe(ggml_backend_cuda_context & ctx, const ggml_c
 //     -> gated_delta_net -> cpy(new state -> cache) -> rms_norm -> mul(norm weight)
 // for one sequence with S == 128 and at most 8 tokens and rollback slots.
 // Returns the number of nodes to skip after the concat (0 when the pattern does not match).
-// GGML_CUDA_FUSE_GDN_DECODE_T=0: do not match the SET_ROWS rollback store (speculative verify, n_rs_seq > 0)
+// GGML_CUDA_FUSE_GDN_DECODE_T=1: also match the SET_ROWS rollback store (speculative verify, n_rs_seq > 0). Off by default:
+// the fused step equals n single-token fused steps bit for bit, but the unfused rollback ops it replaces round differently
+// (~1e-8), which can change greedy streams against the sync tip.
+// read per match (a CONCAT of the chain, once per recurrent layer), so test-backend-ops can enable it for its cases
 static bool ggml_cuda_gdn_decode_rollback_enabled() {
-    static const bool on = [] {
-        const char * env = getenv("GGML_CUDA_FUSE_GDN_DECODE_T");
-        return env == nullptr || atoi(env) != 0;
-    }();
-    return on;
+    const char * env = getenv("GGML_CUDA_FUSE_GDN_DECODE_T");
+    return env != nullptr && atoi(env) != 0;   // off by default: vs the unfused rollback ops it is only tolerance-identical
 }
 
 static int ggml_cuda_try_gdn_decode_fusion(const ggml_cgraph * cgraph, int node_idx, ggml_cuda_gdn_decode_args & args) {
