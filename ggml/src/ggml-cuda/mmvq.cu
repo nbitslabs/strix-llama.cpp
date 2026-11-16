@@ -312,7 +312,7 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
 static bool mmvq_moe_dedup_enabled() {
     static const bool enabled = [] {
         const char * env = getenv("GGML_CUDA_MOE_DEDUP");
-        return !env || std::strcmp(env, "0") != 0;
+        return env && std::strcmp(env, "1") == 0;   // off by default: measured 18-33 % slower end to end on gfx1151 (2026-11-16)
     }();
     return enabled;
 }
