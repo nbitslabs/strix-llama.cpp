@@ -5418,14 +5418,15 @@ struct test_indexer_score : public test_case {
 // qwen4exp QSA indexer scorer at decode (1-8 queries): the fused chain minus the same chain with every head slice made
 // contiguous (CONT before each ADD), which no scorer fusion matches, on the same backend. The CPU gets exactly 0. Up to 2
 // queries the unfused GEMM is the f32 matvec, whose reduction tree the decode scorer reproduces, so the difference must be
-// exactly 0 there; from 3 queries the unfused GEMM is rocBLAS and only rounding may differ.
+// exactly 0 there; from 3 queries the unfused GEMM is rocBLAS and only rounding may differ. The keys are a view, as the
+// model's pooled-key cache is: a leaf would send 32+ GEMM columns to MMB (f16 operands) instead of rocBLAS.
 struct test_indexer_score_ident : public test_case {
     const int blocks, queries;
     test_indexer_score_ident(int blocks, int queries) : blocks(blocks), queries(queries) {}
     std::string op_desc(ggml_tensor *) override { return "INDEXER_SCORE_IDENT"; }
     std::string vars() override { return VARS_TO_STR2(blocks, queries); }
     bool run_whole_graph() override { return true; }
-    double max_err() override { return queries <= 2 ? 0.0 : 1e-4; }
+    double max_err(ggml_backend_t) override { return queries <= 2 ? 0.0 : 1e-4; }
     double err(const float * a, const float * b, size_t n) override {
         double m = 0.0;
         for (size_t i = 0; i < n; ++i) { m = std::max(m, (double) std::fabs(a[i] - b[i])); }
@@ -5433,8 +5434,9 @@ struct test_indexer_score_ident : public test_case {
     }
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int dim = 128, heads = 4;
-        auto * keys = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, dim, blocks);
-        auto * q    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, dim, heads * queries);
+        auto * cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, dim, blocks + 16);
+        auto * keys  = ggml_view_2d(ctx, cache, dim, blocks, cache->nb[1], 0);
+        auto * q     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, dim, heads * queries);
         auto chain = [&](bool fusable) {
             auto * score = ggml_mul_mat(ctx, keys, q);
             score = ggml_reshape_4d(ctx, score, blocks, heads, queries, 1);
