@@ -12,3 +12,5 @@ void ggml_cuda_op_mul_mat_vec_f(
     const int64_t src1_padded_row_size, cudaStream_t stream);
 
 bool ggml_cuda_should_use_mmvf(const ggml_tensor * src0, int cc, int warp_size, int64_t ne11);
+
+bool ggml_cuda_mul_mat_vec_f_dual(ggml_backend_cuda_context & ctx, ggml_tensor * d1, ggml_tensor * d2);

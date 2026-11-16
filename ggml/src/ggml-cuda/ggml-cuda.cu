@@ -5840,6 +5840,43 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    static const bool fuse_ssm_dual = [] {
+        const char * env = getenv("GGML_CUDA_FUSE_SSM_DUAL");
+        return !env || strcmp(env, "0") != 0;
+    }();
+    if (fuse_ssm_dual && node->op == GGML_OP_MUL_MAT && node->src[0]->type == GGML_TYPE_BF16 &&
+            GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
+        int j = i + 1;
+        while (j < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
+            ++j;
+        }
+        if (j < cgraph->n_nodes) {
+            ggml_tensor * other = cgraph->nodes[j];
+            auto overlaps = [](const ggml_tensor * a, const ggml_tensor * b) {
+                const uintptr_t a0 = (uintptr_t) a->data, b0 = (uintptr_t) b->data;
+                return a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
+            };
+            bool independent = other->op == GGML_OP_MUL_MAT && other->src[1] == node->src[1] &&
+                (other->flags & GGML_TENSOR_FLAG_COMPUTE) != 0 && !overlaps(node, other);
+            for (int k = i; independent && k <= j; ++k) {
+                const ggml_tensor * t = cgraph->nodes[k];
+                if (k > i && k < j && overlaps(other, t)) {
+                    independent = false;
+                }
+                for (int si = 0; independent && si < GGML_MAX_SRC; ++si) {
+                    const ggml_tensor * src = t->src[si];
+                    if (src && (overlaps(other, src) || ((k == i || k == j) && overlaps(node, src)))) {
+                        independent = false;
+                    }
+                }
+            }
+            if (independent && ggml_cuda_mul_mat_vec_f_dual(*cuda_ctx, node, other)) {
+                s_precomputed[other] = 0;
+                return GGML_CUDA_FUSED_SELF;
+            }
+        }
+    }
+
     // qwen4exp GDN: ssm_beta / ssm_alpha, two narrow F32-weight GEMMs on the same activations, in one pass over them.
     // The second node's output is written early, so it must not overlap anything the nodes in between touch.
     if (node->op == GGML_OP_MUL_MAT && node->src[0]->type == GGML_TYPE_F32 && node->src[0]->ne[1] <= 64 && node->src[1]->type == GGML_TYPE_F32 &&
