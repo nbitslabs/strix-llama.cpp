@@ -7595,27 +7595,34 @@ struct test_gated_delta_net_cache_fusion : public test_case {
 // ident 2: the reference is n_tokens single-token steps (K = 1, per-slot CPY store: the plain decode chain, fused on AMD),
 //       each reading the caches the previous step wrote; the differences (outputs, final state, final conv state) must
 //       be exactly 0: per token the multi-token fused step computes what the single-token fused step computes.
+// gate 1/2: ssm_out (Q8_0 MUL_MAT of the gated output) follows; the reference chain is the same with the gated output marked
+//       as a graph output, which keeps the output gate out of the ssm_out matvec prologue; the output is the difference of
+//       the two projections, which must be exactly 0. gate 1: the recurrent chain fused (K = n_tokens, per-slot CPY store);
+//       gate 2: the recurrent chain unfused in both (CONCAT output), so the stand-alone RMS_NORM gate match is exercised.
 struct test_gdn_decode_rollback : public test_case {
     const int64_t n_tokens, K;
     const bool reverse, rows;
     const int ident;
+    const int gate;
     std::vector<ggml_tensor *> outputs;
 
-    test_gdn_decode_rollback(int64_t n_tokens, int64_t K, bool reverse = false, bool rows = false, int ident = 0)
-        : n_tokens(n_tokens), K(K), reverse(reverse), rows(rows), ident(ident) {}
+    test_gdn_decode_rollback(int64_t n_tokens, int64_t K, bool reverse = false, bool rows = false, int ident = 0, int gate = 0)
+        : n_tokens(n_tokens), K(K), reverse(reverse), rows(rows), ident(ident), gate(gate) {}
 
-    std::string vars() override { return rows || ident ? VARS_TO_STR5(n_tokens, K, reverse, rows, ident) : VARS_TO_STR3(n_tokens, K, reverse); }
+    std::string vars() override {
+        return gate ? VARS_TO_STR3(n_tokens, K, gate) : rows || ident ? VARS_TO_STR5(n_tokens, K, reverse, rows, ident) : VARS_TO_STR3(n_tokens, K, reverse);
+    }
     std::string op_desc(ggml_tensor *) override { return "GDN_DECODE_ROLLBACK"; }
     bool run_whole_graph() override { return true; }
-    size_t max_tensors() override { return ident == 2 ? 64 * (n_tokens + 2) : 128; }   // ~45 tensors per chain
+    size_t max_tensors() override { return ident == 2 ? 64 * (n_tokens + 2) : 256; }   // ~45-60 tensors per chain
     std::vector<ggml_tensor *> fusion_test_nodes() override { return outputs; }
     // the rollback (SET_ROWS) form replaces the unfused chain and must equal it; the per-slot CPY form keeps the decode kernel's own
     // softplus (logf(1 + expf)) and is only within rounding of the unfused ops
     double max_err(ggml_backend_t backend) override {
-        return ident == 2 || (ident == 1 && rows) ? 0.0 : ident == 1 ? 1e-6 : test_case::max_err(backend);
+        return ident == 2 || gate || (ident == 1 && rows) ? 0.0 : ident == 1 ? 1e-6 : test_case::max_err(backend);
     }
     double err(const float * a, const float * b, size_t n) override {
-        if (!ident) {
+        if (!ident && !gate) {
             return test_case::err(a, b, n);
         }
         double m = 0.0;
@@ -7626,6 +7633,7 @@ struct test_gdn_decode_rollback : public test_case {
     static constexpr int64_t S = 128, H_k = 2, H_v = 4, C = S * (2 * H_k + H_v), D = S * S * H_v, mem_size = 2;
 
     struct chain_out { ggml_tensor * conv, * state, * out; };
+    static constexpr int64_t n_proj = 256;   // ssm_out rows of the gate cases
 
     ggml_tensor * new_cache(ggml_context * ctx, int64_t x, int64_t slots, const char * base, const char * sfx) {
         ggml_tensor * t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, x, mem_size * slots);
@@ -7636,10 +7644,10 @@ struct test_gdn_decode_rollback : public test_case {
     chain_out build_chain(ggml_context * ctx, int64_t n_tokens, int64_t K, bool rows, ggml_tensor * conv_cache, ggml_tensor * state_cache,
             bool unfused, ggml_tensor * ids, ggml_tensor * qkv,
             ggml_tensor * conv_w, ggml_tensor * alpha, ggml_tensor * dt, ggml_tensor * A, ggml_tensor * beta_in,
-            ggml_tensor * norm_w, ggml_tensor * z) {
+            ggml_tensor * norm_w, ggml_tensor * z, ggml_tensor * w_proj = nullptr) {
         ggml_tensor * history = ggml_reshape_3d(ctx, ggml_get_rows(ctx, conv_cache, ids), 3, C, 1);
         ggml_tensor * input = ggml_concat(ctx, history, ggml_transpose(ctx, qkv), 0);
-        if (unfused) {
+        if ((unfused && !gate) || gate == 2) {   // in the gate cases "unfused" blocks only the gate fold
             ggml_set_output(input);
         }
         ggml_tensor * conv_read = nullptr;
@@ -7695,6 +7703,13 @@ struct test_gdn_decode_rollback : public test_case {
         ggml_tensor * out = ggml_mul(ctx, norm, ggml_sigmoid(ctx, ggml_reshape_4d(ctx, z, S, H_v, n_tokens, 1)));
         // the whole chain stays contiguous in the graph, as in the model: read-backs and the second chain come after it
         ggml_build_forward_expand(gf, out);
+        if (w_proj) {
+            if (unfused) {
+                ggml_set_output(out);   // the reference keeps the gate out of the matvec prologue
+            }
+            out = ggml_mul_mat(ctx, w_proj, ggml_reshape_2d(ctx, out, S * H_v, n_tokens));
+            ggml_build_forward_expand(gf, out);
+        }
         return { conv_read, cpy, out };
     }
 
@@ -7734,6 +7749,17 @@ struct test_gdn_decode_rollback : public test_case {
         ggml_tensor * norm_w = tensor(S, 1, "norm_w");
         ggml_tensor * z      = tensor(S * H_v, n_tokens, "z");
         outputs.clear();
+        if (gate) {
+            ggml_tensor * w_proj = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, S * H_v, n_proj);
+            ggml_set_name(w_proj, "w_proj");
+            chain_out ga = build_chain(ctx, n_tokens, K, false, new_cache(ctx, 3 * C, K, "conv_cache", ""), new_cache(ctx, D, K, "state_cache", ""),
+                    false, ids, qkv, conv_w, alpha, dt, A, beta, norm_w, z, w_proj);
+            chain_out gb = build_chain(ctx, n_tokens, K, false, new_cache(ctx, 3 * C, K, "conv_cache", "_ref"), new_cache(ctx, D, K, "state_cache", "_ref"),
+                    true, ids, qkv, conv_w, alpha, dt, A, beta, norm_w, z, w_proj);
+            ggml_tensor * d = ggml_sub(ctx, ga.out, gb.out);
+            outputs = { d };
+            return d;
+        }
         chain_out a = build_chain(ctx, n_tokens, K, rows, new_cache(ctx, 3 * C, K, "conv_cache", ""), new_cache(ctx, D, K, "state_cache", ""),
                 false, ids, qkv, conv_w, alpha, dt, A, beta, norm_w, z);
         if (ident == 2) {
@@ -7789,6 +7815,10 @@ struct test_gdn_decode_rollback : public test_case {
             if (name == "state_ids") {
                 const int32_t id = 0;
                 ggml_backend_tensor_set(t, &id, 0, sizeof(id));
+                continue;
+            }
+            if (t->type != GGML_TYPE_F32) {
+                init_tensor_uniform(t);
                 continue;
             }
             std::vector<float> data(ggml_nelements(t));
@@ -19212,6 +19242,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     for (const auto & shape : {std::pair<int64_t, int64_t>{1, 1}, {2, 4}, {4, 4}}) {
         test_cases.emplace_back(new test_gdn_decode_rollback(shape.first, shape.second, false, false, 1));
+    }
+    // the GDN output gate in the ssm_out matvec prologue against the gated norm + matvec, exact
+    for (int64_t t : {1, 2, 3, 4, 8}) {
+        test_cases.emplace_back(new test_gdn_decode_rollback(t, t, false, false, 0, 1));
+        if (t > 1) {
+            test_cases.emplace_back(new test_gdn_decode_rollback(t, t, false, false, 0, 2));
+        }
     }
 
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));

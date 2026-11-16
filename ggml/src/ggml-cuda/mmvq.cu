@@ -1758,7 +1758,49 @@ static __global__ void mul_mat_vec_q_fq(
             const float4 v0 = yv[0];
             const float4 v1 = yv[1];
             float v[8] = {v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w};
-            if (y_op == 3) {
+            if (y_op == 4) {
+                // qwen4exp GDN output, bit-exact: the sum of squares of each 128-wide head in the tree of
+                // rms_norm_f32<128, true> (gdn_decode_norm_cuda): one square per element, the warp butterfly over
+                // elements 32w..32w+31 (pairs l^16, l^8, l^4, l^2, l^1), then (s0 + s2) + (s1 + s3). This thread holds
+                // elements 8c..8c+7 of chunk w (c = lane & 3, w = (lane >> 2) & 3); partner lanes supply the rest.
+                float p[8];
+#pragma unroll
+                for (int k = 0; k < 8; ++k) {
+                    p[k] = fmaf(v[k], v[k], 0.0f);
+                }
+                float a[8];
+#pragma unroll
+                for (int k = 0; k < 8; ++k) {
+                    a[k] = p[k] + ggml_cuda_shfl_xor(p[k], 2, warp_size);   // l ^ 16
+                }
+                float b[8];
+#pragma unroll
+                for (int k = 0; k < 8; ++k) {
+                    b[k] = a[k] + ggml_cuda_shfl_xor(a[k], 1, warp_size);   // l ^ 8
+                }
+                const float c0 = b[0] + b[4], c1 = b[1] + b[5], c2 = b[2] + b[6], c3 = b[3] + b[7];   // l ^ 4
+                const float d0 = c0 + c2, d1 = c1 + c3;                                             // l ^ 2
+                const float sw = d0 + d1;                                                           // l ^ 1
+                const float x1 = ggml_cuda_shfl_xor(sw, 4, warp_size);    // chunk w ^ 1
+                const float x2 = ggml_cuda_shfl_xor(sw, 8, warp_size);    // chunk w ^ 2
+                const float x3 = ggml_cuda_shfl_xor(sw, 12, warp_size);   // chunk w ^ 3
+                const bool  w_even = ((lane >> 2) & 1) == 0;
+                const float even = w_even ? sw + x2 : x1 + x3;                     // s0 + s2
+                const float odd  = w_even ? x1 + x3 : sw + x2;                     // s1 + s3
+                const float tmp  = even + odd;
+                const float rms_scale = rsqrtf(tmp / 128.0f + fusion.y_eps);
+                const float * z = (const float *) fusion.y_gate + ib*QK8_1 + sub*8;
+                const float * w = (const float *) fusion.y_norm_w + (ib*QK8_1 + sub*8) % 128;
+                const float4 * zv = (const float4 *) z;
+                const float4 * wv = (const float4 *) w;
+                const float4 z0 = zv[0], z1 = zv[1], w0 = wv[0], w1 = wv[1];
+                const float zz[8] = {z0.x, z0.y, z0.z, z0.w, z1.x, z1.y, z1.z, z1.w};
+                const float ww[8] = {w0.x, w0.y, w0.z, w0.w, w1.x, w1.y, w1.z, w1.w};
+#pragma unroll
+                for (int k = 0; k < 8; ++k) {
+                    v[k] = (1.0f / (1.0f + expf(-zz[k]))) * (rms_scale * v[k] * ww[k]);
+                }
+            } else if (y_op == 3) {
                 // qwen4exp GDN output: per-head (128) rms norm * weight, gated by sigmoid(z). The 16 lanes of a
                 // head are consecutive threads of one wave (4 Q8_1 blocks x 4 lanes).
                 float ss = 0.0f;
@@ -3165,7 +3207,7 @@ bool ggml_cuda_mul_mat_vec_q_fq_gdn_gate_ok(ggml_backend_cuda_context & ctx, con
 }
 
 void ggml_cuda_mul_mat_vec_q_fq_gdn_gate(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const float * attn,
-        const ggml_tensor * z, const ggml_tensor * norm_w, const float eps) {
+        const ggml_tensor * z, const ggml_tensor * norm_w, const float eps, const bool exact) {
     GGML_ASSERT((uintptr_t) attn % 16 == 0 && (uintptr_t) norm_w->data % 16 == 0 && ggml_nelements(norm_w) == 128);
     ggml_tensor y = *dst->src[1]; // same shape/strides as the (elided) gated norm output, data = pre-norm scratch
     y.data = (void *) attn;
@@ -3173,8 +3215,51 @@ void ggml_cuda_mul_mat_vec_q_fq_gdn_gate(ggml_backend_cuda_context & ctx, ggml_t
     fusion.y_gate   = z;
     fusion.y_norm_w = norm_w;
     fusion.y_eps    = eps;
-    const bool ok = mul_mat_vec_q_fq_try(ctx, dst->src[0], &y, nullptr, dst, &fusion, 1.0f, 0.0f, 3, /*launch=*/true);
+    const bool ok = mul_mat_vec_q_fq_try(ctx, dst->src[0], &y, nullptr, dst, &fusion, 1.0f, 0.0f, exact ? 4 : 3, /*launch=*/true);
     GGML_ASSERT(ok);
+}
+
+void ggml_cuda_mul_mat_vec_q_gdn_gate_multi(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const float * attn,
+        const float * z, const ggml_tensor * norm_w, const float eps) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    GGML_ASSERT(ggml_nelements(norm_w) == 128 && norm_w->type == GGML_TYPE_F32 && ggml_is_contiguous(norm_w));
+    GGML_ASSERT(src1->ne[2] == 1 && src1->ne[3] == 1 && src0->ne[2] == 1 && src0->ne[3] == 1 && dst->ne[1] == src1->ne[1]);
+    cudaStream_t stream = ctx.stream();
+    const int64_t ne00 = src0->ne[0], ne01 = src0->ne[1], ne10 = src1->ne[0], ne11 = src1->ne[1];
+    // the tail of ggml_cuda_mul_mat_vec_q for a plain multi-column MUL_MAT (no ids, no fusion), with the quantize swapped
+    if (ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+        const size_t size_data  = ggml_nbytes(src0);
+        const size_t size_alloc = ggml_backend_buffer_get_alloc_size(src0->buffer, src0);
+        if (size_alloc > size_data) {
+            GGML_ASSERT(ggml_is_contiguously_allocated(src0));
+            GGML_ASSERT(!src0->view_src);
+            CUDA_CHECK(cudaMemsetAsync((char *) src0->data + size_data, 0, size_alloc - size_data, stream));
+        }
+    }
+    const bool x_pk = ggml_cuda_mmb_dq_packed(src0);
+    ggml_cuda_mm_fusion_args_device fusion_local{};
+    fusion_local.x_pk = x_pk ? 1 : 0;
+
+    const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
+    quantize_row_q8_1_gdn_gate_cuda(attn, z, (const float *) norm_w->data, src1_q8_1.get(), ne10, ne10_padded, ne11, eps, stream);
+
+    const size_t ts_src0 = ggml_type_size(src0->type);
+    const int64_t s01 = src0->nb[1] / ts_src0;
+    const int64_t s11 = ne10_padded / QK8_1;
+    const int64_t s1  = dst->nb[1] / sizeof(float);
+    const int64_t s02 = src0->nb[2] / ts_src0;
+    const int64_t s2  = dst->nb[2] / sizeof(float);
+    const int64_t s03 = src0->nb[3] / ts_src0;
+    const int64_t s3  = dst->nb[3] / sizeof(float);
+    const int64_t s12 = ne11*s11;
+    const int64_t s13 = 1*s12;
+    mul_mat_vec_q_switch_type(
+        src0->data, src0->type, src1_q8_1.get(), nullptr, fusion_local, (float *) dst->data, ne00,
+        ne01,              ne11,          s01, s11,              s1,
+        1,    1,           1,             s02, s12,              s2,
+        1,                 1,             s03, s13,              s3,               0, stream);
 }
 
 #if defined(__HIP_PLATFORM_AMD__)

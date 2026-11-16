@@ -43,8 +43,13 @@ void ggml_cuda_mmv_group(ggml_backend_cuda_context & ctx, const ggml_tensor * y,
 // RDNA3.5 qwen4exp GDN output projection with the gated per-head norm in the prologue:
 //   y' = sigmoid(z) * (rms_norm_128(attn) * norm_w), then the fused-quantize matvec of dst->src[0] with y'
 bool ggml_cuda_mul_mat_vec_q_fq_gdn_gate_ok(ggml_backend_cuda_context & ctx, const ggml_tensor * dst, const ggml_tensor * z);
+// exact: replay the reduction tree of rms_norm_f32<128, true> (bit-identical to the gated norm kernel + matvec)
 void ggml_cuda_mul_mat_vec_q_fq_gdn_gate(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const float * attn,
-        const ggml_tensor * z, const ggml_tensor * norm_w, float eps);
+        const ggml_tensor * z, const ggml_tensor * norm_w, float eps, bool exact = false);
+// 2-8 columns: y' = sigmoid(z) * rms_norm_128(attn) * norm_w quantized to Q8_1 in one kernel (the tree of rms_norm_f32<128, true>
+// and the arithmetic of quantize_q8_1), then the generic mul_mat_vec_q as ggml_cuda_mul_mat_vec_q runs it. attn/z: [ne10, ncols]
+void ggml_cuda_mul_mat_vec_q_gdn_gate_multi(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const float * attn,
+        const float * z, const ggml_tensor * norm_w, float eps);
 
 // RDNA3.5 one-token IQ4_NL MoE down projection with the selected-expert weighted sum in the kernel epilogue.
 bool ggml_cuda_mul_mat_id_weighted_rdna3_5_ok(const ggml_tensor * experts, const ggml_tensor * weights, const ggml_tensor * dst);
