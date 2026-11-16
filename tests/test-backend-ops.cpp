@@ -9048,22 +9048,24 @@ struct test_mmv_group : public test_case {
     const int64_t m_q8;   // rows of a plain Q8_0 segment (0 = none)
     const int64_t m_glu;  // rows of a Q8_0 gate/up + swiglu segment (0 = none)
 
-    std::string vars() override { return VARS_TO_STR3(k, m_q8, m_glu); }
+    const int64_t n;
+
+    std::string vars() override { return VARS_TO_STR4(k, m_q8, m_glu, n); }
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
-        return "MMV_GROUP";
+        return n == 1 ? "MMV_GROUP" : "MUL_MAT";
     }
 
     bool run_whole_graph() override { return true; }
 
     double max_nmse_err() override { return 5e-4; }
 
-    test_mmv_group(int64_t k, int64_t m_q8, int64_t m_glu)
-        : k(k), m_q8(m_q8), m_glu(m_glu) {}
+    test_mmv_group(int64_t k, int64_t m_q8, int64_t m_glu, int64_t n = 1)
+        : k(k), m_q8(m_q8), m_glu(m_glu), n(n) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * y = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, 1);
+        ggml_tensor * y = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
         ggml_set_name(y, "y");
 
         ggml_tensor * out = nullptr;
@@ -9097,12 +9099,13 @@ struct test_hc_up_mix : public test_case {
     const int64_t hc;
     const int64_t n_tokens;
     const bool external_consumer;
+    const bool matmul_only;
 
-    std::string vars() override { return VARS_TO_STR6(type_w, k, n_embd, hc, n_tokens, external_consumer); }
+    std::string vars() override { return VARS_TO_STR7(type_w, k, n_embd, hc, n_tokens, external_consumer, matmul_only); }
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
-        return "HC_UP_MIX";
+        return matmul_only ? "MUL_MAT" : "HC_UP_MIX";
     }
 
     bool run_whole_graph() override { return true; }
@@ -9110,8 +9113,8 @@ struct test_hc_up_mix : public test_case {
     double max_nmse_err() override { return 5e-4; }
 
     test_hc_up_mix(ggml_type type_w, int64_t k, int64_t n_embd, int64_t hc, int64_t n_tokens,
-            bool external_consumer = false)
-        : type_w(type_w), k(k), n_embd(n_embd), hc(hc), n_tokens(n_tokens), external_consumer(external_consumer) {}
+            bool external_consumer = false, bool matmul_only = false)
+        : type_w(type_w), k(k), n_embd(n_embd), hc(hc), n_tokens(n_tokens), external_consumer(external_consumer), matmul_only(matmul_only) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * lo = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n_tokens);
@@ -9122,7 +9125,11 @@ struct test_hc_up_mix : public test_case {
         ggml_set_name(w, "w_up");
 
         ggml_tensor * act  = ggml_silu(ctx, ggml_scale(ctx, lo, 1.0f / (float) hc));
-        ggml_tensor * gate = ggml_sigmoid(ctx, ggml_mul_mat(ctx, w, act));
+        ggml_tensor * mm = ggml_mul_mat(ctx, w, act);
+        if (matmul_only) {
+            return mm;
+        }
+        ggml_tensor * gate = ggml_sigmoid(ctx, mm);
         ggml_tensor * gated = ggml_mul(ctx, xn, gate);
         gated = ggml_reshape_3d(ctx, gated, n_embd, hc, n_tokens);
         ggml_tensor * mixed = ggml_view_2d(ctx, gated, n_embd, n_tokens, ggml_row_size(gated->type, n_embd) * hc, 0);
@@ -18813,6 +18820,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                     }
                 }
             }
+        }
+    }
+
+    // Small dense decode and multi-token batches (spec decoding) on gfx1151.
+    for (int64_t n : {1, 2, 3, 4, 5, 6, 7, 8}) {
+        for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_BF16}) {
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 4, n, 10240, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 1, n, 2560, {1, 1}, {1, 1}));
+        }
+        for (auto mk : {std::array<int64_t, 2>{320, 10240}, {10240, 320}, {640, 2560}}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, mk[0], n, mk[1], {1, 1}, {1, 1}));
+        }
+        test_cases.emplace_back(new test_hc_up_mix(GGML_TYPE_Q8_0, 320, 2560, 4, n, false, true));
+        if (n > 1) {
+            test_cases.emplace_back(new test_mmv_group(2560, 640, 640, n));
         }
     }
 

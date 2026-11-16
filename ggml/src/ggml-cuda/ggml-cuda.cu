@@ -2574,7 +2574,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         } else if (dst->op == GGML_OP_MUL_MAT && dst->src[0] == src0 && dst->src[1] == src1 && ggml_nrows(src1) == 1 &&
                 ggml_cuda_mul_mat_vec_q_fq_prologue_ok(ctx, dst, src1)) {
             ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);   // RDNA3.5 fused-quantize matvec, packed-aware (x_pk)
-        } else if (ggml_nrows(src1) == 1 && ggml_cuda_mmv_group_seg_ok(src0, src1) && ggml_is_contiguous(dst)) {
+        } else if (ggml_cuda_mmv_group_seg_ok(src0, src1) && ggml_is_contiguous(dst)) {
             ggml_cuda_mmv_group_seg seg;
             seg.w = src0; seg.dst = dst;
             ggml_cuda_mmv_group(ctx, src1, &seg, 1);
@@ -6065,8 +6065,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
-    // RDNA3.5 decode: consecutive single-column MUL_MATs that read the same activation vector (plain Q8_0/F32
-    // matvecs, or a [mul_mat, mul_mat, glu] gate/up pair) are launched as one grouped kernel. The segments are
+    // RDNA3.5: consecutive eligible Q8_0 MUL_MATs that read the same activations
+    // (plain matvecs or a [mul_mat, mul_mat, glu] gate/up pair) are launched as one grouped kernel. The segments are
     // mutually independent, so the launch position of the first one is valid for all of them.
     if (node->op == GGML_OP_MUL_MAT && node->src[2] == nullptr && ggml_cuda_mmv_group_seg_ok(node->src[0], node->src[1])) {
         const ggml_tensor * y = node->src[1];
@@ -6102,8 +6102,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 }
                 if (gate_n && n2->src[2] == nullptr && n2->src[1] == y && (n2->flags & GGML_TENSOR_FLAG_COMPUTE) != 0 &&
                         up_n->src[0]->type == GGML_TYPE_Q8_0 && gate_n->src[0]->type == GGML_TYPE_Q8_0 &&
+                        !ggml_cuda_mmb_dq_packed(up_n->src[0]) && !ggml_cuda_mmb_dq_packed(gate_n->src[0]) &&
                         ggml_are_same_shape(up_n->src[0], gate_n->src[0]) && ggml_cuda_mmv_group_seg_ok(n2->src[0], y) &&
-                        glu->type == GGML_TYPE_F32 && ggml_is_contiguous(glu) && ggml_nelements(glu) == up_n->src[0]->ne[1] &&
+                        glu->type == GGML_TYPE_F32 && ggml_is_contiguous(glu) && ggml_nelements(glu) == up_n->src[0]->ne[1]*y->ne[1] &&
                         ggml_cuda_should_fuse_mul_mat(up_n, gate_n, glu) &&
                         ggml_can_fuse_subgraph(cgraph, j, { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU }, { j + 2 })) {
                     segs[nseg].w         = up_n->src[0];

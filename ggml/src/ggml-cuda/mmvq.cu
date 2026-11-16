@@ -2018,8 +2018,7 @@ static void mul_mat_vec_q_fq_switch_type(
 }
 
 // ---------------------------------------------------------------------------------------------
-// RDNA3.5 grouped single-column matvec: several independent matvecs that share the same activation vector
-// Q8_0 matvecs are launched as one kernel. Each segment is a plain [ncols x nrows] weight matrix with an optional
+// RDNA3.5 grouped matvec: independent Q8_0 matvecs that share the same activations use one kernel. Each segment is a plain [ncols x nrows] weight matrix with an optional
 // Q8_0 gate and GLU epilogue. Blocks are assigned to segments by a prefix over the segment block counts.
 
 #define MMVQ_GROUP_MAX 4
@@ -2092,7 +2091,7 @@ static __global__ void mul_mat_vec_fq_group(
     }
 
     {
-        const float * y = y_ptr;
+        const float * y = y_ptr + (size_t) blockIdx.y*ncols_x;
         const int nby = ncols_x / QK8_1;
         for (int i = tid; i < 4*nby; i += nwarps*warp_size) {
             const int ib  = i >> 2;
@@ -2191,7 +2190,7 @@ static __global__ void mul_mat_vec_fq_group(
                     break;
             }
         }
-        seg.dst[row] = result;
+        seg.dst[(size_t) blockIdx.y*seg.nrows + row] = result;
     }
 }
 
@@ -2200,7 +2199,7 @@ bool ggml_cuda_mmv_group_seg_ok(const ggml_tensor * w, const ggml_tensor * y) {
     if (!GGML_CUDA_CC_IS_RDNA3_5(cc)) {
         return false;
     }
-    if (y->type != GGML_TYPE_F32 || y->ne[1] != 1 || y->ne[2] != 1 || y->ne[3] != 1 || !ggml_is_contiguous(y) ||
+    if (y->type != GGML_TYPE_F32 || (y->ne[1] < 1 || y->ne[1] > 8) || y->ne[2] != 1 || y->ne[3] != 1 || !ggml_is_contiguous(y) ||
             (uintptr_t) y->data % 16 != 0 || y->ne[0] != w->ne[0]) {
         return false;
     }
@@ -2209,13 +2208,18 @@ bool ggml_cuda_mmv_group_seg_ok(const ggml_tensor * w, const ggml_tensor * y) {
         return false;
     }
     const int64_t ncols = w->ne[0];
+    // Limit the unmeasured multi-column path to the small HC and shared-expert projections.
+    if (y->ne[1] > 1 && !((ncols == 10240 && w->ne[1] == 320) ||
+            (ncols == 320 && w->ne[1] == 10240) || (ncols == 2560 && w->ne[1] == 640))) {
+        return false;
+    }
     if (w->type == GGML_TYPE_Q8_0) {
         return ncols % QK8_1 == 0 && (ncols / QK8_1) * sizeof(block_q8_1) <= 16384 && w->nb[1] % sizeof(block_q8_0) == 0;
     }
     return false;
 }
 
-void ggml_cuda_mmv_group(ggml_backend_cuda_context & ctx, const ggml_tensor * y, const ggml_cuda_mmv_group_seg * segs, const int nseg) {
+void ggml_cuda_mmv_group(ggml_backend_cuda_context & ctx, const ggml_tensor * y, const ggml_cuda_mmv_group_seg * segs, const int nseg, const float y_scale, const float y_bias, const int y_op) {
     GGML_ASSERT(nseg >= 1 && nseg <= MMVQ_GROUP_MAX);
     const int device    = ggml_cuda_get_device();
     const int warp_size = ggml_cuda_info().devices[device].warp_size;
@@ -2228,7 +2232,7 @@ void ggml_cuda_mmv_group(ggml_backend_cuda_context & ctx, const ggml_tensor * y,
     int64_t max_rows      = 0;
     for (int i = 0; i < nseg; ++i) {
         GGML_ASSERT(ggml_cuda_mmv_group_seg_ok(segs[i].w, y));
-        GGML_ASSERT(segs[i].dst->type == GGML_TYPE_F32 && ggml_is_contiguous(segs[i].dst) && ggml_nelements(segs[i].dst) == segs[i].w->ne[1]);
+        GGML_ASSERT(segs[i].dst->type == GGML_TYPE_F32 && ggml_is_contiguous(segs[i].dst) && ggml_nelements(segs[i].dst) == segs[i].w->ne[1]*y->ne[1]);
         GGML_ASSERT(!segs[i].gate || (!ggml_cuda_mmb_dq_packed(segs[i].gate) && !ggml_cuda_mmb_dq_packed(segs[i].w)));
         if (segs[i].gate) {
             GGML_ASSERT(segs[i].w->type == GGML_TYPE_Q8_0 && segs[i].gate->type == GGML_TYPE_Q8_0 &&
@@ -2265,7 +2269,7 @@ void ggml_cuda_mmv_group(ggml_backend_cuda_context & ctx, const ggml_tensor * y,
         nblocks += (d.nrows + nwarps - 1) / nwarps;
     }
 
-    const dim3 block_nums(nblocks, 1, 1);
+    const dim3 block_nums(nblocks, y->ne[1], 1);
     const dim3 block_dims(warp_size, nwarps, 1);
     const int  nbytes_shared = total_q8_rows > 0 ? (ncols / QK8_1) * sizeof(block_q8_1) : 0;
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, ctx.stream());
@@ -2274,7 +2278,7 @@ void ggml_cuda_mmv_group(ggml_backend_cuda_context & ctx, const ggml_tensor * y,
     const bool long_rows = (ncols / QK8_0) >= 16 * blocks_per_iter && total_q8_rows <= 1024;
 
     auto launch = [&](auto kernel) {
-        ggml_cuda_kernel_launch(kernel, launch_params, args, (const float *) y->data, ncols, 1.0f, 0.0f, 0);
+        ggml_cuda_kernel_launch(kernel, launch_params, args, (const float *) y->data, ncols, y_scale, y_bias, y_op);
     };
 
     switch (nwarps) {
@@ -3002,6 +3006,16 @@ static bool mul_mat_vec_q_fq_try(
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const int64_t ncols_dst_fq = ids ? ne2 : ne1;
+    if (!ids && !fusion && ncols_dst_fq > 1 && ggml_is_matrix(dst) && ggml_is_contiguous(dst) &&
+            ggml_cuda_mmv_group_seg_ok(src0, src1)) {
+        if (launch) {
+            ggml_cuda_mmv_group_seg seg;
+            seg.w = src0;
+            seg.dst = dst;
+            ggml_cuda_mmv_group(ctx, src1, &seg, 1, y_scale, y_bias, y_op);
+        }
+        return true;
+    }
     const bool aligned = (uintptr_t) src1->data % 16 == 0 && nb11 % 16 == 0 && nb12 % 16 == 0 && nb13 % 16 == 0;
     const bool fusion_ok = !fusion ||
         (fusion->x_scale == nullptr && fusion->gate_scale == nullptr && fusion->shared_up == nullptr &&
