@@ -5415,6 +5415,44 @@ struct test_indexer_score : public test_case {
     }
 };
 
+// qwen4exp QSA indexer scorer at decode (1-8 queries): the fused chain minus the same chain with every head slice made
+// contiguous (CONT before each ADD), which no scorer fusion matches, on the same backend. The CPU gets exactly 0. Up to 2
+// queries the unfused GEMM is the f32 matvec, whose reduction tree the decode scorer reproduces, so the difference must be
+// exactly 0 there; from 3 queries the unfused GEMM is rocBLAS and only rounding may differ.
+struct test_indexer_score_ident : public test_case {
+    const int blocks, queries;
+    test_indexer_score_ident(int blocks, int queries) : blocks(blocks), queries(queries) {}
+    std::string op_desc(ggml_tensor *) override { return "INDEXER_SCORE_IDENT"; }
+    std::string vars() override { return VARS_TO_STR2(blocks, queries); }
+    bool run_whole_graph() override { return true; }
+    double max_err() override { return queries <= 2 ? 0.0 : 1e-4; }
+    double err(const float * a, const float * b, size_t n) override {
+        double m = 0.0;
+        for (size_t i = 0; i < n; ++i) { m = std::max(m, (double) std::fabs(a[i] - b[i])); }
+        return m;
+    }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int dim = 128, heads = 4;
+        auto * keys = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, dim, blocks);
+        auto * q    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, dim, heads * queries);
+        auto chain = [&](bool fusable) {
+            auto * score = ggml_mul_mat(ctx, keys, q);
+            score = ggml_reshape_4d(ctx, score, blocks, heads, queries, 1);
+            score = ggml_relu(ctx, score);
+            ggml_tensor * sum = nullptr;
+            for (int h = 0; h < heads; ++h) {
+                ggml_tensor * slice = ggml_view_3d(ctx, score, blocks, queries, 1, score->nb[2], score->nb[3], h * score->nb[1]);
+                if (!fusable && h > 0) { slice = ggml_cont(ctx, slice); }
+                sum = sum ? ggml_add(ctx, sum, slice) : ggml_cont(ctx, slice);
+            }
+            return sum;
+        };
+        ggml_tensor * fused = chain(true);
+        ggml_tensor * plain = chain(false);
+        return ggml_sub(ctx, fused, plain);
+    }
+};
+
 // RMS_NORM + MUL(gamma) [+ MUL(sigmoid gate)], short rows: the qwen3.5/qwen4exp gated GDN norm. Allocated through
 // the scheduler so graph_optimize runs: it moves the gate chain ahead of the norm (Vulkan RMS_NORM_MUL_MUL).
 // proj: the gate is reshape(mul_mat(W, z)) as in the model; v: the input is a strided view.
@@ -15316,6 +15354,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (bool bounded : {false, true}) test_cases.emplace_back(new test_indexer_score(3001, queries, true, bounded));
     }
     test_cases.emplace_back(new test_indexer_score(3001, 512, true, true));
+    // decode: 1-8 queries (the decode scorer on RDNA3.5; 4 x queries GEMM columns)
+    for (int queries : {1, 2, 3, 4, 8}) {
+        for (int blocks : {1000, 8192}) {
+            for (bool vis : {false, true}) test_cases.emplace_back(new test_indexer_score(blocks, queries, vis));
+        }
+        test_cases.emplace_back(new test_indexer_score(3001, queries, true, true));
+        test_cases.emplace_back(new test_indexer_score_ident(8191, queries));
+    }
+    test_cases.emplace_back(new test_indexer_score(63, 1, true));    // < 64 blocks: unfused
+    test_cases.emplace_back(new test_indexer_score_ident(64, 1));
+    test_cases.emplace_back(new test_indexer_score_ident(65, 2));    // a partial last row group
     // with the compact visibility chain (fused on RDNA3.5)
     for (int blocks : {64, 1000, 10112}) test_cases.emplace_back(new test_indexer_head_sum(blocks,4,512,1,false,false,0,1));
     test_cases.emplace_back(new test_indexer_head_sum(1000,4,77,1,false,false,0,1));
@@ -18328,6 +18377,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_qsa_strip(32256, 512,  512, 512));          // FN 8192 blocks x 512 queries, one whole strip
     test_cases.emplace_back(new test_qsa_strip(4000,  700,  512, 512));          // ragged last strip (188 queries)
     test_cases.emplace_back(new test_qsa_strip(31744, 1024, 512, 512, true));    // LLAMA_FN_LAST_ATTN_TRIM: the last strip only
+    // decode and speculative verify: one strip of 1-8 queries (the decode scorer on RDNA3.5)
+    for (int64_t q : {1, 2, 4, 8}) {
+        test_cases.emplace_back(new test_qsa_strip(8188 - q, q, q, 512));
+        test_cases.emplace_back(new test_qsa_strip(31741, q, q, 512));
+    }
     test_cases.emplace_back(new test_qsa_strip(4000,  700,  512, 512, true));    // trimmed ragged strip
 
     // exhaustive top_k tests

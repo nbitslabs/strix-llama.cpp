@@ -5081,7 +5081,8 @@ static int ggml_cuda_match_hc_mix(const ggml_cgraph * cgraph, const int i, ggml_
     return n_ops;
 }
 
-static int ggml_cuda_match_idx_relu_sum(const ggml_cgraph * g, int i, ggml_cuda_idx_relu_sum_args & a) {
+// min_rows: the standalone kernel needs 64 score rows to pay off; the decode scorer takes the 1-8 query chain
+static int ggml_cuda_match_idx_relu_sum(const ggml_cgraph * g, int i, ggml_cuda_idx_relu_sum_args & a, int64_t min_rows = 64) {
     if (i + 4 >= g->n_nodes) return 0;
     const ggml_tensor * relu = g->nodes[i];
     if (relu->op != GGML_OP_UNARY || ggml_get_unary_op(relu) != GGML_UNARY_OP_RELU) return 0;
@@ -5089,7 +5090,7 @@ static int ggml_cuda_match_idx_relu_sum(const ggml_cgraph * g, int i, ggml_cuda_
     const ggml_tensor * src = relu->src[0];
     if (!src || src->type != GGML_TYPE_F32 || !ggml_is_contiguous(src) || !ggml_are_same_shape(src, relu)) return 0;
     const int64_t nb = relu->ne[0], H = relu->ne[1], nt = relu->ne[2], ns = relu->ne[3];
-    if (H < 2 || H > 32 || nb < 64 || nt * ns < 64 || nt * ns > UINT16_MAX) return 0;
+    if (H < 2 || H > 32 || nb < 64 || nt * ns < min_rows || nt * ns > UINT16_MAX) return 0;
     auto is_slice = [&](const ggml_tensor * v, int64_t h) {
         return v->op == GGML_OP_VIEW && v->view_src == relu && v->type == GGML_TYPE_F32 &&
                v->ne[0] == nb && v->ne[1] == nt && v->ne[2] == ns && v->ne[3] == 1 &&
@@ -5234,8 +5235,10 @@ static int ggml_cuda_match_idx_relu_sum(const ggml_cgraph * g, int i, ggml_cuda_
     return count2;
 }
 
-// MUL_MAT(keys F32, q) -> RESHAPE [M, 4, nq] -> RELU/head sum (+ visibility): the scorer writes the summed scores
-static int ggml_cuda_match_idx_gemm(ggml_backend_cuda_context & ctx, const ggml_cgraph * g, int i, ggml_cuda_idx_relu_sum_args & a) {
+// MUL_MAT(keys F32, q) -> RESHAPE [M, 4, nq] -> RELU/head sum (+ visibility): the scorer writes the summed scores.
+// decode (optional out): set when the chain has 1-8 queries and goes to ggml_cuda_idx_score_decode instead of the MMB scorer
+static int ggml_cuda_match_idx_gemm(ggml_backend_cuda_context & ctx, const ggml_cgraph * g, int i, ggml_cuda_idx_relu_sum_args & a,
+        bool * decode = nullptr) {
     if (i + 3 >= g->n_nodes) return 0;
     const ggml_tensor * mm = g->nodes[i];
     if (mm->op != GGML_OP_MUL_MAT || mm->src[2] != nullptr || mm->type != GGML_TYPE_F32 || !ggml_is_contiguous(mm)) return 0;
@@ -5244,9 +5247,12 @@ static int ggml_cuda_match_idx_gemm(ggml_backend_cuda_context & ctx, const ggml_
         rs->ne[1] * rs->ne[2] != mm->ne[1] * mm->ne[2] * mm->ne[3]) return 0;
     const ggml_tensor * relu = g->nodes[i + 2];
     if (relu->op != GGML_OP_UNARY || ggml_get_unary_op(relu) != GGML_UNARY_OP_RELU || relu->src[0] != rs) return 0;
-    const int c = ggml_cuda_match_idx_relu_sum(g, i + 2, a);
+    // the MMB scorer needs >= 512 GEMM columns, the decode scorer <= 32: the two never compete for a chain
+    const bool dec = rs->ne[2] <= 8 && rs->ne[3] == 1 && ggml_cuda_idx_score_decode_supported(mm->src[0], mm->src[1], mm);
+    const int c = ggml_cuda_match_idx_relu_sum(g, i + 2, a, dec ? 1 : 64);
     if (c <= 0 || a.score != rs || a.heads != 4) return 0;
-    if (!ggml_cuda_mmb_idx_score_supported(ctx, mm->src[0], mm->src[1], mm, a.heads)) return 0;
+    if (!dec && !ggml_cuda_mmb_idx_score_supported(ctx, mm->src[0], mm->src[1], mm, a.heads)) return 0;
+    if (decode) { *decode = dec; }
     const int count = c + 2;
     const int output = i + count - 1;
     if (g->nodes[output] != a.dst) return 0;
@@ -5791,11 +5797,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (node->op == GGML_OP_MUL_MAT && GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
         ggml_cuda_idx_relu_sum_args args;
-        const int count = ggml_cuda_match_idx_gemm(*cuda_ctx, cgraph, i, args);
+        bool decode = false;
+        const int count = ggml_cuda_match_idx_gemm(*cuda_ctx, cgraph, i, args, &decode);
         if (count > 0) {
-            ggml_cuda_mmb_idx_score(*cuda_ctx, node->src[0], node->src[1], args.dst,
-                args.vis_tails  ? (const int32_t *) args.vis_tails->data  : nullptr,
-                args.vis_starts ? (const int32_t *) args.vis_starts->data : nullptr);
+            const int32_t * tails  = args.vis_tails  ? (const int32_t *) args.vis_tails->data  : nullptr;
+            const int32_t * starts = args.vis_starts ? (const int32_t *) args.vis_starts->data : nullptr;
+            if (decode) {
+                ggml_cuda_idx_score_decode(*cuda_ctx, node->src[0], node->src[1], args.dst, tails, starts);
+            } else {
+                ggml_cuda_mmb_idx_score(*cuda_ctx, node->src[0], node->src[1], args.dst, tails, starts);
+            }
             return count - 1;
         }
     }
