@@ -9082,6 +9082,32 @@ struct test_norm_mmv : public test_case {
     }
 };
 
+struct test_ssm_bf16_dual : public test_case {
+    const int64_t tokens;
+    const bool reshape;
+    ggml_tensor * beta = nullptr;
+    ggml_tensor * alpha = nullptr;
+
+    test_ssm_bf16_dual(int64_t tokens, bool reshape) : tokens(tokens), reshape(reshape) {}
+    std::string vars() override { return VARS_TO_STR2(tokens, reshape); }
+    std::string op_desc(ggml_tensor *) override { return "SSM_BF16_DUAL"; }
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { beta, alpha }; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2560, tokens);
+        ggml_tensor * wb = ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, 2560, 48);
+        ggml_tensor * wa = ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, 2560, 48);
+        beta = ggml_mul_mat(ctx, wb, x);
+        alpha = ggml_mul_mat(ctx, wa, x);
+        if (reshape) {
+            return ggml_add(ctx, ggml_reshape_4d(ctx, beta, 1, 48, tokens, 1),
+                                 ggml_reshape_4d(ctx, alpha, 1, 48, tokens, 1));
+        }
+        return ggml_add(ctx, beta, alpha);
+    }
+};
+
 // GGML_OP_OUT_PROD
 // GGML_OP_MUL_MAT group: independent single-column matvecs on one activation vector
 // (RDNA3.5 CUDA launches independent Q8_0 segments as one grouped kernel)
@@ -16573,6 +16599,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, v, eps));
                 test_cases.emplace_back(new test_rms_norm(GGML_TYPE_BF16, { n, 5, 4, 3 }, v, eps));
             }
+        }
+    }
+
+    for (int64_t tokens : { 1, 4, 8 }) {
+        for (bool reshape : { false, true }) {
+            test_cases.emplace_back(new test_ssm_bf16_dual(tokens, reshape));
         }
     }
 
