@@ -6124,7 +6124,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             j_end = j;
             j++;
         }
-        if (nseg >= 2 && ggml_cuda_check_fusion_memory_ranges(cgraph, i, j_end - i + 1, out_nodes, nseg)) {
+        if ((nseg >= 2 || (y->ne[1] > 1 && nseg == 1 && j_end > i)) &&
+                ggml_cuda_check_fusion_memory_ranges(cgraph, i, j_end - i + 1, out_nodes, nseg)) {
             ggml_cuda_mmv_group(*cuda_ctx, y, segs, nseg);
             return j_end - i;
         }

@@ -841,18 +841,6 @@ static void mul_mat_vec_f_cuda(
         stride_channel_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, exact_batch, stream);
 }
 
-static __global__ void mul_mat_vec_f_split_sum(const float * partial, float * dst, const int n, const int splits) {
-    const int i = threadIdx.x;
-    if (i >= n) {
-        return;
-    }
-    float sum = 0.0f;
-    for (int k = 0; k < splits; ++k) {
-        sum += partial[k*n + i];
-    }
-    dst[i] = sum;
-}
-
 void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
     const ggml_cuda_mm_fusion_args_host * fusion) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
@@ -878,32 +866,6 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
     // the fused GLU path gets the GLU node as dst, which carries no matmul precision, so it accumulates in F32
     const enum ggml_prec prec = fast_fp16_available(cc) && !(fusion && fusion->gate) ? ggml_prec_get_acc(dst) : GGML_PREC_F32;
     const bool exact_batch = ggml_get_op_params_i32(dst, 1) == GGML_HINT_EXACT_BATCH;
-
-    // gfx1151: caller measured 20+ us for [10240,4] and 9 us for [2560,1]. Split the tiny row grid; retain only if device timings improve.
-    const bool skinny = (ne00 == 10240 && ne01 == 4) || (ne00 == 2560 && ne01 == 1);
-    if (GGML_CUDA_CC_IS_RDNA3_5(cc) && skinny && !ids && !fusion && !exact_batch &&
-            (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_BF16) &&
-            ne11 >= 1 && ne11 <= 8 && ggml_is_matrix(src0) && ggml_is_matrix(src1) && ggml_is_matrix(dst) &&
-            ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst)) {
-        constexpr int chunk = 128;
-        const int splits = ne00 / chunk;
-        const int n = ne01 * ne11;
-        ggml_cuda_pool_alloc<float> partial(ctx.pool(), n * splits);
-        ggml_tensor w = *src0;
-        ggml_tensor y = *src1;
-        ggml_tensor d = *dst;
-        w.ne[0] = y.ne[0] = chunk;
-        w.ne[2] = y.ne[2] = d.ne[2] = splits;
-        w.nb[2] = chunk * ts_src0;
-        y.nb[2] = chunk * sizeof(float);
-        d.data = partial.get();
-        d.src[0] = &w;
-        d.src[1] = &y;
-        ggml_cuda_mul_mat_vec_f(ctx, &w, &y, nullptr, &d);
-        const ggml_cuda_kernel_launch_params params(dim3(1), dim3(32), 0, ctx.stream());
-        ggml_cuda_kernel_launch(mul_mat_vec_f_split_sum, params, partial.get(), (float *) dst->data, n, splits);
-        return;
-    }
 
     const float   * src1_d =       (const float   *) src1->data;
     const int32_t *  ids_d = ids ? (const int32_t *)  ids->data : nullptr;

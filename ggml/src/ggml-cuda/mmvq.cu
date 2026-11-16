@@ -2194,6 +2194,118 @@ static __global__ void mul_mat_vec_fq_group(
     }
 }
 
+// Multi-column groups share global Q8_1 activations and keep weights in registers across columns.
+template <int ncols_dst>
+__launch_bounds__(4 * ggml_cuda_get_physical_warp_size(), 1)
+static __global__ void mul_mat_vec_q_group(
+        const mmvq_group_args_dev args, const block_q8_1 * GGML_CUDA_RESTRICT y_q8, const int ncols_x,
+        const int stride_col_y) {
+    constexpr int nwarps = 4;
+    constexpr int pf = MMVQ_FQ_PF;
+    constexpr int qk  = QK8_0;
+    constexpr int qi  = QI8_0;
+    constexpr int vdr = VDR_Q8_0_Q8_1_MMVQ;
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int blocks_per_iter = vdr * warp_size / qi;
+
+    const int lane = threadIdx.x;
+
+    // segment lookup, uniform per block
+    int s = 0;
+#pragma unroll
+    for (int k = 1; k < MMVQ_GROUP_MAX; ++k) {
+        if (k < args.nseg && (int) blockIdx.x >= args.seg[k].blocks_begin) {
+            s = k;
+        }
+    }
+    const mmvq_group_seg_dev seg = args.seg[s];
+
+    const int  row    = ((int) blockIdx.x - seg.blocks_begin)*nwarps + threadIdx.y;
+    if (row >= seg.nrows) {
+        return;
+    }
+
+    const bool use_gate = seg.gate != nullptr;
+
+    const int blocks_per_row_x = ncols_x / qk;
+    const int kqs  = vdr * (lane % (qi/vdr));
+    const int kbx0 = lane / (qi/vdr);
+
+    const int pk_row = seg.pk ? row : -1;
+    const block_q8_0 * x  = (const block_q8_0 *) seg.vx + (seg.pk ? 0 : (size_t) row*seg.stride_row);
+    const block_q8_0 * xg = use_gate ? (const block_q8_0 *) seg.gate + (size_t) row*seg.gate_stride_row : nullptr;
+
+    mmvq_fq_q8_0_chunk<pf> cx;
+    mmvq_fq_q8_0_chunk<pf> cg;
+    mmvq_fq_q8_0_load(cx, x, kbx0, kqs, blocks_per_row_x, pk_row);
+    if (use_gate) {
+        mmvq_fq_q8_0_load(cg, xg, kbx0, kqs, blocks_per_row_x);
+    }
+
+    float tmp[ncols_dst] = {};
+    float tmp_gate[ncols_dst] = {};
+
+    constexpr int chunk_blocks = pf*blocks_per_iter;
+    for (int c0 = kbx0; c0 < blocks_per_row_x; c0 += chunk_blocks) {
+        mmvq_fq_q8_0_chunk<pf> nx;
+        mmvq_fq_q8_0_chunk<pf> ng;
+        const int c1 = c0 + chunk_blocks;
+        if (c1 < blocks_per_row_x) {
+            mmvq_fq_q8_0_load(nx, x, c1, kqs, blocks_per_row_x, pk_row);
+            if (use_gate) {
+                mmvq_fq_q8_0_load(ng, xg, c1, kqs, blocks_per_row_x);
+            }
+        }
+        // Reuse the register-staged weights for every output column.
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+            const block_q8_1 * y = y_q8 + (size_t) j*stride_col_y;
+            mmvq_fq_q8_0_dot(tmp[j], cx, y, c0, kqs, blocks_per_row_x);
+            if (use_gate) {
+                mmvq_fq_q8_0_dot(tmp_gate[j], cg, y, c0, kqs, blocks_per_row_x);
+            }
+        }
+        if (c1 < blocks_per_row_x) {
+            cx = nx;
+            if (use_gate) {
+                cg = ng;
+            }
+        }
+    }
+
+#pragma unroll
+    for (int j = 0; j < ncols_dst; ++j) {
+        tmp[j] = warp_reduce_sum<warp_size>(tmp[j]);
+        if (use_gate) {
+            tmp_gate[j] = warp_reduce_sum<warp_size>(tmp_gate[j]);
+        }
+
+        if (lane == 0) {
+            float result = tmp[j];
+            if (use_gate) {
+                switch (seg.glu_op) {
+                    case GGML_GLU_OP_SWIGLU:
+                        result *= ggml_cuda_op_silu_single(tmp_gate[j]);
+                        break;
+                    case GGML_GLU_OP_GEGLU:
+                        result *= ggml_cuda_op_gelu_single(tmp_gate[j]);
+                        break;
+                    case GGML_GLU_OP_SWIGLU_OAI:
+                        result = ggml_cuda_op_swiglu_oai_single(tmp_gate[j], result);
+                        break;
+                    case GGML_GLU_OP_SWIGLU_CLAMP:
+                        result = ggml_cuda_op_swiglu_clamp_single(tmp_gate[j], result, seg.glu_limit);
+                        break;
+                    default:
+                        result = result * tmp_gate[j];
+                        break;
+                }
+            }
+            seg.dst[(size_t) j*seg.nrows + row] = result;
+        }
+    }
+}
+
 bool ggml_cuda_mmv_group_seg_ok(const ggml_tensor * w, const ggml_tensor * y) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     if (!GGML_CUDA_CC_IS_RDNA3_5(cc)) {
@@ -2208,9 +2320,9 @@ bool ggml_cuda_mmv_group_seg_ok(const ggml_tensor * w, const ggml_tensor * y) {
         return false;
     }
     const int64_t ncols = w->ne[0];
-    // Limit the unmeasured multi-column path to the small HC and shared-expert projections.
+    // gfx1151: per-column weight scans regressed HC down and shared up at T=4 (2026-11-16); remeasure before widening this gate.
     if (y->ne[1] > 1 && !((ncols == 10240 && w->ne[1] == 320) ||
-            (ncols == 320 && w->ne[1] == 10240) || (ncols == 2560 && w->ne[1] == 640))) {
+            (ncols == 2560 && w->ne[1] == 640))) {
         return false;
     }
     if (w->type == GGML_TYPE_Q8_0) {
@@ -2219,7 +2331,7 @@ bool ggml_cuda_mmv_group_seg_ok(const ggml_tensor * w, const ggml_tensor * y) {
     return false;
 }
 
-void ggml_cuda_mmv_group(ggml_backend_cuda_context & ctx, const ggml_tensor * y, const ggml_cuda_mmv_group_seg * segs, const int nseg, const float y_scale, const float y_bias, const int y_op) {
+void ggml_cuda_mmv_group(ggml_backend_cuda_context & ctx, const ggml_tensor * y, const ggml_cuda_mmv_group_seg * segs, const int nseg) {
     GGML_ASSERT(nseg >= 1 && nseg <= MMVQ_GROUP_MAX);
     const int device    = ggml_cuda_get_device();
     const int warp_size = ggml_cuda_info().devices[device].warp_size;
@@ -2244,7 +2356,7 @@ void ggml_cuda_mmv_group(ggml_backend_cuda_context & ctx, const ggml_tensor * y,
     }
 
     // same block-size heuristic as mul_mat_vec_q_fq_launch, applied to the largest segment
-    int nwarps = MMVQ_FQ_NWARPS;
+    int nwarps = y->ne[1] > 1 ? 4 : MMVQ_FQ_NWARPS;
     while (nwarps > 4 && ((max_rows + nwarps - 1) / nwarps) < 2 * nsm) {
         nwarps /= 2;
     }
@@ -2269,7 +2381,30 @@ void ggml_cuda_mmv_group(ggml_backend_cuda_context & ctx, const ggml_tensor * y,
         nblocks += (d.nrows + nwarps - 1) / nwarps;
     }
 
-    const dim3 block_nums(nblocks, y->ne[1], 1);
+    if (y->ne[1] > 1) {
+        const int64_t ncols_padded = GGML_PAD(ncols, MATRIX_ROW_PADDING);
+        ggml_cuda_pool_alloc<block_q8_1> y_q8(ctx.pool(), y->ne[1]*ncols_padded/QK8_1);
+        quantize_row_q8_1_cuda((const float *) y->data, y_q8.get(), ncols,
+                y->nb[1]/sizeof(float), y->nb[2]/sizeof(float), y->nb[3]/sizeof(float),
+                ncols_padded, y->ne[1], 1, 1, ctx.stream());
+        const ggml_cuda_kernel_launch_params params(dim3(nblocks, 1, 1), dim3(warp_size, nwarps, 1), 0, ctx.stream());
+        auto launch = [&](auto kernel) {
+            ggml_cuda_kernel_launch(kernel, params, args, y_q8.get(), ncols, (int) (ncols_padded/QK8_1));
+        };
+        switch (y->ne[1]) {
+            case 2: launch(mul_mat_vec_q_group<2>); break;
+            case 3: launch(mul_mat_vec_q_group<3>); break;
+            case 4: launch(mul_mat_vec_q_group<4>); break;
+            case 5: launch(mul_mat_vec_q_group<5>); break;
+            case 6: launch(mul_mat_vec_q_group<6>); break;
+            case 7: launch(mul_mat_vec_q_group<7>); break;
+            case 8: launch(mul_mat_vec_q_group<8>); break;
+            default: GGML_ABORT("fatal error");
+        }
+        return;
+    }
+
+    const dim3 block_nums(nblocks, 1, 1);
     const dim3 block_dims(warp_size, nwarps, 1);
     const int  nbytes_shared = total_q8_rows > 0 ? (ncols / QK8_1) * sizeof(block_q8_1) : 0;
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, ctx.stream());
@@ -2278,7 +2413,7 @@ void ggml_cuda_mmv_group(ggml_backend_cuda_context & ctx, const ggml_tensor * y,
     const bool long_rows = (ncols / QK8_0) >= 16 * blocks_per_iter && total_q8_rows <= 1024;
 
     auto launch = [&](auto kernel) {
-        ggml_cuda_kernel_launch(kernel, launch_params, args, (const float *) y->data, ncols, y_scale, y_bias, y_op);
+        ggml_cuda_kernel_launch(kernel, launch_params, args, (const float *) y->data, ncols, 1.0f, 0.0f, 0);
     };
 
     switch (nwarps) {
@@ -3006,13 +3141,13 @@ static bool mul_mat_vec_q_fq_try(
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const int64_t ncols_dst_fq = ids ? ne2 : ne1;
-    if (!ids && !fusion && ncols_dst_fq > 1 && ggml_is_matrix(dst) && ggml_is_contiguous(dst) &&
+    if (!ids && !fusion && y_op == 0 && ncols_dst_fq > 1 && ggml_is_matrix(dst) && ggml_is_contiguous(dst) &&
             ggml_cuda_mmv_group_seg_ok(src0, src1)) {
         if (launch) {
             ggml_cuda_mmv_group_seg seg;
             seg.w = src0;
             seg.dst = dst;
-            ggml_cuda_mmv_group(ctx, src1, &seg, 1, y_scale, y_bias, y_op);
+            ggml_cuda_mmv_group(ctx, src1, &seg, 1);
         }
         return true;
     }
@@ -3096,7 +3231,7 @@ static bool mul_mat_vec_q_fq_try(
 
 bool ggml_cuda_mul_mat_vec_q_fq_prologue_ok(ggml_backend_cuda_context & ctx, const ggml_tensor * dst, const ggml_tensor * y) {
     if (dst->op != GGML_OP_MUL_MAT || !ggml_is_quantized(dst->src[0]->type) || y->type != GGML_TYPE_F32 ||
-        !ggml_is_contiguous(y) || !ggml_are_same_shape(y, dst->src[1])) {
+        dst->ne[1] != 1 || !ggml_is_contiguous(y) || !ggml_are_same_shape(y, dst->src[1])) {
         return false;
     }
     return mul_mat_vec_q_fq_try(ctx, dst->src[0], y, nullptr, const_cast<ggml_tensor *>(dst), nullptr, 1.0f, 0.0f, 0, /*launch=*/false);
