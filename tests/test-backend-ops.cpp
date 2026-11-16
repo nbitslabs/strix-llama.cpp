@@ -5935,6 +5935,7 @@ struct test_weighted_expert_sum : public test_case {
     const int64_t n_embd;
     const int64_t n_expert_used;
     const int64_t n_tokens;
+    const bool rdna_down;
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -5945,19 +5946,22 @@ struct test_weighted_expert_sum : public test_case {
     double max_nmse_err() override { return 5e-4; }
 
     std::string vars() override {
-        return VARS_TO_STR3(n_embd, n_expert_used, n_tokens);
+        return VARS_TO_STR4(n_embd, n_expert_used, n_tokens, rdna_down);
     }
 
-    test_weighted_expert_sum(int64_t n_embd, int64_t n_expert_used, int64_t n_tokens)
-        : n_embd(n_embd), n_expert_used(n_expert_used), n_tokens(n_tokens) {}
+    test_weighted_expert_sum(int64_t n_embd, int64_t n_expert_used, int64_t n_tokens, bool rdna_down = false)
+        : n_embd(n_embd), n_expert_used(n_expert_used), n_tokens(n_tokens), rdna_down(rdna_down) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        const int64_t k = 32;
-        const int64_t n_mats = std::max<int64_t>(16, n_expert_used);
-        ggml_tensor * expert_weights = ggml_new_tensor_3d(ctx, GGML_TYPE_Q8_0, k, n_embd, n_mats);
+        const int64_t k = rdna_down ? 640 : 32;
+        const int64_t n_mats = rdna_down ? 512 : std::max<int64_t>(16, n_expert_used);
+        ggml_tensor * expert_weights = ggml_new_tensor_3d(ctx, rdna_down ? GGML_TYPE_IQ4_NL : GGML_TYPE_Q8_0, k, n_embd, n_mats);
         ggml_tensor * ids_all = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n_tokens);
         ggml_set_name(ids_all, "ids");
         ggml_tensor * ids = ggml_view_2d(ctx, ids_all, n_expert_used, n_tokens, ids_all->nb[1], 0);
+        if (rdna_down) {
+            ids = ggml_cont(ctx, ids);
+        }
         ggml_tensor * input = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, n_expert_used, n_tokens);
         ggml_tensor * experts = ggml_mul_mat_id(ctx, expert_weights, input, ids);
         ggml_tensor * weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_expert_used, n_tokens);
@@ -5981,7 +5985,7 @@ struct test_weighted_expert_sum : public test_case {
     }
 
     void initialize_tensors(ggml_context * ctx) override {
-        init_mul_mat_id_tensors(ctx, std::max<int64_t>(16, n_expert_used));
+        init_mul_mat_id_tensors(ctx, rdna_down ? 512 : std::max<int64_t>(16, n_expert_used));
     }
 };
 
@@ -16631,6 +16635,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, {128, 48, 1024, 1}, 1e-6f, false, false, false, false, true, GGML_TYPE_COUNT, GGML_TYPE_COUNT, false));
     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, {129, 48, 1, 1}, 1e-6f, false, false, false, false, true, GGML_TYPE_COUNT, GGML_TYPE_COUNT, false));
 
+    for (int64_t n_tokens : { 1, 2, 4, 8 }) {
+        test_cases.emplace_back(new test_weighted_expert_sum(2560, 10, n_tokens, true));
+    }
     test_cases.emplace_back(new test_weighted_expert_sum(127, 2, 3));
     test_cases.emplace_back(new test_weighted_expert_sum(128, 4, 5));
     test_cases.emplace_back(new test_weighted_expert_sum(2048, 8, 32));
