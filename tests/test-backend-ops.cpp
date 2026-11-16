@@ -11950,6 +11950,49 @@ struct test_mul_mat_fusion : public test_case {
     }
 };
 
+// Stable selections exercise sharing across slots as well as across tokens.
+enum moe_ids_pattern { MOE_IDS_SHARED, MOE_IDS_OVERLAP, MOE_IDS_DISTINCT };
+
+template <typename base>
+struct test_moe_dedup : public base {
+    const moe_ids_pattern pattern;
+
+    template <typename... args>
+    test_moe_dedup(moe_ids_pattern pattern, args... values) : base(values...), pattern(pattern) {}
+
+    std::string vars() override {
+        return base::vars() + ",moe_ids=" + std::to_string(pattern);
+    }
+
+    void set_ids(ggml_context * ctx) {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type != GGML_TYPE_I32 || ggml_is_view_op(t->op)) {
+                continue;
+            }
+            const int offset = t->ne[0] > this->n_mats ? 1 : 0;
+            std::vector<int32_t> data(t->ne[0]);
+            for (int64_t token = 0; token < t->ne[1]; ++token) {
+                for (int64_t slot = 0; slot < t->ne[0]; ++slot) {
+                    const int selected = (slot - offset + this->n_used + token) % this->n_used;
+                    const int first = pattern == MOE_IDS_DISTINCT ? token * this->n_used :
+                                      pattern == MOE_IDS_OVERLAP ? token : 0;
+                    data[slot] = (first + selected) % this->n_mats;
+                }
+                ggml_backend_tensor_set(t, data.data(), token * t->nb[1], data.size() * sizeof(int32_t));
+            }
+        }
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        base::initialize_tensors(ctx);
+        set_ids(ctx);
+    }
+
+    void reinit_perf_iter(ggml_context * ctx) override {
+        set_ids(ctx);
+    }
+};
+
 // Fused gate/up/GLU with GGML_PREC_Q8 on src1, e.g. a W4A16 NVFP4 checkpoint (W4A8, see test_mul_mat_w4a8)
 struct test_mul_mat_fusion_w4a8 : public test_mul_mat_fusion {
     using test_mul_mat_fusion::test_mul_mat_fusion;
@@ -16812,6 +16855,25 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 1048576, 40, 64, {1, 1}, {53, 1}));
 
     // kernel_mul_mm_id: the index of tokens 32768-33791 does not fit in 16 bits (about 0.3 GB peak memory).
+    // RDNA3.5 MoE dedupe: odd rows, strided ids, and distinct slot activations.
+    for (int tokens : {2, 4, 8}) {
+        for (moe_ids_pattern pattern : {MOE_IDS_SHARED, MOE_IDS_OVERLAP, MOE_IDS_DISTINCT}) {
+            const int experts = pattern == MOE_IDS_DISTINCT ? 10 * tokens : 16;
+            for (bool broadcast : {false, true}) {
+                test_cases.emplace_back(new test_moe_dedup<test_mul_mat_id>(pattern,
+                    GGML_TYPE_IQ3_S, GGML_TYPE_F32, experts, 10, broadcast, 65, tokens, 2560, 0, true));
+                test_cases.emplace_back(new test_moe_dedup<test_mul_mat_id>(pattern,
+                    GGML_TYPE_IQ4_NL, GGML_TYPE_F32, experts, 10, broadcast, 65, tokens, 640, 0, true));
+                test_cases.emplace_back(new test_moe_dedup<test_mul_mat_fusion>(pattern,
+                    GGML_TYPE_IQ3_S, GGML_GLU_OP_SWIGLU, tokens, 65, 2560, true, experts, 10, broadcast));
+            }
+        }
+        test_cases.emplace_back(new test_mul_mat_id_shared(GGML_TYPE_IQ3_S, tokens));
+        test_cases.emplace_back(new test_mul_mat_id_shared(GGML_TYPE_IQ4_NL, tokens));
+        test_cases.emplace_back(new test_mul_mat_id_dup(GGML_TYPE_IQ3_S, GGML_TYPE_F32, 16, 10, false, 65, tokens, 256));
+        test_cases.emplace_back(new test_mul_mat_id_dup(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 16, 10, false, 65, tokens, 640));
+    }
+
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F32, GGML_TYPE_F32, 4, 2, false, 64, 33792, 64));
     // kernel_mul_mm_id: > 2^31-element dst (8.7 GB), about 45 GB peak memory. Tokens 32514+ have a dst offset past INT32_MAX, tokens 32768+ also need a 32-bit token index.
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F32, GGML_TYPE_F32, 16, 8, false, 8256, 32832, 64));
