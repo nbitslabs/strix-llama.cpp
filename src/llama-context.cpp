@@ -1140,12 +1140,23 @@ void llama_context::sched_reserve() {
             __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
 }
 
-void llama_context::synchronize() {
+void llama_context::synchronize(bool allow_reuse) {
+    static const bool draft_sync_min = [] {
+        const char * env = getenv("LLAMA_DRAFT_SYNC_MIN");
+        return !env || atoi(env) != 0;
+    }();
+    // Evaluation callbacks can read outputs between submissions inside the scheduler.
+    const bool reuse = allow_reuse && draft_sync_min && cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && !cparams.cb_eval;
+    if (reuse && outputs_synchronized) {
+        return;
+    }
+    outputs_synchronized = false;
     if (!sched) {
         return;
     }
 
     ggml_backend_sched_synchronize(sched.get());
+    outputs_synchronized = reuse;
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
@@ -1183,6 +1194,7 @@ const llama_cparams & llama_context::get_cparams() const {
 }
 
 ggml_backend_sched_t llama_context::get_sched() const {
+    outputs_synchronized = false;
     return sched.get();
 }
 
@@ -1219,6 +1231,8 @@ llama_memory_t llama_context::get_memory() const {
 }
 
 bool llama_context::memory_update(bool optimize) {
+    outputs_synchronized = false;
+
     if (!memory) {
         return false;
     }
@@ -2227,6 +2241,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 }
 
 int llama_context::encode(const llama_batch_ext & batch_inp) {
+    outputs_synchronized = false;
+
     if (batch_inp.tokens.empty()) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
         return -1;
@@ -2486,6 +2502,8 @@ struct llama_prefetch_guard {
 };
 
 int llama_context::decode(const llama_batch_ext & batch_inp) {
+    outputs_synchronized = false;
+
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);
@@ -3780,7 +3798,10 @@ ggml_status llama_context::graph_compute(
 
     copy_experts.reset();
 
+    outputs_synchronized = false;
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
+    // Callbacks may access outputs during compute; the following readbacks are still pending.
+    outputs_synchronized = false;
     if (status != GGML_STATUS_SUCCESS) {
         if (auto * qsa = dynamic_cast<llama_memory_hybrid_idx *>(memory.get())) { qsa->qsa_invalidate(); }
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
@@ -5329,17 +5350,17 @@ bool llama_get_causal_attn(const llama_context * ctx) {
 }
 
 void llama_synchronize(llama_context * ctx) {
-    ctx->synchronize();
+    ctx->synchronize(true);
 }
 
 float * llama_get_logits(llama_context * ctx) {
-    ctx->synchronize();
+    ctx->synchronize(true);
 
     return ctx->get_logits();
 }
 
 float * llama_get_logits_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize(true);
 
     float * res = nullptr;
 
@@ -5353,19 +5374,19 @@ float * llama_get_logits_ith(llama_context * ctx, int32_t i) {
 }
 
 float * llama_get_embeddings(llama_context * ctx) {
-    ctx->synchronize();
+    ctx->synchronize(true);
 
     return ctx->get_embeddings();
 }
 
 float * llama_get_embeddings_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize(true);
 
     return ctx->get_embeddings_ith(i);
 }
 
 float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
-    ctx->synchronize();
+    ctx->synchronize(true);
 
     return ctx->get_embeddings_seq(seq_id);
 }
@@ -5460,19 +5481,19 @@ void llama_nextn_resident_read(const std::shared_ptr<llama_resident_nextn> & row
 }
 
 float * llama_get_embeddings_nextn(llama_context * ctx) {
-    ctx->synchronize();
+    ctx->synchronize(true);
 
     return ctx->get_embeddings_nextn();
 }
 
 float * llama_get_embeddings_nextn_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize(true);
 
     return ctx->get_embeddings_nextn_ith(i);
 }
 
 float * llama_get_embeddings_layer_inp(llama_context * ctx, uint32_t lid) {
-    ctx->synchronize();
+    ctx->synchronize(true);
 
     return ctx->get_embeddings_layer_inp(lid);
 }
@@ -5482,43 +5503,43 @@ bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler *
 }
 
 llama_token llama_get_sampled_token_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize(true);
 
     return ctx->get_sampled_token_ith(i);
 }
 
 float * llama_get_sampled_probs_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize(true);
 
     return ctx->get_sampled_probs_ith(i);
 }
 
 float * llama_get_sampled_logits_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize(true);
 
     return ctx->get_sampled_logits_ith(i);
 }
 
 llama_token * llama_get_sampled_candidates_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize(true);
 
     return const_cast<llama_token *>(ctx->get_sampled_candidates_ith(i));
 }
 
 uint32_t llama_get_sampled_candidates_count_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize(true);
 
     return static_cast<uint32_t>(ctx->get_sampled_candidates_count(i));
 }
 
 uint32_t llama_get_sampled_logits_count_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize(true);
 
     return static_cast<uint32_t>(ctx->get_sampled_logits_count(i));
 }
 
 uint32_t llama_get_sampled_probs_count_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize(true);
 
     return static_cast<uint32_t>(ctx->get_sampled_probs_count(i));
 }

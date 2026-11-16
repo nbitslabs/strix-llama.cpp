@@ -58,7 +58,7 @@ struct llama_context {
     //   - etc.
     void sched_reserve();
 
-    void synchronize();
+    void synchronize(bool allow_reuse = false);
 
     const llama_model   & get_model()   const;
     const llama_cparams & get_cparams() const;
@@ -420,6 +420,9 @@ private:
     std::vector<swap_info> output_swaps;
 
     ggml_backend_sched_ptr sched;
+
+    // Only output access may reuse a completed wait; internal barriers always wait.
+    mutable bool outputs_synchronized = false;
 
     sched_params sched_params_cur;
 
