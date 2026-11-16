@@ -10921,9 +10921,15 @@ struct test_top_k_extreme : public test_top_k {
 // HIP without hipCUB uses radix top-k for these widths. When the k-th value ties,
 // choosing the first columns must be reproducible across workgroup schedules.
 struct test_top_k_stable_ties : public test_top_k {
-    test_top_k_stable_ties(int cols) : test_top_k(GGML_TYPE_F32, {cols, 2, 1, 1}, 512, true) {}
+    const bool ordered;
+    test_top_k_stable_ties(int cols, int rows = 2, bool ordered = false)
+        : test_top_k(GGML_TYPE_F32, {cols, rows, 1, 1}, 512, true), ordered(ordered) {}
 
-    std::string vars() override { return test_top_k::vars() + ",stable_zero_cut=1"; }
+    std::string vars() override { return test_top_k::vars() + ",stable_zero_cut=1," + VARS_TO_STR1(ordered); }
+
+    bool same_output(ggml_tensor * t1, ggml_tensor * t2) override {
+        return ordered ? test_case::same_output(t1, t2) : test_top_k::same_output(t1, t2);
+    }
 
     void initialize_tensors(ggml_context * ctx) override {
         test_top_k::initialize_tensors(ctx);
@@ -10942,7 +10948,7 @@ struct test_top_k_stable_ties : public test_top_k {
                 picked[i] = int32_t(v);
                 if (v != float(picked[i])) return 1.0;
             }
-            std::sort(picked.begin(), picked.end());
+            if (!ordered) std::sort(picked.begin(), picked.end());
             for (int i = 0; i < k; ++i) if (picked[i] != i) return 1.0;
         }
         return 0.0;
@@ -15105,6 +15111,42 @@ struct test_get_rows_packed : public test_case {
     }
 };
 
+struct test_topk_moe_ties : public test_topk_moe {
+    test_topk_moe_ties(int tokens) : test_topk_moe({512, tokens, 1, 1}, 10, true, false, GATING_FUNC_SOFTMAX, 2.0f) {}
+    std::string vars() override { return test_topk_moe::vars() + ",tied_logits=1"; }
+    void initialize_tensors(ggml_context * ctx) override {
+        test_topk_moe::initialize_tensors(ctx);
+        std::vector<float> data(ggml_nelements(logits), 0.0f);
+        ggml_backend_tensor_set(logits, data.data(), 0, ggml_nbytes(logits));
+    }
+    // CPU argsort has no index tie-break. Check the fused HIP router's ordered IDs directly.
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return {selected_experts}; }
+    double err(const float * a, const float * b, size_t n) override {
+        GGML_UNUSED(b);
+        if (n != size_t(ne[1] * n_expert_used)) return 1.0;
+        for (size_t i = 0; i < n; ++i) {
+            if (a[i] != float(i % n_expert_used)) return 1.0;
+        }
+        return 0.0;
+    }
+    double max_err(ggml_backend_t backend) override {
+        const char * reg = ggml_backend_reg_name(ggml_backend_dev_backend_reg(ggml_backend_get_device(backend)));
+        return strcmp(reg, "ROCm") == 0 ? 0.0 : 1.0;
+    }
+    bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
+        const char * reg = ggml_backend_reg_name(ggml_backend_dev_backend_reg(ggml_backend_get_device(backend)));
+        if (strcmp(reg, "ROCm") != 0) return true;
+        std::vector<float> actual(ggml_nelements(weights));
+        std::vector<float> expected(actual.size(), 0.2f);
+        ggml_backend_tensor_get(weights, actual.data(), 0, ggml_nbytes(weights));
+        if (memcmp(actual.data(), expected.data(), ggml_nbytes(weights)) != 0) {
+            msg = "tied router weights differ from normalized, scaled uniform probabilities";
+            return false;
+        }
+        return true;
+    }
+};
+
 struct test_topk_moe_lifetime : public test_topk_moe {
     const bool offset;
     ggml_tensor * logits = nullptr;
@@ -15207,7 +15249,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_get_rows_packed(GGML_TYPE_F16, 128, kv, kv, 1, 1, 0, 1, true));
     }
 
-    for (int nt : {1, 8, 9, 256, 2048}) {
+    for (int nt : {1, 2, 4, 8}) {
+        test_cases.emplace_back(new test_topk_moe({512, nt, 1, 1}, 10, true, false, GATING_FUNC_SOFTMAX, 2.0f));
+        test_cases.emplace_back(new test_topk_moe_ties(nt));
+    }
+    for (int nt : {1, 4}) {
+        test_cases.emplace_back(new test_top_k_stable_ties(2048, nt, true));
+    }
+    for (int nt : {1, 2, 4, 8, 9, 256, 2048}) {
         for (bool offset : {false, true}) {
             test_cases.emplace_back(new test_topk_moe_lifetime(nt, offset, false, GATING_FUNC_SOFTMAX, true, 0.0f));
             test_cases.emplace_back(new test_topk_moe_lifetime(nt, offset, true, GATING_FUNC_SIGMOID, true, 2.0f));

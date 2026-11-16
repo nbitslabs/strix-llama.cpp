@@ -3,6 +3,7 @@
 #include "topk-moe.cuh"
 
 #include <cmath>
+#include <cstdlib>
 #include <initializer_list>
 
 // Kernel config struct - passed by value to CUDA kernel
@@ -341,6 +342,80 @@ __global__ void topk_moe_cuda(const float *         logits,
     }
 }
 
+#if defined(GGML_USE_HIP)
+static bool topk_moe_fast_enabled() {
+    static const bool fast = [] {
+        const char * env = std::getenv("GGML_CUDA_TOPK_MOE_FAST");
+        return !env || std::atoi(env) != 0;
+    }();
+    return fast;
+}
+
+// gfx1151 decode: the measured 512-expert router takes about 13 us with eight rows packed per block.
+// Keep the warp reductions; distribute only selection. Remove this path if hardware validation shows no gain.
+static __global__ void topk_moe_512_decode(const float * logits, float * weights, int32_t * ids,
+        int n_expert_used, float clamp_val, float scale_val, bool with_norm) {
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    __shared__ float probs[512];
+    __shared__ int order[512];
+
+    if (tid < WARP_SIZE) {
+        float wt[512 / WARP_SIZE];
+#pragma unroll
+        for (int i = 0; i < 512 / WARP_SIZE; ++i) {
+            wt[i] = logits[row * 512 + i * WARP_SIZE + tid];
+        }
+        softmax_warp_inplace<512 / WARP_SIZE, false>(wt, 512, tid);
+#pragma unroll
+        for (int i = 0; i < 512 / WARP_SIZE; ++i) {
+            probs[i * WARP_SIZE + tid] = __isnanf(wt[i]) ? -FLT_MAX : wt[i];
+        }
+    }
+    order[tid] = tid;
+    order[tid + 256] = tid + 256;
+    __syncthreads();
+
+    // One owner per comparator. Equal probabilities use the original argmax's lower expert index.
+    for (int size = 2; size <= 512; size *= 2) {
+        for (int stride = size / 2; stride > 0; stride /= 2) {
+            const int a = (tid / stride) * (2 * stride) + tid % stride;
+            const int b = a + stride;
+            const int ia = order[a], ib = order[b];
+            const bool before = probs[ia] > probs[ib] || (probs[ia] == probs[ib] && ia < ib);
+            if (before == ((a & size) != 0)) {
+                order[a] = ib;
+                order[b] = ia;
+            }
+            __syncthreads();
+        }
+    }
+
+    if (tid < WARP_SIZE) {
+        float wt_sum = 0.0f;
+        for (int k = 0; k < n_expert_used; ++k) {
+            const int expert = order[k];
+            if ((expert & (WARP_SIZE - 1)) == tid) {
+                ids[row * 512 + k] = expert;
+                if (with_norm) {
+                    wt_sum += probs[expert];
+                }
+            }
+        }
+        float output_weight = tid < n_expert_used ? probs[order[tid]] : 0.0f;
+        if (with_norm) {
+            wt_sum = warp_reduce_sum(wt_sum);
+            wt_sum = max(wt_sum, clamp_val);
+            const float inv_sum = 1.0f / wt_sum;
+            output_weight *= inv_sum;
+        }
+        if (tid < n_expert_used) {
+            weights[row * n_expert_used + tid] = output_weight * scale_val;
+        }
+    }
+}
+#endif // defined(GGML_USE_HIP)
+
 template<bool has_bias>
 static void launch_topk_moe_cuda(ggml_backend_cuda_context & ctx,
                                  const float *               logits,
@@ -359,6 +434,22 @@ static void launch_topk_moe_cuda(ggml_backend_cuda_context & ctx,
     dim3         grid_dims((n_rows + rows_per_block - 1) / rows_per_block, 1, 1);
     dim3         block_dims(WARP_SIZE, rows_per_block, 1);
     cudaStream_t stream = ctx.stream();
+#if defined(GGML_USE_HIP)
+    // Different row blocks cannot synchronize reads of aliased logits before writing packed weights.
+    const auto overlaps_logits = [&](const void * ptr, size_t bytes) {
+        const uintptr_t a = reinterpret_cast<uintptr_t>(logits);
+        const uintptr_t b = reinterpret_cast<uintptr_t>(ptr);
+        return a <= b ? b - a < size_t(n_rows) * n_expert * sizeof(float) : a - b < bytes;
+    };
+    if (topk_moe_fast_enabled() && !has_bias && n_expert == 512 && n_expert_used == 10 && n_rows >= 1 && n_rows <= 8 &&
+            !config.use_sigmoid && !config.use_sqrt_softplus && !config.delayed_softmax && config.n_groups == 0 &&
+            GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[ctx.device].cc) &&
+            !overlaps_logits(weights, size_t(n_rows) * n_expert_used * sizeof(float)) &&
+            !overlaps_logits(ids, size_t(n_rows) * n_expert * sizeof(int32_t))) {
+        topk_moe_512_decode<<<n_rows, 256, 0, stream>>>(logits, weights, ids, n_expert_used, clamp_val, scale_val, config.with_norm);
+        return;
+    }
+#endif // defined(GGML_USE_HIP)
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, stream);
 
 #if defined(GGML_USE_HIP) && HIP_VERSION < 60300000
