@@ -7664,7 +7664,7 @@ struct test_gdn_decode_rollback : public test_case {
     }
     std::string op_desc(ggml_tensor *) override { return "GDN_DECODE_ROLLBACK"; }
     bool run_whole_graph() override { return true; }
-    size_t max_tensors() override { return ident == 2 ? 64 * (n_tokens + 2) : 128; }   // ~45 tensors per chain
+    size_t max_tensors() override { return ident == 2 ? 64 * (n_tokens + 2) : 256; }   // ~45-60 tensors per chain
     std::vector<ggml_tensor *> fusion_test_nodes() override { return outputs; }
     // the rollback (SET_ROWS) form replaces the unfused chain and must equal it; the per-slot CPY form keeps the decode kernel's own
     // softplus (logf(1 + expf)) and is only within rounding of the unfused ops
