@@ -4370,6 +4370,13 @@ static bool ggml_cuda_gdn_decode_rollback_enabled() {
     return env == nullptr || atoi(env) != 0;
 }
 
+// GGML_CUDA_FUSE_GDN_DECODE_T1=1: also match the rollback store at one token. Off by default: on the model (2026-11-16) the
+// 1-row greedy streams changed with it, which the unit tests (exact against the unfused chain) do not reproduce
+static bool ggml_cuda_gdn_decode_rollback_t1_enabled() {
+    const char * env = getenv("GGML_CUDA_FUSE_GDN_DECODE_T1");
+    return env != nullptr && atoi(env) != 0;
+}
+
 static int ggml_cuda_try_gdn_decode_fusion(const ggml_cgraph * cgraph, int node_idx, ggml_cuda_gdn_decode_args & args) {
     const ggml_tensor * concat = cgraph->nodes[node_idx];
     if (concat->op != GGML_OP_CONCAT || concat->type != GGML_TYPE_F32 || ggml_get_op_params_i32(concat, 0) != 0) {
@@ -4545,6 +4552,9 @@ static int ggml_cuda_try_gdn_decode_fusion(const ggml_cgraph * cgraph, int node_
         // goes to slot Kw - 1 - w, i.e. slot s holds the window that starts at column n_tokens - s, which is what
         // the fused kernel writes for token n_tokens - 1 - s. Slots n_tokens..K-1 stay unwritten (conv_fill_tail off).
         const int64_t Kw = n_tokens;
+        if (n_tokens == 1 && !ggml_cuda_gdn_decode_rollback_t1_enabled()) {
+            return 0;
+        }
         // ggml_set_rows(a, b, c) keeps src[0] = b (rows), src[1] = c (indices), src[2] = a (destination)
         const ggml_tensor * windows = rb_set->src[0];
         const ggml_tensor * order   = rb_set->src[1];
