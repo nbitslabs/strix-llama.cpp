@@ -7606,7 +7606,11 @@ struct test_gdn_decode_rollback : public test_case {
     bool run_whole_graph() override { return true; }
     size_t max_tensors() override { return ident == 2 ? 64 * (n_tokens + 2) : 128; }   // ~45 tensors per chain
     std::vector<ggml_tensor *> fusion_test_nodes() override { return outputs; }
-    double max_err(ggml_backend_t backend) override { return ident == 2 ? 0.0 : ident == 1 ? 1e-6 : test_case::max_err(backend); }
+    // the rollback (SET_ROWS) form replaces the unfused chain and must equal it; the per-slot CPY form keeps the decode kernel's own
+    // softplus (logf(1 + expf)) and is only within rounding of the unfused ops
+    double max_err(ggml_backend_t backend) override {
+        return ident == 2 || (ident == 1 && rows) ? 0.0 : ident == 1 ? 1e-6 : test_case::max_err(backend);
+    }
     double err(const float * a, const float * b, size_t n) override {
         if (!ident) {
             return test_case::err(a, b, n);
@@ -7711,21 +7715,23 @@ struct test_gdn_decode_rollback : public test_case {
         chain_out a = build_chain(ctx, n_tokens, K, rows, new_cache(ctx, 3 * C, K, "conv_cache", ""), new_cache(ctx, D, K, "state_cache", ""),
                 false, ids, qkv, conv_w, alpha, dt, A, beta, norm_w, z);
         if (ident == 2) {
-            // n_tokens single-token steps on caches of one slot (the same initial rows), in graph order
-            ggml_tensor * conv_c  = new_cache(ctx, 3 * C, 1, "conv_cache", "_ref");
-            ggml_tensor * state_c = new_cache(ctx, D, 1, "state_cache", "_ref");
+            // n_tokens single-token steps (same store form and slot count: what plain decode builds with these rollback slots)
+            // on caches with the same initial rows, in graph order; each step writes slot 0, which the next one reads
+            ggml_tensor * conv_c  = new_cache(ctx, 3 * C, K, "conv_cache", "_ref");
+            ggml_tensor * state_c = new_cache(ctx, D, K, "state_cache", "_ref");
             ggml_tensor * outs = nullptr;
             chain_out st = {};
             for (int64_t t = 0; t < n_tokens; ++t) {
                 auto col = [&](ggml_tensor * x) { return ggml_view_2d(ctx, x, x->ne[0], 1, x->nb[1], t * x->nb[1]); };
-                st = build_chain(ctx, 1, 1, false, conv_c, state_c, false, ids, col(qkv), conv_w, col(alpha), dt, A, col(beta), norm_w, col(z));
+                st = build_chain(ctx, 1, rows ? K : 1, rows, conv_c, state_c, false, ids, col(qkv), conv_w, col(alpha), dt, A, col(beta), norm_w, col(z));
                 ggml_tensor * o = ggml_reshape_4d(ctx, st.out, S, H_v, 1, 1);
                 outs = outs ? ggml_concat(ctx, outs, o, 2) : o;
             }
             // token n-1 wrote slot 0 of the multi-token caches (conv and state); the reference caches hold the last step
             ggml_tensor * d_out   = ggml_sub(ctx, a.out, outs);
             ggml_tensor * d_state = ggml_sub(ctx, ggml_view_2d(ctx, a.state, D, 1, a.state->nb[1], 0), st.state);
-            ggml_tensor * d_conv  = ggml_sub(ctx, ggml_cont(ctx, ggml_view_2d(ctx, a.conv, 3 * C, 1, a.conv->nb[1], 0)), ggml_cont(ctx, st.conv));
+            ggml_tensor * d_conv  = ggml_sub(ctx, ggml_cont(ctx, ggml_view_2d(ctx, a.conv, 3 * C, 1, a.conv->nb[1], 0)),
+                    ggml_cont(ctx, ggml_view_2d(ctx, st.conv, 3 * C, 1, st.conv->nb[1], 0)));
             ggml_build_forward_expand(gf, d_conv);
             ggml_build_forward_expand(gf, d_state);
             outputs = { d_conv, d_state, d_out };
