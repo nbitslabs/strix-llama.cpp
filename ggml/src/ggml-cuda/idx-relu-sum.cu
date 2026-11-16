@@ -117,7 +117,7 @@ int ggml_cuda_idx_score_decode_mode() {
     // 0: off (unfused chain), 1: 1-8 queries, 2: only where the unfused GEMM is the matvec (1-2 queries, bit-identical)
     static const int mode = [] {
         const char * env = getenv("GGML_CUDA_FUSE_IDX_DECODE");
-        return env ? atoi(env) : 2;   // default 2: only the bit-identical range (3-8 queries changed greedy streams on the model, 2026-11-16)
+        return env ? atoi(env) : 0;   // default off: not adopted (no 4-row gain; 3-8 queries changed greedy streams, 2026-11-16)
     }();
     return mode;
 }

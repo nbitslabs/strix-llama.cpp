@@ -14,7 +14,7 @@ struct ggml_cuda_idx_relu_sum_args {
 void ggml_cuda_op_idx_relu_sum(ggml_backend_cuda_context & ctx, const ggml_cuda_idx_relu_sum_args & args);
 
 // qwen4exp QSA indexer scorer at decode: MUL_MAT(keys F32 [128, M], q F32 [128, 4*T]) + RELU + 4-head sum (+ visibility),
-// T = 1..8, n_stream 1. GGML_CUDA_FUSE_IDX_DECODE: 0 off, 1 T = 1..8, 2 (default) only T = 1..2 (bit-identical to the matvec)
+// T = 1..8, n_stream 1. GGML_CUDA_FUSE_IDX_DECODE: 0 (default) off, 1 T = 1..8, 2 only T = 1..2 (bit-identical to the matvec)
 int  ggml_cuda_idx_score_decode_mode();
 bool ggml_cuda_idx_score_decode_supported(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * mm);
 void ggml_cuda_idx_score_decode(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
