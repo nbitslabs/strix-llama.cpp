@@ -115,11 +115,9 @@ idx_score_decode_f32(const float * __restrict__ keys, const float * __restrict__
 
 int ggml_cuda_idx_score_decode_mode() {
     // 0: off (unfused chain), 1: 1-8 queries, 2: only where the unfused GEMM is the matvec (1-2 queries, bit-identical)
-    static const int mode = [] {
-        const char * env = getenv("GGML_CUDA_FUSE_IDX_DECODE");
-        return env ? atoi(env) : 0;   // default off: not adopted (no 4-row gain; 3-8 queries changed greedy streams, 2026-11-16)
-    }();
-    return mode;
+    // read per call (a scorer-shaped chain only), so test-backend-ops can enable it for its cases
+    const char * env = getenv("GGML_CUDA_FUSE_IDX_DECODE");
+    return env ? atoi(env) : 0;   // default off: not adopted (no 4-row gain; 3-8 queries changed greedy streams, 2026-11-16)
 }
 
 bool ggml_cuda_idx_score_decode_supported(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * mm) {

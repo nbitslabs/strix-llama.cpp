@@ -5363,6 +5363,17 @@ struct test_indexer_head_sum : public test_case {
     }
 };
 
+// the CUDA decode scorer (1-8 queries) is off by default on the model; its test cases enable it unless the caller set it
+static void test_enable_idx_decode() {
+    if (getenv("GGML_CUDA_FUSE_IDX_DECODE") == nullptr) {
+#ifdef _WIN32
+        _putenv_s("GGML_CUDA_FUSE_IDX_DECODE", "1");
+#else
+        setenv("GGML_CUDA_FUSE_IDX_DECODE", "1", 0);
+#endif
+    }
+}
+
 // qwen4exp QSA indexer scorer: MUL_MAT(pooled keys F32 [128, blocks], q [128, 4*queries]) -> RESHAPE -> RELU -> head sum
 // (-> compact visibility). On RDNA3.5 the whole chain is one fused GEMM.
 struct test_indexer_score : public test_case {
@@ -5391,6 +5402,7 @@ struct test_indexer_score : public test_case {
         }
     }
     ggml_tensor * build_graph(ggml_context * ctx) override {
+        if (queries <= 8) { test_enable_idx_decode(); }
         const int dim = 128, heads = 4;
         auto * keys = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, dim, bounded ? blocks + 32 : blocks);
         auto * k = bounded ? ggml_view_2d(ctx, keys, dim, blocks, keys->nb[1], 0) : keys;
@@ -5435,6 +5447,7 @@ struct test_indexer_score_ident : public test_case {
         return m;
     }
     ggml_tensor * build_graph(ggml_context * ctx) override {
+        if (true) { test_enable_idx_decode(); }
         const int dim = 128, heads = 4;
         auto * cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, dim, blocks + 16);
         auto * keys  = ggml_view_2d(ctx, cache, dim, blocks, cache->nb[1], 0);
@@ -11262,6 +11275,7 @@ struct test_qsa_strip : public test_case {
     bool run_whole_graph() override { return true; }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
+        if (n_tps <= 8) { test_enable_idx_decode(); }
         const int64_t nb = n_blocks(), q0 = q_first(), n_q = n_tps - q0;
         GGML_ASSERT(nb >= budget);
         ggml_tensor * pooled = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, K, nb, 1);
