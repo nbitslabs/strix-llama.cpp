@@ -2181,7 +2181,9 @@ gdn_decode_fused_cuda(const ggml_cuda_gdn_decode_args args) {
 
     // gate = softplus(alpha + dt_bias) * A, beta = sigmoid(beta): scalar per head, computed by every thread
     const float alpha_biased = args.alpha[(int64_t) t * args.H_v + h] + args.dt_bias[h];
-    const float gate         = gdn_decode_softplus(alpha_biased) * args.ssm_a[h];
+    const float softplus     = args.softplus_log1p ? ((alpha_biased > 20.0f) ? alpha_biased : log1pf(expf(alpha_biased)))
+                                                   : gdn_decode_softplus(alpha_biased);
+    const float gate         = softplus * args.ssm_a[h];
     const float beta_val     = gdn_decode_sigmoid(args.beta[(int64_t) t * args.H_v + h]);
     const float g_val        = expf(gate);
     __syncthreads();

@@ -4734,6 +4734,7 @@ static int ggml_cuda_try_gdn_decode_fusion(const ggml_cgraph * cgraph, int node_
     args.conv_bias      = 0.0f;
     args.conv_state_out = conv_out_base;
     args.conv_fill_tail = rb_set == nullptr;
+    args.softplus_log1p = rb_set != nullptr;
     args.alpha          = (const float *) add->src[0]->data;
     args.dt_bias        = (const float *) add->src[1]->data;
     args.ssm_a          = (const float *) mul_a->src[1]->data;
