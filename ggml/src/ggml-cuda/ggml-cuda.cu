@@ -2553,6 +2553,15 @@ static bool ggml_cuda_should_fuse_mul_mat_q(const ggml_tensor * up, const ggml_t
     return ggml_cuda_mmq_fusion_is_efficient(x_up->type, ggml_prec_get_src(up, 1), x_up->ne[1], ncols, nchannels, device);
 }
 
+// gfx1151 (2026-10-30): rows 2-4 gained 10-18%; row 8 regressed. Recheck before raising the cutoff.
+static int ggml_cuda_dq_mmvq_max() {
+    static const int dq_mmvq_max = [] {
+        const char * env = getenv("GGML_CUDA_DQ_MMVQ_MAX");
+        return env ? std::max(0, std::min(atoi(env), MMVQ_MAX_BATCH_SIZE)) : 4;
+    }();
+    return dq_mmvq_max;
+}
+
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -2564,11 +2573,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     // But if src0 is also a view of another tensor then this cannot be done safely because it may overwrite valid tensor data.
     // Therefore, in such cases use cuBLAS.
     if (ggml_cuda_mmb_dq_packed(src0)) {   // MMB_DENSE_R2: use only packed-aware kernels
-        // gfx1151 (2026-10-30): rows 2-4 gained 10-18%; row 8 regressed. Recheck before raising the cutoff.
-        static const int dq_mmvq_max = [] {
-            const char * env = getenv("GGML_CUDA_DQ_MMVQ_MAX");
-            return env ? std::max(0, std::min(atoi(env), MMVQ_MAX_BATCH_SIZE)) : 4;
-        }();
+        const int dq_mmvq_max = ggml_cuda_dq_mmvq_max();
         if (ggml_cuda_mmb_supported_mm(ctx, src0, src1, dst)) {
             ggml_cuda_mul_mat_mmb(ctx, src0, src1, dst);
         } else if (dst->op == GGML_OP_MUL_MAT && dst->src[0] == src0 && dst->src[1] == src1 && ggml_nrows(src1) == 1 &&
@@ -2672,6 +2677,49 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         return;
     }
     ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
+}
+
+// true when ggml_cuda_mul_mat(dst) would run ggml_cuda_mul_mat_vec_q(src0, src1, nullptr, dst) without fusion: the branches
+// of ggml_cuda_mul_mat above, in order, up to that call (a fused path that replaces the matvec must keep its arithmetic)
+static bool ggml_cuda_mul_mat_takes_mmvq(ggml_backend_cuda_context & ctx, const ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    if (dst->op != GGML_OP_MUL_MAT || dst->src[2] != nullptr || !ggml_is_quantized(src0->type) ||
+            src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || ggml_cuda_op_mul_mat_use_fwht(dst)) {
+        return false;
+    }
+    const int cc        = ggml_cuda_info().devices[ctx.device].cc;
+    const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
+    const int64_t ne11 = src1->ne[1];
+    if (ggml_cuda_mmb_dq_packed(src0)) {
+        if (ggml_cuda_mmb_supported_mm(ctx, src0, src1, dst)) {
+            return false;
+        }
+        if (ggml_nrows(src1) == 1) {
+            return ggml_cuda_mul_mat_vec_q_fq_prologue_ok(ctx, dst, src1);
+        }
+        if (ggml_cuda_mmv_group_seg_ok(src0, src1) && ggml_is_contiguous(dst)) {
+            return false;
+        }
+        return ggml_nrows(src1) > 1 && ggml_nrows(src1) <= ggml_cuda_dq_mmvq_max() && src0->type == GGML_TYPE_Q8_0 &&
+            src0->ne[1] % 128 == 0 && src0->ne[0] % 64 == 0 && ggml_is_matrix(src0) && ggml_is_matrix(src1) && ggml_is_matrix(dst) &&
+            ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst);
+    }
+    const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE
+        && ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) && src0->view_src;
+    if (bad_padding_clear) {
+        return false;
+    }
+    if (ggml_get_op_params_i32(dst, 1) == GGML_HINT_EXACT_BATCH) {
+        return false;
+    }
+    if (ggml_cuda_should_use_mmvf(src0, cc, warp_size, ne11)) {
+        return false;
+    }
+    if (ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false)) {
+        return false;
+    }
+    return !ggml_cuda_should_use_mmq_few(src0, src1, cc) && ggml_cuda_should_use_mmvq(src0->type, cc, ne11);
 }
 
 // returns true when ggml_cuda_mul_mat_id takes the fallback path that requires stream synchronization
@@ -4362,6 +4410,40 @@ static bool ggml_cuda_try_topk_moe(ggml_backend_cuda_context & ctx, const ggml_c
 //     -> gated_delta_net -> cpy(new state -> cache) -> rms_norm -> mul(norm weight)
 // for one sequence with S == 128 and at most 8 tokens and rollback slots.
 // Returns the number of nodes to skip after the concat (0 when the pattern does not match).
+// GGML_CUDA_FUSE_GDN_GATE_T=0: keep the GDN output gate (RMS_NORM * w, sigmoid(z) * .) out of the ssm_out matvec prologue
+static bool ggml_cuda_gdn_gate_fold_enabled() {
+    static const bool on = [] {
+        const char * env = getenv("GGML_CUDA_FUSE_GDN_GATE_T");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    return on;
+}
+
+// norm_out (= RMS_NORM(x) * w, [128, H_v, T]) -> sig = SIGMOID(z) -> mul = norm_out * sig -> mm = MUL_MAT(w_out, mul or its
+// contiguous reshape): the qwen4exp GDN output gate feeding ssm_out, each intermediate read only by the next node
+static bool ggml_cuda_gdn_gate_chain_ok(const ggml_cgraph * cgraph, const ggml_tensor * norm_out, int norm_idx,
+        const ggml_tensor * sig, int sig_idx, const ggml_tensor * mul, int mul_idx, const ggml_tensor * mm) {
+    if (!sig || !mul || !mm || sig->op != GGML_OP_UNARY || ggml_get_unary_op(sig) != GGML_UNARY_OP_SIGMOID || mul->op != GGML_OP_MUL ||
+            mm->op != GGML_OP_MUL_MAT || mm->src[2] != nullptr) {
+        return false;
+    }
+    const ggml_tensor * z = sig->src[0];
+    const int64_t n = ggml_nelements(norm_out);
+    return (mm->src[1] == mul || (ggml_cuda_is_view_or_noop(mm->src[1]) && mm->src[1]->view_src == mul &&
+                ggml_is_contiguous(mm->src[1]) && ggml_nelements(mm->src[1]) == n)) &&
+        ((mul->src[0] == sig && mul->src[1] == norm_out) || (mul->src[0] == norm_out && mul->src[1] == sig)) &&
+        norm_out->type == GGML_TYPE_F32 && sig->type == GGML_TYPE_F32 && mul->type == GGML_TYPE_F32 && ggml_is_contiguous(mul) &&
+        z->type == GGML_TYPE_F32 && ggml_is_contiguous(z) && ggml_nelements(z) == n && (uintptr_t) z->data % 16 == 0 &&
+        ggml_are_same_shape(sig, norm_out) && ggml_are_same_shape(mul, norm_out) &&
+        norm_out->ne[0] == 128 && n % 128 == 0 && mm->src[1]->ne[0] % 128 == 0 &&
+        ggml_node_get_use_count(cgraph, norm_idx) == 1 && ggml_node_get_use_count(cgraph, sig_idx) == 1 &&
+        ggml_node_get_use_count(cgraph, mul_idx) == 1 &&
+        (norm_out->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 && (sig->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 &&
+        (mul->flags & GGML_TENSOR_FLAG_OUTPUT) == 0;
+}
+
+static bool ggml_cuda_mul_mat_takes_mmvq(ggml_backend_cuda_context & ctx, const ggml_tensor * dst);
+
 // GGML_CUDA_FUSE_GDN_DECODE_T=0: do not match the SET_ROWS rollback store (speculative verify, n_rs_seq > 0). The fused step
 // equals n single-token fused steps bit for bit; the unfused rollback ops it replaces round differently (~1e-8).
 // read per match (a CONCAT of the chain, once per recurrent layer), so test-backend-ops can enable it for its cases
@@ -5904,6 +5986,37 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // qwen4exp GDN output gate at 2-8 tokens when the recurrent chain itself is not fused (speculative verify with the rollback
+    // store): RMS_NORM(x [128, H_v, T]) -> MUL(w) -> SIGMOID(z) -> MUL -> ssm_out MUL_MAT becomes the bit-exact gate prologue
+    // in the quantize of the generic matvec (two launches instead of norm, gate, quantize and matvec)
+    if (node->op == GGML_OP_RMS_NORM && ggml_cuda_gdn_gate_fold_enabled() && GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc) &&
+            node->type == GGML_TYPE_F32 && node->ne[0] == 128 && node->ne[2] >= 2 && node->ne[2] <= 8 && node->ne[3] == 1 &&
+            node->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(node->src[0]) && ggml_are_same_shape(node, node->src[0]) &&
+            (uintptr_t) node->src[0]->data % 16 == 0 && ggml_node_get_use_count(cgraph, i) == 1) {
+        auto next_compute = [&](int & k) -> ggml_tensor * {
+            while (k < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[k])) {
+                k++;
+            }
+            return k < cgraph->n_nodes ? cgraph->nodes[k] : nullptr;
+        };
+        int j = i + 1;
+        ggml_tensor * mulw = next_compute(j); const int mulw_idx = j; j++;
+        ggml_tensor * sig  = next_compute(j); const int sig_idx  = j; j++;
+        ggml_tensor * mul  = next_compute(j); const int mul_idx  = j; j++;
+        ggml_tensor * mm   = next_compute(j); const int mm_idx   = j;
+        const ggml_tensor * w = mulw ? mulw->src[1] : nullptr;
+        if (mulw && mulw->op == GGML_OP_MUL && mulw->src[0] == node && mulw->type == GGML_TYPE_F32 && ggml_are_same_shape(mulw, node) &&
+                w && w->type == GGML_TYPE_F32 && ggml_is_contiguous(w) && ggml_nelements(w) == 128 && (uintptr_t) w->data % 16 == 0 &&
+                ggml_cuda_gdn_gate_chain_ok(cgraph, mulw, mulw_idx, sig, sig_idx, mul, mul_idx, mm) &&
+                mm->src[1]->ne[1] == node->ne[2] && mm->src[1]->ne[0] == node->ne[0] * node->ne[1] &&
+                ggml_cuda_mul_mat_takes_mmvq(*cuda_ctx, mm) && !ggml_cuda_mmv_group_seg_ok(mm->src[0], mm->src[1])) {
+            const float eps = ggml_get_op_params_f32(node, 0);
+            ggml_cuda_mul_mat_vec_q_gdn_gate_multi(*cuda_ctx, mm, (const float *) node->src[0]->data,
+                (const float *) sig->src[0]->data, w, eps);
+            return mm_idx - i;
+        }
+    }
+
     // prefill shared-expert merge: SIGMOID(gate [1, T]) -> MUL(shexp [n, T], gate) -> ADD(moe_out, .) in one kernel
     if (node->op == GGML_OP_UNARY && ggml_get_unary_op(node) == GGML_UNARY_OP_SIGMOID && i + 2 < cgraph->n_nodes &&
             node->type == GGML_TYPE_F32 && node->ne[0] == 1 && ggml_nrows(node) >= 2) {
@@ -6300,6 +6413,27 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 // validated for the L2_NORM spelling. For the qwen4exp RMS_NORM+SCALE representation keep the
                 // plain fused kernel, which applies the gated norm itself: the chain fusion is the win and this
                 // avoids feeding the gate matvec tensors from a chain shape it was not exercised with.
+                // qwen4exp spelling (RMS_NORM + SCALE q/k norms): the bit-exact gate prologue, the exact tree of the norm
+                // kernel, at 1 token in the fused-quantize matvec and at 2-8 tokens in the quantize of the generic matvec,
+                // wherever ssm_out would take ggml_cuda_mul_mat_vec_q
+                if (args.qk_rms_scale && ggml_cuda_gdn_gate_fold_enabled() && args.S == 128 &&
+                        ggml_cuda_gdn_gate_chain_ok(cgraph, norm_out, norm_idx, sig, sig_idx, mul, mul_idx, mm) &&
+                        ggml_nelements(norm_out) == args.S * args.H_v * args.n_tokens && mm->src[1]->ne[1] == args.n_tokens &&
+                        ggml_cuda_mul_mat_takes_mmvq(*cuda_ctx, mm)) {
+                    if (args.n_tokens == 1 && ggml_cuda_mul_mat_vec_q_fq_gdn_gate_ok(*cuda_ctx, mm, sig->src[0])) {
+                        ggml_cuda_pool_alloc<float> attn(cuda_ctx->pool(), args.S * args.H_v);
+                        ggml_cuda_op_gdn_decode_fused_prenorm(*cuda_ctx, args, attn.get());
+                        ggml_cuda_mul_mat_vec_q_fq_gdn_gate(*cuda_ctx, mm, attn.get(), sig->src[0], args.norm_w_tensor, args.eps_rms, /*exact=*/true);
+                        return mm_idx - i;
+                    }
+                    if (args.n_tokens >= 2 && !ggml_cuda_mmv_group_seg_ok(mm->src[0], mm->src[1])) {
+                        ggml_cuda_pool_alloc<float> attn(cuda_ctx->pool(), args.S * args.H_v * args.n_tokens);
+                        ggml_cuda_op_gdn_decode_fused_prenorm(*cuda_ctx, args, attn.get());
+                        ggml_cuda_mul_mat_vec_q_gdn_gate_multi(*cuda_ctx, mm, attn.get(), (const float *) sig->src[0]->data,
+                            args.norm_w_tensor, args.eps_rms);
+                        return mm_idx - i;
+                    }
+                }
                 if (!args.qk_rms_scale && args.n_tokens == 1 &&
                         sig && mul && mm && sig->op == GGML_OP_UNARY && ggml_get_unary_op(sig) == GGML_UNARY_OP_SIGMOID &&
                         mul->op == GGML_OP_MUL && mm->op == GGML_OP_MUL_MAT && mm->src[2] == nullptr &&

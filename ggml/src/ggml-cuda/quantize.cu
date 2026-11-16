@@ -107,6 +107,61 @@ static __global__ void quantize_q8_1(
     y[ib].ds = make_half2(d, d * sum);
 }
 
+// quantize_q8_1 with the qwen4exp GDN output prologue: y = sigmoid(z) * (rms_norm_128(x) * w). One thread per element as
+// in quantize_q8_1 and in rms_norm_f32<128, true>: the four waves of a 128-wide head sum their squares with the warp
+// butterfly and combine them as (s0 + s2) + (s1 + s3), mean = sum / 128, so y is bit-identical to RMS_NORM + MUL followed
+// by the sigmoid-gated MUL; the quantization is quantize_q8_1's. Rows are contiguous [ne00] (x and z), padded to ne0.
+__launch_bounds__(CUDA_QUANTIZE_BLOCK_SIZE, 1)
+static __global__ void quantize_q8_1_gdn_gate(
+        const float * __restrict__ x, const float * __restrict__ z, const float * __restrict__ w, void * __restrict__ vy,
+        const int64_t ne00, const int64_t ne0, const float eps) {
+    static_assert(CUDA_QUANTIZE_BLOCK_SIZE % 128 == 0, "a block holds whole heads");
+    __shared__ float s_sum[CUDA_QUANTIZE_BLOCK_SIZE / WARP_SIZE];
+    const int64_t i0 = (int64_t) blockDim.x*blockIdx.x + threadIdx.x;   // ne0 % CUDA_QUANTIZE_BLOCK_SIZE == 0: no early exit
+    const int64_t i1 = blockIdx.y;
+    const int64_t i_cont = i1*ne0 + i0;
+    block_q8_1 * y = (block_q8_1 *) vy;
+    const int64_t ib  = i_cont / QK8_1;
+    const int64_t iqs = i_cont % QK8_1;
+
+    const bool in = i0 < ne00;
+    float xi = in ? x[i1*ne00 + i0] : 0.0f;
+    float part = fmaf(xi, xi, 0.0f);
+    part = warp_reduce_sum<WARP_SIZE>(part);
+    const int warp = threadIdx.x / WARP_SIZE, head = warp / 4;
+    if (threadIdx.x % WARP_SIZE == 0) {
+        s_sum[warp] = part;
+    }
+    __syncthreads();
+    if (in) {
+        const float tmp   = (s_sum[4*head + 0] + s_sum[4*head + 2]) + (s_sum[4*head + 1] + s_sum[4*head + 3]);
+        const float mean  = tmp / 128.0f;
+        const float scale = rsqrtf(mean + eps);
+        const float normed = scale * xi * w[i0 % 128];
+        xi = (1.0f / (1.0f + expf(-z[i1*ne00 + i0]))) * normed;
+    }
+
+    float amax = fabsf(xi);
+    amax = warp_reduce_max<QK8_1>(amax);
+    const float  d = amax / 127.0f;
+    const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+    const int sum = warp_reduce_sum<QK8_1>((int) q);
+    y[ib].qs[iqs] = q;
+    if (iqs > 0) {
+        return;
+    }
+    y[ib].ds = make_half2(d, d * sum);
+}
+
+void quantize_row_q8_1_gdn_gate_cuda(
+        const float * x, const float * z, const float * w, void * vy, const int64_t ne00, const int64_t ne0, const int64_t ne1,
+        const float eps, cudaStream_t stream) {
+    GGML_ASSERT(ne00 % 128 == 0 && ne0 >= ne00 && ne0 % CUDA_QUANTIZE_BLOCK_SIZE == 0);
+    const dim3 num_blocks(ne0 / CUDA_QUANTIZE_BLOCK_SIZE, ne1, 1);
+    quantize_q8_1_gdn_gate<<<num_blocks, CUDA_QUANTIZE_BLOCK_SIZE, 0, stream>>>(x, z, w, vy, ne00, ne0, eps);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 __device__ __forceinline__ uint8_t compute_e8m0_scale(float amax) {
     if (!(amax > 0.0f)) {
         return 0;
