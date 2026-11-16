@@ -7696,6 +7696,25 @@ struct test_gdn_decode_rollback : public test_case {
     }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
+        if (rows) {
+            // the CUDA matcher takes the SET_ROWS rollback store only when enabled (off by default: tolerance-identical
+            // to the unfused rollback ops); an explicit GGML_CUDA_FUSE_GDN_DECODE_T from the caller wins
+            if (getenv("GGML_CUDA_FUSE_GDN_DECODE_T") == nullptr) {
+#ifdef _WIN32
+                _putenv_s("GGML_CUDA_FUSE_GDN_DECODE_T", "1");
+#else
+                setenv("GGML_CUDA_FUSE_GDN_DECODE_T", "1", 0);
+#endif
+            }
+            // the one-token rollback match is opt-in on the model; the tests keep exercising it
+            if (getenv("GGML_CUDA_FUSE_GDN_DECODE_T1") == nullptr) {
+#ifdef _WIN32
+                _putenv_s("GGML_CUDA_FUSE_GDN_DECODE_T1", "1");
+#else
+                setenv("GGML_CUDA_FUSE_GDN_DECODE_T1", "1", 0);
+#endif
+            }
+        }
         auto tensor = [&](int64_t x, int64_t y, const char * name) {
             ggml_tensor * t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, x, y);
             ggml_set_name(t, name);
