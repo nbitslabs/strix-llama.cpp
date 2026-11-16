@@ -72,6 +72,9 @@ struct ggml_cuda_gdn_decode_args {
     int64_t       qkv_token_stride = 0;
     int64_t       conv_slot_stride = 0;
     int64_t       state_slot_stride = 0;
+    // the per-slot CPY store writes slots n_tokens..K-1 with the old conv state; the SET_ROWS rollback store
+    // (build_conv_state_store with n_rs_seq > 0) leaves them unwritten
+    bool          conv_fill_tail = true;
 };
 
 void ggml_cuda_op_gdn_decode_fused(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_decode_args & args);
