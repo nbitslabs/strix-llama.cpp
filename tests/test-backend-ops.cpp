@@ -9044,6 +9044,44 @@ struct test_mul_mat_id_shared : public test_case {
     }
 };
 
+// RMS_NORM -> MUL -> Q8_0 matvecs, including a reader that must prevent fusion.
+struct test_norm_mmv : public test_case {
+    const int64_t n;
+    const bool grouped;
+    const bool external_consumer;
+
+    test_norm_mmv(int64_t n, bool grouped, bool external_consumer = false)
+        : n(n), grouped(grouped), external_consumer(external_consumer) {}
+
+    std::string vars() override { return VARS_TO_STR3(n, grouped, external_consumer); }
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "NORM_MMV";
+    }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 5e-4; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2560, n);
+        ggml_tensor * gamma = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 2560);
+        ggml_tensor * norm = ggml_rms_norm(ctx, x, 1e-6f);
+        ggml_tensor * y = ggml_mul(ctx, norm, gamma);
+        ggml_tensor * w0 = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, 2560, 6144);
+        ggml_tensor * out = ggml_mul_mat(ctx, w0, y);
+        ggml_set_name(out, "norm_mmv_0");
+        if (grouped) {
+            ggml_tensor * w1 = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, 2560, 10240);
+            ggml_tensor * mm1 = ggml_mul_mat(ctx, w1, y);
+            ggml_set_name(mm1, "norm_mmv_1");
+            out = ggml_concat(ctx, out, mm1, 0);
+        }
+        if (external_consumer) {
+            out = ggml_concat(ctx, out, y, 0);
+        }
+        return out;
+    }
+};
+
 // GGML_OP_OUT_PROD
 // GGML_OP_MUL_MAT group: independent single-column matvecs on one activation vector
 // (RDNA3.5 CUDA launches independent Q8_0 segments as one grouped kernel)
@@ -16912,6 +16950,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_hc_up_mix(GGML_TYPE_Q8_0, 64, 64, 14, 3));
     test_cases.emplace_back(new test_hc_up_mix(GGML_TYPE_Q8_0, 64, 64, 16, 3));
     test_cases.emplace_back(new test_hc_up_mix(GGML_TYPE_Q8_0, 64, 64, 16, 3, true));
+
+    for (int n : {1, 2, 4, 8}) {
+        test_cases.emplace_back(new test_norm_mmv(n, false));
+        test_cases.emplace_back(new test_norm_mmv(n, true));
+        test_cases.emplace_back(new test_norm_mmv(n, true, true));
+    }
 
     // grouped single-column matvecs on one activation vector (qwen4exp decode: GDN qkv/z/beta/alpha,
     // hyper-connection down + inject, shared-expert gate/up + router)

@@ -2059,6 +2059,8 @@ struct mmvq_group_seg_dev {
 struct mmvq_group_args_dev {
     mmvq_group_seg_dev seg[MMVQ_GROUP_MAX];
     int nseg;
+    const float * norm_gamma;
+    float norm_eps;
 };
 
 template <int nwarps, int pf>
@@ -2077,6 +2079,8 @@ static __global__ void mul_mat_vec_fq_group(
 
     const int lane = threadIdx.x;
     const int tid  = warp_size*threadIdx.y + lane;
+    __shared__ float norm_sums[32];
+    const float norm_scale = args.norm_gamma ? rms_norm_mmv_scale_2560(y_ptr, ncols_x, args.norm_eps, norm_sums, tid, nwarps*warp_size) : 1.0f;
 
     // segment lookup, uniform per block
     int s = 0;
@@ -2120,7 +2124,12 @@ static __global__ void mul_mat_vec_fq_group(
             const float4 v0 = yv[0];
             const float4 v1 = yv[1];
             float v[8] = {v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w};
-            if (y_op != 0) {
+            if (args.norm_gamma) {
+#pragma unroll
+                for (int k = 0; k < 8; ++k) {
+                    v[k] = (norm_scale * v[k]) * args.norm_gamma[ib*QK8_1 + sub*8 + k];
+                }
+            } else if (y_op != 0) {
 #pragma unroll
                 for (int k = 0; k < 8; ++k) {
                     const float t = y_scale * v[k] + y_bias;
@@ -2358,7 +2367,8 @@ bool ggml_cuda_mmv_group_seg_ok(const ggml_tensor * w, const ggml_tensor * y) {
     return false;
 }
 
-void ggml_cuda_mmv_group(ggml_backend_cuda_context & ctx, const ggml_tensor * y, const ggml_cuda_mmv_group_seg * segs, const int nseg) {
+void ggml_cuda_mmv_group(ggml_backend_cuda_context & ctx, const ggml_tensor * y, const ggml_cuda_mmv_group_seg * segs, const int nseg,
+        const float * norm_gamma, const float norm_eps) {
     GGML_ASSERT(nseg >= 1 && nseg <= MMVQ_GROUP_MAX);
     const int device    = ggml_cuda_get_device();
     const int warp_size = ggml_cuda_info().devices[device].warp_size;
@@ -2390,6 +2400,9 @@ void ggml_cuda_mmv_group(ggml_backend_cuda_context & ctx, const ggml_tensor * y,
 
     mmvq_group_args_dev args{};
     args.nseg = nseg;
+    args.norm_gamma = norm_gamma;
+    args.norm_eps = norm_eps;
+    GGML_ASSERT(!norm_gamma || (ncols == 2560 && y->ne[1] == 1));
     int nblocks = 0;
     for (int i = 0; i < nseg; ++i) {
         mmvq_group_seg_dev & d = args.seg[i];
@@ -3511,6 +3524,55 @@ static bool mul_mat_vec_q_fq_try(
         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
         ne03, ne3, s03, s13, s3, stream, y_scale, y_bias, y_op);
     return true;
+}
+
+bool ggml_cuda_norm_mmv_ok(const ggml_tensor * dst, const ggml_tensor * x) {
+    const int device = ggml_cuda_get_device();
+    if (!GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[device].cc) || ggml_cuda_info().devices[device].warp_size != 32 ||
+            dst->op != GGML_OP_MUL_MAT || dst->src[2] || x->type != GGML_TYPE_F32 || x->ne[0] != 2560 ||
+            x->ne[1] < 1 || x->ne[1] > 8 || !ggml_is_matrix(x) || !ggml_is_contiguous(x) ||
+            !ggml_cuda_is_aligned(x, 16) || !ggml_are_same_shape(x, dst->src[1])) {
+        return false;
+    }
+    const ggml_tensor * w = dst->src[0];
+    if (w->type != GGML_TYPE_Q8_0 || w->ne[0] != x->ne[0] || w->ne[1] <= 0 || w->ne[1] > INT32_MAX ||
+            !ggml_is_matrix(w) || !ggml_is_contiguous(w) || (x->ne[1] > 1 && ggml_cuda_mmb_dq_packed(w)) ||
+            (w->buffer && ggml_backend_buffer_get_usage(w->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) ||
+            dst->type != GGML_TYPE_F32 || !ggml_is_matrix(dst) || !ggml_is_contiguous(dst) ||
+            dst->ne[0] != w->ne[1] || dst->ne[1] != x->ne[1]) {
+        return false;
+    }
+    return x->ne[1] != 1 || ggml_cuda_mmv_group_seg_ok(w, x);
+}
+
+void ggml_cuda_norm_mmv(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * gamma,
+        const float eps, const ggml_cuda_mmv_group_seg * segs, const int nseg) {
+    GGML_ASSERT(nseg >= 1 && nseg <= GGML_CUDA_MMV_GROUP_MAX);
+    for (int i = 0; i < nseg; ++i) {
+        GGML_ASSERT(ggml_cuda_norm_mmv_ok(segs[i].dst, x) && !segs[i].gate);
+    }
+    if (x->ne[1] == 1) {
+        ggml_cuda_mmv_group(ctx, x, segs, nseg, (const float *) gamma->data, eps);
+        return;
+    }
+    const int ncols = x->ne[0];
+    const int ncols_padded = GGML_PAD(ncols, MATRIX_ROW_PADDING);
+    ggml_cuda_pool_alloc<block_q8_1> y_q8(ctx.pool(), x->ne[1]*ncols_padded/QK8_1);
+    quantize_row_q8_1_norm_cuda((const float *) x->data, (const float *) gamma->data,
+            y_q8.get(), ncols_padded, x->ne[1], eps, ctx.stream());
+    const int64_t stride_col_y = ncols_padded / QK8_1;
+    const int64_t stride_channel_y = x->ne[1] * stride_col_y;
+    for (int i = 0; i < nseg; ++i) {
+        const ggml_tensor * w = segs[i].w;
+        ggml_tensor * dst = segs[i].dst;
+        ggml_cuda_mm_fusion_args_device fusion{};
+        fusion.x_pk = ggml_cuda_mmb_dq_packed(w) ? 1 : 0;
+        mul_mat_vec_q_switch_type(
+            w->data, w->type, y_q8.get(), nullptr, fusion, (float *) dst->data, ncols,
+            w->ne[1], x->ne[1], w->nb[1] / sizeof(block_q8_0), stride_col_y, dst->nb[1] / sizeof(float),
+            1, 1, 1, w->nb[2] / sizeof(block_q8_0), stride_channel_y, dst->nb[2] / sizeof(float),
+            1, 1, w->nb[3] / sizeof(block_q8_0), stride_channel_y, dst->nb[3] / sizeof(float), 0, ctx.stream());
+    }
 }
 
 bool ggml_cuda_mul_mat_vec_q_prologue_ok(const ggml_tensor * dst, const ggml_tensor * y) {

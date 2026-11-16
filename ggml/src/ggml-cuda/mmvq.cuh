@@ -38,7 +38,12 @@ struct ggml_cuda_mmv_group_seg {
     float               glu_limit = 0.0f;
 };
 bool ggml_cuda_mmv_group_seg_ok(const ggml_tensor * w, const ggml_tensor * y);
-void ggml_cuda_mmv_group(ggml_backend_cuda_context & ctx, const ggml_tensor * y, const ggml_cuda_mmv_group_seg * segs, int nseg);
+void ggml_cuda_mmv_group(ggml_backend_cuda_context & ctx, const ggml_tensor * y, const ggml_cuda_mmv_group_seg * segs, int nseg,
+        const float * norm_gamma = nullptr, float norm_eps = 0.0f);
+
+bool ggml_cuda_norm_mmv_ok(const ggml_tensor * dst, const ggml_tensor * x);
+void ggml_cuda_norm_mmv(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * gamma,
+        float eps, const ggml_cuda_mmv_group_seg * segs, int nseg);
 
 // RDNA3.5 qwen4exp GDN output projection with the gated per-head norm in the prologue:
 //   y' = sigmoid(z) * (rms_norm_128(attn) * norm_w), then the fused-quantize matvec of dst->src[0] with y'

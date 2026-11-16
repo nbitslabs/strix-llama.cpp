@@ -84,3 +84,25 @@ void quantize_scatter_mmq_q8_1_cuda(const float *   x,
                                     int64_t         nrows_dst,
                                     int             n_expert_used,
                                     cudaStream_t    stream);
+
+// Replay rms_norm_f32<float, 1024, 1, true> at K=2560 on RDNA3.5 with fewer physical waves.
+static __device__ __forceinline__ float rms_norm_mmv_scale_2560(const float * x, int ncols, float eps, float * sums, int tid, int nthreads) {
+    const int lane = tid % WARP_SIZE;
+    for (int i = tid; i < 1024; i += nthreads) {
+        float tmp = 0.0f;
+        if (i < ncols/4) {
+            const float4 v = ((const float4 *) x)[i];
+            tmp += v.x*v.x + v.y*v.y + v.z*v.z + v.w*v.w;
+        }
+        tmp = warp_reduce_sum(tmp);
+        if (lane == 0) {
+            sums[i / WARP_SIZE] = tmp;
+        }
+    }
+    __syncthreads();
+    const float tmp = warp_reduce_sum(sums[lane]);
+    return rsqrtf(tmp / ncols + eps);
+}
+
+void quantize_row_q8_1_norm_cuda(const float * x, const float * gamma, void * vy,
+        int64_t ne0, int64_t ne1, float eps, cudaStream_t stream);

@@ -6065,6 +6065,46 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // Keep earlier HC combine/residual norm fusions intact; only fold a still-uncomputed direct chain.
+    if (node->op == GGML_OP_RMS_NORM && i + 2 < cgraph->n_nodes &&
+            GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
+        static const bool fuse_norm_mmv = [] {
+            const char * env = getenv("GGML_CUDA_FUSE_NORM_MMV");
+            return !env || std::strcmp(env, "0") != 0;
+        }();
+        ggml_tensor * mul = cgraph->nodes[i + 1];
+        const ggml_tensor * x = node->src[0];
+        const ggml_tensor * gamma = mul->src[0] == node ? mul->src[1] : nullptr;
+        if (fuse_norm_mmv && mul->op == GGML_OP_MUL && gamma && gamma->type == GGML_TYPE_F32 &&
+                gamma->ne[0] == 2560 && ggml_nelements(gamma) == 2560 && ggml_is_contiguous(gamma) &&
+                ggml_cuda_is_aligned(gamma, 16) && node->type == GGML_TYPE_F32 && mul->type == GGML_TYPE_F32 &&
+                ggml_are_same_shape(node, x) && ggml_are_same_shape(mul, x) &&
+                ggml_is_contiguous(node) && ggml_is_contiguous(mul) &&
+                ggml_cuda_is_aligned(node, 16) && ggml_cuda_is_aligned(mul, 16)) {
+            ggml_cuda_mmv_group_seg segs[GGML_CUDA_MMV_GROUP_MAX];
+            int outputs[GGML_CUDA_MMV_GROUP_MAX];
+            ggml_op ops[2 + GGML_CUDA_MMV_GROUP_MAX] = {GGML_OP_RMS_NORM, GGML_OP_MUL};
+            int nseg = 0;
+            for (int j = i + 2; j < cgraph->n_nodes && nseg < GGML_CUDA_MMV_GROUP_MAX; ++j) {
+                ggml_tensor * mm = cgraph->nodes[j];
+                if (mm->op != GGML_OP_MUL_MAT || mm->src[1] != mul || !ggml_cuda_norm_mmv_ok(mm, x)) {
+                    break;
+                }
+                segs[nseg].w = mm->src[0];
+                segs[nseg].dst = mm;
+                ops[2 + nseg] = GGML_OP_MUL_MAT;
+                outputs[nseg++] = j;
+            }
+            if (nseg > 0 && ggml_can_fuse_subgraph(cgraph, i, 2 + nseg, ops, outputs, nseg) &&
+                    ggml_cuda_check_fusion_memory_ranges(cgraph, i, 2 + nseg, outputs, nseg)) {
+                float eps;
+                memcpy(&eps, node->op_params, sizeof(eps));
+                ggml_cuda_norm_mmv(*cuda_ctx, x, gamma, eps, segs, nseg);
+                return 1 + nseg;
+            }
+        }
+    }
+
     // RDNA3.5: consecutive eligible Q8_0 MUL_MATs that read the same activations
     // (plain matvecs or a [mul_mat, mul_mat, glu] gate/up pair) are launched as one grouped kernel. The segments are
     // mutually independent, so the launch position of the first one is valid for all of them.

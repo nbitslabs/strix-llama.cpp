@@ -627,6 +627,37 @@ void quantize_row_q8_1_cuda(
     ggml_cuda_kernel_launch(quantize_q8_1<false>, launch_params, x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv, 1.0f, 0.0f, 0);
 }
 
+// Each block replays the full norm reduction before quantizing its slice of one column.
+static __global__ void quantize_q8_1_norm_2560(const float * x, const float * gamma, block_q8_1 * y,
+        const int ncols, const int64_t ne0, const float eps) {
+    __shared__ float sums[32];
+    x += (size_t) blockIdx.y * ncols;
+    const float scale = rms_norm_mmv_scale_2560(x, ncols, eps, sums, threadIdx.x, CUDA_QUANTIZE_BLOCK_SIZE);
+    const int i = blockIdx.x * CUDA_QUANTIZE_BLOCK_SIZE + threadIdx.x;
+    if (i >= ne0) {
+        return;
+    }
+    const float xi = i < ncols ? (scale * x[i]) * gamma[i] : 0.0f;
+    const float amax = warp_reduce_max<QK8_1>(fabsf(xi));
+    const float d = amax / 127.0f;
+    const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+    const int sum = warp_reduce_sum<QK8_1>((int) q);
+    const int64_t ib = ((int64_t) blockIdx.y * ne0 + i) / QK8_1;
+    y[ib].qs[i % QK8_1] = q;
+    if (i % QK8_1 == 0) {
+        y[ib].ds = make_half2(d, d * sum);
+    }
+}
+
+void quantize_row_q8_1_norm_cuda(const float * x, const float * gamma, void * vy,
+        const int64_t ne0, const int64_t ne1, const float eps, cudaStream_t stream) {
+    GGML_ASSERT(ne0 >= 2560 && ne0 % QK8_1 == 0);
+    const ggml_cuda_kernel_launch_params params(
+        dim3((ne0 + CUDA_QUANTIZE_BLOCK_SIZE - 1) / CUDA_QUANTIZE_BLOCK_SIZE, ne1, 1),
+        dim3(CUDA_QUANTIZE_BLOCK_SIZE, 1, 1), 0, stream);
+    ggml_cuda_kernel_launch(quantize_q8_1_norm_2560, params, x, gamma, (block_q8_1 *) vy, 2560, ne0, eps);
+}
+
 void quantize_row_q8_1_prologue_cuda(
         const float * x, void * vy, const int64_t ne00, const int64_t ne0, const int64_t ne1,
         const float y_scale, const float y_bias, const int y_op, cudaStream_t stream) {
