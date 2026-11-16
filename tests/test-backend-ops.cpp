@@ -1417,6 +1417,8 @@ struct test_case {
     }
 
     virtual bool run_whole_graph() { return false; }
+    // tensors the test-mode context holds (graph objects only, no data)
+    virtual size_t max_tensors() { return 128; }
     // the output must be the same in each run on the same backend
     virtual bool deterministic(ggml_backend_t backend) {
         GGML_UNUSED(backend);
@@ -1536,7 +1538,7 @@ struct test_case {
         mode = MODE_TEST;
 
         ggml_init_params params = {
-            /* .mem_size = */ ggml_tensor_overhead()*128 + ggml_graph_overhead(),
+            /* .mem_size = */ ggml_tensor_overhead()*max_tensors() + ggml_graph_overhead(),
             /* .mem_base = */ NULL,
             /* .no_alloc = */ true,
         };
@@ -7642,6 +7644,7 @@ struct test_gdn_decode_rollback : public test_case {
     std::string vars() override { return rows || ident ? VARS_TO_STR5(n_tokens, K, reverse, rows, ident) : VARS_TO_STR3(n_tokens, K, reverse); }
     std::string op_desc(ggml_tensor *) override { return "GDN_DECODE_ROLLBACK"; }
     bool run_whole_graph() override { return true; }
+    size_t max_tensors() override { return ident == 2 ? 64 * (n_tokens + 2) : 128; }   // ~45 tensors per chain
     std::vector<ggml_tensor *> fusion_test_nodes() override { return outputs; }
     double max_err(ggml_backend_t backend) override { return ident == 2 ? 0.0 : ident == 1 ? 1e-6 : test_case::max_err(backend); }
     double err(const float * a, const float * b, size_t n) override {
