@@ -16862,6 +16862,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int64_t n_tokens : { 1, 2, 4, 8 }) {
         test_cases.emplace_back(new test_weighted_expert_sum(2560, 10, n_tokens, true));
     }
+    test_cases.emplace_back(new test_swiglu_iq3_mmvq());
     test_cases.emplace_back(new test_weighted_expert_sum(127, 2, 3));
     test_cases.emplace_back(new test_weighted_expert_sum(128, 4, 5));
     test_cases.emplace_back(new test_weighted_expert_sum(2048, 8, 32));
