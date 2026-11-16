@@ -7624,22 +7624,26 @@ struct test_gated_delta_net_cache_fusion : public test_case {
 // (fused into one decode kernel + one norm kernel on AMD).
 // rows: the conv store of build_conv_state_store with n_rs_seq > 0 (ARANGE -> reverse SCALE -> I32 cast -> SET_ROWS of
 //       the overlapping windows into slots {n-1, ..., 0}), which the model emits; otherwise the older per-slot CPYs.
-// ident: the chain twice on separate caches, the second kept unfused (its CONCAT is a graph output); the outputs are
-//       the differences (output, conv slots, state slots), which must be exactly 0: per token the fused kernel must
-//       compute what the unfused T-token ops compute.
+// ident 1: the chain twice on separate caches, the second kept unfused (its CONCAT is a graph output); the outputs are
+//       the differences (output, conv slots, state slots). The unfused ops round differently from the fused decode step
+//       (also at one token), so this is a tolerance check.
+// ident 2: the reference is n_tokens single-token steps (K = 1, per-slot CPY store: the plain decode chain, fused on AMD),
+//       each reading the caches the previous step wrote; the differences (outputs, final state, final conv state) must
+//       be exactly 0: per token the multi-token fused step computes what the single-token fused step computes.
 struct test_gdn_decode_rollback : public test_case {
     const int64_t n_tokens, K;
-    const bool reverse, rows, ident;
+    const bool reverse, rows;
+    const int ident;
     std::vector<ggml_tensor *> outputs;
 
-    test_gdn_decode_rollback(int64_t n_tokens, int64_t K, bool reverse = false, bool rows = false, bool ident = false)
+    test_gdn_decode_rollback(int64_t n_tokens, int64_t K, bool reverse = false, bool rows = false, int ident = 0)
         : n_tokens(n_tokens), K(K), reverse(reverse), rows(rows), ident(ident) {}
 
     std::string vars() override { return rows || ident ? VARS_TO_STR5(n_tokens, K, reverse, rows, ident) : VARS_TO_STR3(n_tokens, K, reverse); }
     std::string op_desc(ggml_tensor *) override { return "GDN_DECODE_ROLLBACK"; }
     bool run_whole_graph() override { return true; }
     std::vector<ggml_tensor *> fusion_test_nodes() override { return outputs; }
-    double max_err(ggml_backend_t backend) override { return ident ? 0.0 : test_case::max_err(backend); }
+    double max_err(ggml_backend_t backend) override { return ident == 2 ? 0.0 : ident == 1 ? 1e-6 : test_case::max_err(backend); }
     double err(const float * a, const float * b, size_t n) override {
         if (!ident) {
             return test_case::err(a, b, n);
@@ -7653,16 +7657,16 @@ struct test_gdn_decode_rollback : public test_case {
 
     struct chain_out { ggml_tensor * conv, * state, * out; };
 
-    chain_out build_chain(ggml_context * ctx, const char * sfx, bool unfused, ggml_tensor * ids, ggml_tensor * qkv,
+    ggml_tensor * new_cache(ggml_context * ctx, int64_t x, int64_t slots, const char * base, const char * sfx) {
+        ggml_tensor * t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, x, mem_size * slots);
+        ggml_format_name(t, "%s%s", base, sfx);
+        return t;
+    }
+
+    chain_out build_chain(ggml_context * ctx, int64_t n_tokens, int64_t K, bool rows, ggml_tensor * conv_cache, ggml_tensor * state_cache,
+            bool unfused, ggml_tensor * ids, ggml_tensor * qkv,
             ggml_tensor * conv_w, ggml_tensor * alpha, ggml_tensor * dt, ggml_tensor * A, ggml_tensor * beta_in,
             ggml_tensor * norm_w, ggml_tensor * z) {
-        auto cache = [&](int64_t x, const char * base) {
-            ggml_tensor * t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, x, mem_size * K);
-            ggml_format_name(t, "%s%s", base, sfx);
-            return t;
-        };
-        ggml_tensor * conv_cache  = cache(3 * C, "conv_cache");
-        ggml_tensor * state_cache = cache(D, "state_cache");
         ggml_tensor * history = ggml_reshape_3d(ctx, ggml_get_rows(ctx, conv_cache, ids), 3, C, 1);
         ggml_tensor * input = ggml_concat(ctx, history, ggml_transpose(ctx, qkv), 0);
         if (unfused) {
@@ -7741,7 +7745,29 @@ struct test_gdn_decode_rollback : public test_case {
         ggml_tensor * norm_w = tensor(S, 1, "norm_w");
         ggml_tensor * z      = tensor(S * H_v, n_tokens, "z");
         outputs.clear();
-        chain_out a = build_chain(ctx, "", false, ids, qkv, conv_w, alpha, dt, A, beta, norm_w, z);
+        chain_out a = build_chain(ctx, n_tokens, K, rows, new_cache(ctx, 3 * C, K, "conv_cache", ""), new_cache(ctx, D, K, "state_cache", ""),
+                false, ids, qkv, conv_w, alpha, dt, A, beta, norm_w, z);
+        if (ident == 2) {
+            // n_tokens single-token steps on caches of one slot (the same initial rows), in graph order
+            ggml_tensor * conv_c  = new_cache(ctx, 3 * C, 1, "conv_cache", "_ref");
+            ggml_tensor * state_c = new_cache(ctx, D, 1, "state_cache", "_ref");
+            ggml_tensor * outs = nullptr;
+            chain_out st = {};
+            for (int64_t t = 0; t < n_tokens; ++t) {
+                auto col = [&](ggml_tensor * x) { return ggml_view_2d(ctx, x, x->ne[0], 1, x->nb[1], t * x->nb[1]); };
+                st = build_chain(ctx, 1, 1, false, conv_c, state_c, false, ids, col(qkv), conv_w, col(alpha), dt, A, col(beta), norm_w, col(z));
+                ggml_tensor * o = ggml_reshape_4d(ctx, st.out, S, H_v, 1, 1);
+                outs = outs ? ggml_concat(ctx, outs, o, 2) : o;
+            }
+            // token n-1 wrote slot 0 of the multi-token caches (conv and state); the reference caches hold the last step
+            ggml_tensor * d_out   = ggml_sub(ctx, a.out, outs);
+            ggml_tensor * d_state = ggml_sub(ctx, ggml_view_2d(ctx, a.state, D, 1, a.state->nb[1], 0), st.state);
+            ggml_tensor * d_conv  = ggml_sub(ctx, ggml_cont(ctx, ggml_view_2d(ctx, a.conv, 3 * C, 1, a.conv->nb[1], 0)), ggml_cont(ctx, st.conv));
+            ggml_build_forward_expand(gf, d_conv);
+            ggml_build_forward_expand(gf, d_state);
+            outputs = { d_conv, d_state, d_out };
+            return d_out;
+        }
         if (!ident) {
             if (rows) {
                 outputs.push_back(ggml_cont(ctx, a.conv));
@@ -7751,7 +7777,8 @@ struct test_gdn_decode_rollback : public test_case {
             outputs.push_back(a.out);
             return a.out;
         }
-        chain_out b = build_chain(ctx, "_ref", true, ids, qkv, conv_w, alpha, dt, A, beta, norm_w, z);
+        chain_out b = build_chain(ctx, n_tokens, K, rows, new_cache(ctx, 3 * C, K, "conv_cache", "_ref"), new_cache(ctx, D, K, "state_cache", "_ref"),
+                true, ids, qkv, conv_w, alpha, dt, A, beta, norm_w, z);
         ggml_tensor * d_conv  = ggml_sub(ctx, ggml_cont(ctx, a.conv), ggml_cont(ctx, b.conv));
         ggml_tensor * d_state = ggml_sub(ctx, a.state, b.state);
         ggml_tensor * d_out   = ggml_sub(ctx, a.out, b.out);
@@ -19198,10 +19225,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // the model's SET_ROWS rollback store, and the fused chain against the unfused one on the same backend
     for (const auto & shape : {std::pair<int64_t, int64_t>{1, 4}, {2, 4}, {4, 4}, {3, 5}, {8, 8}}) {
         test_cases.emplace_back(new test_gdn_decode_rollback(shape.first, shape.second, false, true));
-        test_cases.emplace_back(new test_gdn_decode_rollback(shape.first, shape.second, false, true, true));
+        test_cases.emplace_back(new test_gdn_decode_rollback(shape.first, shape.second, false, true, 1));
+        test_cases.emplace_back(new test_gdn_decode_rollback(shape.first, shape.second, false, true, 2));
     }
     for (const auto & shape : {std::pair<int64_t, int64_t>{1, 1}, {2, 4}, {4, 4}}) {
-        test_cases.emplace_back(new test_gdn_decode_rollback(shape.first, shape.second, false, false, true));
+        test_cases.emplace_back(new test_gdn_decode_rollback(shape.first, shape.second, false, false, 1));
     }
 
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));

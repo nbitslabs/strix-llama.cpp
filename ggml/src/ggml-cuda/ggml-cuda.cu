@@ -4546,9 +4546,10 @@ static int ggml_cuda_try_gdn_decode_fusion(const ggml_cgraph * cgraph, int node_
         // goes to slot Kw - 1 - w, i.e. slot s holds the window that starts at column n_tokens - s, which is what
         // the fused kernel writes for token n_tokens - 1 - s. Slots n_tokens..K-1 stay unwritten (conv_fill_tail off).
         const int64_t Kw = n_tokens;
-        const ggml_tensor * slots   = rb_set->src[0];
-        const ggml_tensor * windows = rb_set->src[1];
-        const ggml_tensor * order   = rb_set->src[2];
+        // ggml_set_rows(a, b, c) keeps src[0] = b (rows), src[1] = c (indices), src[2] = a (destination)
+        const ggml_tensor * windows = rb_set->src[0];
+        const ggml_tensor * order   = rb_set->src[1];
+        const ggml_tensor * slots   = rb_set->src[2];
         float ar[3], sc[2];
         memcpy(ar, rb_arange->op_params, sizeof(ar));
         memcpy(sc, rb_scale->op_params, sizeof(sc));
@@ -4701,7 +4702,7 @@ static int ggml_cuda_try_gdn_decode_fusion(const ggml_cgraph * cgraph, int node_
     const ggml_tensor * conv_outs[8];
     int n_conv_outs = 0;
     if (rb_set) {
-        conv_outs[n_conv_outs++] = rb_set->src[0];
+        conv_outs[n_conv_outs++] = rb_set->src[2];
     } else {
         for (int k = 0; k < n_conv_cpy; ++k) {
             conv_outs[n_conv_outs++] = conv_cpy[k]->src[1];
