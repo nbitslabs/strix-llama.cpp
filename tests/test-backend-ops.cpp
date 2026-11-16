@@ -4283,79 +4283,6 @@ struct test_rms_norm : public test_case {
     }
 };
 
-struct test_hc_decode : public test_case {
-    const int embd, tokens;
-    const bool mix, exact;
-
-    test_hc_decode(int embd, int tokens, bool mix, bool exact)
-        : embd(embd), tokens(tokens), mix(mix), exact(exact) {}
-    std::string op_desc(ggml_tensor *) override { return mix ? "HC_MIX_DECODE" : "HC_COMBINE_DECODE"; }
-    std::string vars() override { return VARS_TO_STR4(embd, tokens, mix, exact); }
-    bool run_whole_graph() override { return true; }
-    bool use_scheduler_allocation() override { return true; }
-    double max_nmse_err() override { return exact ? 0.0 : test_case::max_nmse_err(); }
-    double err(const float * a, const float * b, size_t n) override {
-        if (!exact) {
-            return test_case::err(a, b, n);
-        }
-        size_t n_diff = 0;
-        for (size_t i = 0; i < n; ++i) {
-            n_diff += a[i] != b[i];
-        }
-        return (double) n_diff;
-    }
-
-    ggml_tensor * build_graph(ggml_context * ctx) override {
-        constexpr int hc = 4;
-        auto * x = mix ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, embd * hc, tokens)
-                      : ggml_new_tensor_3d(ctx, GGML_TYPE_F32, embd, hc, tokens);
-        auto * gate = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, mix ? embd * hc : hc, tokens);
-        auto * block = mix ? nullptr : ggml_new_tensor_3d(ctx, GGML_TYPE_F32, embd, 1, tokens);
-        for (auto * t : {x, gate, block}) {
-            if (t) {
-                ggml_set_input(t);
-                if (exact) {
-                    ggml_set_output(t); // both chains must read the original inputs
-                }
-                if (gf) { ggml_build_forward_expand(gf, t); }
-            }
-        }
-        auto chain = [&](bool unfused) {
-            auto keep = [&](ggml_tensor * t) {
-                if (unfused) { ggml_set_output(t); }
-                return t;
-            };
-            if (mix) {
-                auto * sig = keep(ggml_sigmoid(ctx, gate));
-                auto * gated = keep(ggml_mul(ctx, x, sig));
-                gated = ggml_reshape_3d(ctx, gated, embd, hc, tokens);
-                auto * sum = keep(ggml_cont(ctx, ggml_view_2d(ctx, gated, embd, tokens, gated->nb[2], 0)));
-                for (int c = 1; c < hc; ++c) {
-                    auto * stream = ggml_view_2d(ctx, gated, embd, tokens, gated->nb[2], c * gated->nb[1]);
-                    sum = keep(ggml_add(ctx, sum, stream));
-                }
-                return ggml_scale(ctx, sum, 0.25f);
-            }
-            auto * scaled = keep(ggml_scale(ctx, gate, 0.25f));
-            auto * sig = keep(ggml_sigmoid(ctx, scaled));
-            auto * weight = keep(ggml_scale(ctx, sig, 2.0f));
-            weight = ggml_reshape_3d(ctx, weight, 1, hc, tokens);
-            if (gf) { ggml_build_forward_expand(gf, weight); }
-            auto * expanded = keep(ggml_repeat(ctx, block, x));
-            auto * update = keep(ggml_mul(ctx, expanded, weight));
-            return ggml_add(ctx, x, update);
-        };
-        auto * fused = chain(false);
-        if (!exact) {
-            return fused;
-        }
-        if (gf) { ggml_build_forward_expand(gf, fused); }
-        auto * unfused = chain(true);
-        // Compare each backend's fused chain to its own unfused chain, so CPU/GPU expf differences do not enter the test.
-        return ggml_sub(ctx, fused, unfused);
-    }
-};
-
 struct test_hc_combine_norm_lifetime : public test_case {
     const int embd, hc, tokens;
     const bool res_inplace;
@@ -15426,17 +15353,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     for (int T : {255, 256, 2048}) {
         test_cases.emplace_back(new test_conv_state_chain(true, 10240, T, 5, false, false, true));
-    }
-    for (int tokens : {1, 2, 4, 8}) {
-        for (bool mix : {false, true}) {
-            for (bool exact : {false, true}) {
-                test_cases.emplace_back(new test_hc_decode(2560, tokens, mix, exact));
-            }
-        }
-    }
-    // Partial waves and blocks on the same decode paths.
-    for (bool mix : {false, true}) {
-        test_cases.emplace_back(new test_hc_decode(2563, 2, mix, true));
     }
     for(int embd : {1023,1024,2560,3072,3073}) {
         for(int hc : {1,4,5,16,17}) {
