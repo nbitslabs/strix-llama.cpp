@@ -6680,13 +6680,20 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
-    // Shared expert gate for one token: mul_mat(w [n_embd, 1], y) -> sigmoid -> mul -> add [-> add]
-    // (Qwen3.5 adds the residual in a second add, qwen4exp folds the result into the hyper-connection instead)
+    // Shared expert gate: mul_mat(w [n_embd, 1], y) -> sigmoid -> mul -> add [-> add]
+    // Qwen3.5 adds a residual; qwen4exp feeds the hyper-connection. The switch keeps the original T=1 route.
+    static const bool fuse_shexp_gate = [] {
+        const char * env = getenv("GGML_CUDA_FUSE_SHEXP_GATE");
+        return !env || strcmp(env, "0") != 0;
+    }();
     if (node->op == GGML_OP_MUL_MAT && i + 3 < cgraph->n_nodes && node->type == GGML_TYPE_F32 &&
         node->src[0]->type == GGML_TYPE_F32 && node->src[1]->type == GGML_TYPE_F32 &&
         node->src[0]->ne[0] % 2 == 0 && ggml_nelements(node->src[0]) == node->src[0]->ne[0] &&
-        ggml_nelements(node->src[1]) == node->src[0]->ne[0] &&
-        ggml_is_contiguous(node->src[0]) && ggml_is_contiguous(node->src[1]) && ggml_nelements(node) == 1 &&
+        ggml_is_matrix(node->src[1]) && node->src[1]->ne[0] == node->src[0]->ne[0] &&
+        node->src[1]->ne[1] >= 1 && node->src[1]->ne[1] <= 8 &&
+        (node->src[1]->ne[1] == 1 || (fuse_shexp_gate && GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc))) &&
+        ggml_is_contiguous(node->src[0]) && ggml_is_contiguous(node->src[1]) &&
+        ggml_is_matrix(node) && node->ne[0] == 1 && node->ne[1] == node->src[1]->ne[1] &&
         cgraph->nodes[i + 1]->op == GGML_OP_UNARY && ggml_get_unary_op(cgraph->nodes[i + 1]) == GGML_UNARY_OP_SIGMOID &&
         cgraph->nodes[i + 1]->src[0] == node && cgraph->nodes[i + 2]->op == GGML_OP_MUL && cgraph->nodes[i + 3]->op == GGML_OP_ADD &&
         GGML_CUDA_CC_IS_AMD(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
@@ -6728,13 +6735,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             };
             const bool residual_ok = !two_adds || (residual != mul && residual != add0 && residual->type == GGML_TYPE_F32 &&
                 ggml_are_same_shape(mul, residual) && ggml_is_contiguous(residual) && safe_output_alias(residual));
-            if (gate == sigmoid && ggml_nelements(sigmoid) == 1 && (add0->src[0] == mul || add0->src[1] == mul) &&
+            if (gate == sigmoid && sigmoid->type == GGML_TYPE_F32 && ggml_are_same_shape(sigmoid, node) &&
+                (add0->src[0] == mul || add0->src[1] == mul) &&
                 other != mul && residual_ok &&
                 mul->type == GGML_TYPE_F32 && src->type == GGML_TYPE_F32 && other->type == GGML_TYPE_F32 &&
-                mul->ne[0] == ncols && ggml_nelements(mul) == ncols && ggml_are_same_shape(mul, src) && ggml_are_same_shape(mul, other) &&
+                mul->ne[0] == ncols && ggml_are_same_shape(mul, node->src[1]) && ggml_are_same_shape(mul, src) && ggml_are_same_shape(mul, other) &&
                 ggml_are_same_shape(mul, out) &&
                 ggml_is_contiguous(src) && ggml_is_contiguous(other) && ggml_is_contiguous(out) &&
-                safe_output_alias(src) && safe_output_alias(other) && safe_output_alias(node->src[1])) {
+                out->type == GGML_TYPE_F32 && add0->type == GGML_TYPE_F32 &&
+                safe_output_alias(src) && safe_output_alias(other) && safe_output_alias(node->src[1]) &&
+                ((uintptr_t) node->src[0]->data + ggml_nbytes(node->src[0]) <= dst_begin || (uintptr_t) node->src[0]->data >= dst_end)) {
                 ggml_cuda_op_shared_gate_mul_add(*cuda_ctx, node, src, other, residual, out);
                 return two_adds ? 4 : 3;
             }

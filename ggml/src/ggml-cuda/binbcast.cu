@@ -726,13 +726,21 @@ void ggml_cuda_op_shared_mul_add(
         (const float *) residual->data, (float *) dst->data, dst->ne[0], nelements);
 }
 
-// Qwen3.5 shared-expert gate for one token: gate = sigmoid(w . y) computed exactly like
+// Shared-expert gate per token: gate = sigmoid(w . y) computed exactly like
 // mul_mat_vec_f<float, float, 1, 256> (same per-thread fma chain and the same two-level warp reduction),
-// then dst = (other + src*gate) + residual as in shared_mul_add_f32. One block, so the activation vector is
+// then dst = (other + src*gate) + residual as in shared_mul_add_f32. One block per token, so its activation vector is
 // fully read before the reduction barrier and the output may alias it.
 static __global__ void __launch_bounds__(256, 1) shared_gate_mul_add_f32(
         const float * w, const float * y, const float * src, const float * other, const float * residual, float * dst,
         const int ncols2, const int64_t n_embd) {
+    const int64_t offset = int64_t(blockIdx.x) * n_embd;
+    y += offset;
+    src += offset;
+    other += offset;
+    dst += offset;
+    if (residual) {
+        residual += offset;
+    }
     constexpr int block_size = 256;
     constexpr int warp_size  = 32;
     __shared__ float buf_iw[warp_size];
@@ -779,7 +787,7 @@ void ggml_cuda_op_shared_gate_mul_add(
     const ggml_tensor * w = gate_mm->src[0];
     const ggml_tensor * y = gate_mm->src[1];
     GGML_ASSERT(w->ne[0] % 2 == 0);
-    const ggml_cuda_kernel_launch_params launch_params(1, 256, 0, ctx.stream());
+    const ggml_cuda_kernel_launch_params launch_params(dst->ne[1], 256, 0, ctx.stream());
     ggml_cuda_kernel_launch(shared_gate_mul_add_f32, launch_params,
         (const float *) w->data, (const float *) y->data, (const float *) src->data, (const float *) other->data,
         residual ? (const float *) residual->data : nullptr, (float *) dst->data, (int) (w->ne[0] / 2), dst->ne[0]);

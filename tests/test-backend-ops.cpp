@@ -6015,6 +6015,51 @@ struct test_shared_mul_add : public test_case {
     }
 };
 
+struct test_shared_gate_mul_add : public test_case {
+    const int64_t n_tokens;
+
+    test_shared_gate_mul_add(int64_t n_tokens) : n_tokens(n_tokens) {}
+    std::string op_desc(ggml_tensor *) override { return "SHARED_GATE_MUL_ADD"; }
+    std::string vars() override { return VAR_TO_STR(n_tokens); }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 0.0; }
+
+    double err(const float * a, const float * b, size_t n) override {
+        // Compare the fused and materialized chains on each backend, not CPU and GPU reduction orders.
+        if (n != size_t(2 * 2560 * n_tokens)) {
+            return 1.0;
+        }
+        for (size_t i = 0; i < n; ++i) {
+            if (!std::isfinite(a[i]) || !std::isfinite(b[i])) {
+                return 1.0;
+            }
+        }
+        return memcmp(a, a + n/2, n/2 * sizeof(float)) == 0 &&
+               memcmp(b, b + n/2, n/2 * sizeof(float)) == 0 ? 0.0 : 1.0;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2560, 1);
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2560, n_tokens);
+        ggml_tensor * src = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2560, n_tokens);
+        ggml_tensor * other = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2560, n_tokens);
+        auto chain = [&](bool materialize) {
+            ggml_tensor * mm = ggml_mul_mat(ctx, w, x);
+            ggml_tensor * sig = ggml_sigmoid(ctx, mm);
+            ggml_tensor * mul = ggml_mul(ctx, src, sig);
+            if (materialize) {
+                ggml_set_output(mm);
+                ggml_set_output(sig);
+                ggml_set_output(mul);
+            }
+            return ggml_add(ctx, other, mul);
+        };
+        ggml_tensor * reference = chain(true);
+        ggml_tensor * fused = chain(false);
+        return ggml_concat(ctx, reference, fused, 1);
+    }
+};
+
 // GGML_OP_UNARY(GELU|SILU|SIGMOID|SOFTPLUS) + GGML_OP_MUL (fused operation).
 struct test_unary_mul : public test_case {
     const ggml_unary_op op;
@@ -16873,6 +16918,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_weighted_expert_sum(128, 4, 5));
     test_cases.emplace_back(new test_weighted_expert_sum(2048, 8, 32));
     test_cases.emplace_back(new test_weighted_expert_sum(128, 16, 3));
+    for (int64_t n_tokens : {1, 2, 4, 8}) {
+        test_cases.emplace_back(new test_shared_gate_mul_add(n_tokens));
+    }
     test_cases.emplace_back(new test_shared_mul_add(127, 3));
     test_cases.emplace_back(new test_shared_mul_add(2048, 32));
     test_cases.emplace_back(new test_swiglu_q8_mmq(false, 1, 1, 2048, 32, 512));
