@@ -5,6 +5,15 @@
 #include "mmb.cuh"
 #include "ggml-backend-impl.h"
 
+static bool hc_fast_decode(const ggml_backend_cuda_context & ctx, const int64_t n_tokens) {
+    static const bool enabled = [] {
+        const char * value = getenv("GGML_CUDA_HC_FAST");
+        return value == nullptr || atoi(value) != 0;
+    }();
+    const auto & device = ggml_cuda_info().devices[ctx.device];
+    return enabled && GGML_CUDA_CC_IS_RDNA3_5(device.cc) && device.warp_size == 32 && n_tokens <= 32;
+}
+
 // Explicitly rounded mul/add: keeps the fused kernels from being contracted into FMAs so that
 // the results match the separate MUL and ADD kernels of the unfused graph bit for bit.
 #if defined(__HIP_PLATFORM_AMD__)
@@ -223,6 +232,14 @@ void ggml_cuda_op_hc_mix_reduce(ggml_backend_cuda_context & ctx, const ggml_cuda
         const int threads = 256; const int blocks = (int) ((n_items + threads - 1) / threads);
         const ggml_cuda_kernel_launch_params launch_params(blocks, threads, 0, ctx.stream());
         ggml_cuda_kernel_launch(hc_mix_reduce_bf16, launch_params, xn16, g16, out, n_embd, n_tokens, args.hc, args.scale, args.bias);
+    } else if (args.hc == 4 && hc_fast_decode(ctx, n_tokens)) {
+        // gfx1151 decode: reported 0.56-0.65 ms per 96 mixes; revisit this layout after comparison with the LDS path below.
+        // One lane owns all four products and the ordered sum; keep 32 outputs per block without the LDS barrier.
+        const int threads = ggml_cuda_info().devices[ctx.device].warp_size;
+        const int blocks = (int) ((n_items + threads - 1) / threads);
+        const ggml_cuda_kernel_launch_params launch_params(blocks, threads, 0, ctx.stream());
+        ggml_cuda_kernel_launch(hc_mix_reduce_f32, launch_params,
+            (const float *) xn->data, (const float *) gate->data, out, n_embd, n_tokens, args.hc, args.scale, args.bias);
     } else if (args.hc == 4 && n_tokens <= 32) {
         // one wave per stream, the same in-order sum: bit-identical to the serial kernel with more blocks in flight for decode
         const int blocks = (int) ((n_items + 31) / 32);
@@ -270,7 +287,8 @@ void ggml_cuda_op_hc_combine(ggml_backend_cuda_context & ctx, const ggml_cuda_hc
     float * out = stage ? staged.alloc(ggml_nelements(dst)) : (float *) dst->data;
 
     const int64_t n_items = ggml_nelements(dst);
-    const int     threads = 256;
+    // Increase the decode grid for the elementwise fallback; the measured combine+norm path keeps its reduction tree.
+    const int     threads = hc_fast_decode(ctx, n_tokens) ? 64 : 256;
     const int     blocks  = (int) ((n_items + threads - 1) / threads);
     const ggml_cuda_kernel_launch_params launch_params(blocks, threads, 0, ctx.stream());
     ggml_cuda_kernel_launch(hc_combine_f32, launch_params,
