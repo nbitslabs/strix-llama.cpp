@@ -7679,6 +7679,8 @@ struct test_gdn_decode_rollback : public test_case {
         ggml_tensor * attn = ggml_view_4d(ctx, gdn, S, H_v, n_tokens, 1, S * sizeof(float), S * H_v * sizeof(float), S * H_v * n_tokens * sizeof(float), 0);
         ggml_tensor * norm = ggml_mul(ctx, ggml_rms_norm(ctx, attn, 1e-6f), norm_w);
         ggml_tensor * out = ggml_mul(ctx, norm, ggml_sigmoid(ctx, ggml_reshape_4d(ctx, z, S, H_v, n_tokens, 1)));
+        // the whole chain stays contiguous in the graph, as in the model: read-backs and the second chain come after it
+        ggml_build_forward_expand(gf, out);
         return { conv_read, cpy, out };
     }
 
