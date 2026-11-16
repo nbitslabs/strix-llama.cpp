@@ -18902,11 +18902,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, mk[0], n, mk[1], {1, 1}, {1, 1}));
         }
         test_cases.emplace_back(new test_hc_up_mix(GGML_TYPE_Q8_0, 320, 2560, 4, n, false, true));
-        if (n == 1 || n == 4 || n == 8) {
-            for (int64_t k : {256, 512}) {
-                test_cases.emplace_back(new test_hc_up_mix(GGML_TYPE_Q8_0, k, 2560, 4, n, false, true));
-            }
-        }
         if (n > 1) {
             test_cases.emplace_back(new test_mmv_group(2560, 640, 640, n));
         }
