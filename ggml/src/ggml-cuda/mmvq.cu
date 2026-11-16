@@ -3737,50 +3737,6 @@ static __global__ void mul_mat_id_iq4_nl_weighted_rdna3_5(
     }
 }
 
-// The serial T=1 path measured 161 GB/s on gfx1151 at K=640, M=2560, ten experts.
-// Run independent expert dots in separate waves; remove this path if hardware validation shows no gain.
-template <int n_expert_used>
-__launch_bounds__(32 * n_expert_used, 1)
-static __global__ void mul_mat_id_iq4_nl_weighted_parallel_rdna3_5(
-        const void * vx_ptr, const block_q8_1 * y, const int32_t * ids, const float * weights, float * dst,
-        const int nrows, const int blocks_per_row, const int stride_row_x, const int stride_channel_x,
-        const int stride_y) {
-    constexpr int qi        = ggml_cuda_type_traits<GGML_TYPE_IQ4_NL>::qi;
-    constexpr int vdr       = VDR_Q4_0_Q8_1_MMVQ;
-    constexpr int warp_size = 32;
-    constexpr int blocks_per_iter = vdr * warp_size / qi;
-
-    const int lane = threadIdx.x;
-    const int ex   = threadIdx.y;
-    const int row  = blockIdx.x;
-    if (row >= nrows) {
-        return;
-    }
-
-    __shared__ float terms[n_expert_used];
-    const int channel = ids[ex];
-    const int x_off = channel * stride_channel_x + row * stride_row_x;
-    float sum = 0.0f;
-    for (int kbx = lane / (qi/vdr); kbx < blocks_per_row; kbx += blocks_per_iter) {
-        const int kqs = vdr * (lane % (qi/vdr));
-        sum += vec_dot_iq4_nl_q8_1(vx_ptr, y + ex * stride_y + kbx, x_off + kbx, kqs);
-    }
-    sum = warp_reduce_sum<warp_size>(sum);
-    if (lane == 0) {
-        terms[ex] = mmvq_hc_mul_rn(sum, weights[ex]);
-    }
-    __syncthreads();
-
-    if (lane == 0 && ex == 0) {
-        float result = terms[0];
-#pragma unroll
-        for (int i = 1; i < n_expert_used; ++i) {
-            result = mmvq_hc_add_rn(result, terms[i]);
-        }
-        dst[row] = result;
-    }
-}
-
 template <int n_expert_used>
 __launch_bounds__(32, 8)
 static __global__ void mul_mat_id_iq4_nl_weighted_tokens_rdna3_5(
@@ -3866,14 +3822,6 @@ static __global__ void mul_mat_id_q8_0_weighted_rdna3_5(
     }
 }
 
-static bool mmvq_moe_t1_fast_enabled() {
-    static const bool enabled = [] {
-        const char * env = getenv("GGML_CUDA_MOE_T1_FAST");
-        return !env || std::strcmp(env, "0") != 0;
-    }();
-    return enabled;
-}
-
 static bool mmvq_moe_weighted_tokens_enabled() {
     static const bool enabled = [] {
         const char * env = getenv("GGML_CUDA_MOE_WEIGHTED_T");
@@ -3936,15 +3884,6 @@ void ggml_cuda_mul_mat_id_weighted_rdna3_5(
     if (n_tokens > 1) {
         const ggml_cuda_kernel_launch_params params(dim3(nrows, 1, n_tokens), 32, 0, ctx.stream());
         ggml_cuda_kernel_launch(mul_mat_id_iq4_nl_weighted_tokens_rdna3_5<n_used>, params,
-            w->data, y_q8.get(), (const int32_t *) ids->data, (const float *) weights->data, (float *) dst->data,
-            nrows, nblocks, (int) (w->nb[1] / ggml_type_size(w->type)),
-            (int) (w->nb[2] / ggml_type_size(w->type)), nblocks);
-        return;
-    }
-
-    if (w->type == GGML_TYPE_IQ4_NL && mmvq_moe_t1_fast_enabled()) {
-        const ggml_cuda_kernel_launch_params params(nrows, dim3(32, n_used, 1), 0, ctx.stream());
-        ggml_cuda_kernel_launch(mul_mat_id_iq4_nl_weighted_parallel_rdna3_5<n_used>, params,
             w->data, y_q8.get(), (const int32_t *) ids->data, (const float *) weights->data, (float *) dst->data,
             nrows, nblocks, (int) (w->nb[1] / ggml_type_size(w->type)),
             (int) (w->nb[2] / ggml_type_size(w->type)), nblocks);
