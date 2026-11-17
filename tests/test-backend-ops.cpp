@@ -9244,12 +9244,13 @@ struct test_hc_up_mix : public test_case {
     const int64_t hc;
     const int64_t n_tokens;
     const bool external_consumer;
+    const bool matmul_only;
 
-    std::string vars() override { return VARS_TO_STR6(type_w, k, n_embd, hc, n_tokens, external_consumer); }
+    std::string vars() override { return VARS_TO_STR7(type_w, k, n_embd, hc, n_tokens, external_consumer, matmul_only); }
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
-        return "HC_UP_MIX";
+        return matmul_only ? "MUL_MAT" : "HC_UP_MIX";
     }
 
     bool run_whole_graph() override { return true; }
@@ -9257,8 +9258,8 @@ struct test_hc_up_mix : public test_case {
     double max_nmse_err() override { return 5e-4; }
 
     test_hc_up_mix(ggml_type type_w, int64_t k, int64_t n_embd, int64_t hc, int64_t n_tokens,
-            bool external_consumer = false)
-        : type_w(type_w), k(k), n_embd(n_embd), hc(hc), n_tokens(n_tokens), external_consumer(external_consumer) {}
+            bool external_consumer = false, bool matmul_only = false)
+        : type_w(type_w), k(k), n_embd(n_embd), hc(hc), n_tokens(n_tokens), external_consumer(external_consumer), matmul_only(matmul_only) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * lo = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n_tokens);
@@ -9269,7 +9270,11 @@ struct test_hc_up_mix : public test_case {
         ggml_set_name(w, "w_up");
 
         ggml_tensor * act  = ggml_silu(ctx, ggml_scale(ctx, lo, 1.0f / (float) hc));
-        ggml_tensor * gate = ggml_sigmoid(ctx, ggml_mul_mat(ctx, w, act));
+        ggml_tensor * mm = ggml_mul_mat(ctx, w, act);
+        if (matmul_only) {
+            return mm;
+        }
+        ggml_tensor * gate = ggml_sigmoid(ctx, mm);
         ggml_tensor * gated = ggml_mul(ctx, xn, gate);
         gated = ggml_reshape_3d(ctx, gated, n_embd, hc, n_tokens);
         ggml_tensor * mixed = ggml_view_2d(ctx, gated, n_embd, n_tokens, ggml_row_size(gated->type, n_embd) * hc, 0);
@@ -19040,6 +19045,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 }
             }
         }
+    }
+
+    // HC up projection (scale -> silu -> Q8_0 matvec) at decode and multi-token (spec decoding) batches on gfx1151.
+    for (int64_t n : {1, 2, 3, 4, 5, 6, 7, 8}) {
+        for (auto mk : {std::array<int64_t, 2>{320, 10240}, {10240, 320}, {640, 2560}}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, mk[0], n, mk[1], {1, 1}, {1, 1}));
+        }
+        test_cases.emplace_back(new test_hc_up_mix(GGML_TYPE_Q8_0, 320, 2560, 4, n, false, true));
     }
 
     for (bool b : {false, true}) {

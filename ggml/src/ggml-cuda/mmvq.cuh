@@ -23,6 +23,10 @@ bool ggml_cuda_mul_mat_vec_q_fq_prologue_ok(ggml_backend_cuda_context & ctx, con
 void ggml_cuda_mul_mat_vec_q_fq_prologue(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_tensor * y,
         float y_scale, float y_bias, int y_op);
 
+bool ggml_cuda_mul_mat_vec_q_prologue_ok(const ggml_tensor * dst, const ggml_tensor * y);
+void ggml_cuda_mul_mat_vec_q_prologue(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_tensor * y,
+        float y_scale, float y_bias, int y_op);
+
 // RDNA3.5 grouped matvec: independent single-column matvecs sharing the same F32 activation vector `y`
 // (Q8_0 rows via the fused-quantize path, optionally with a Q8_0 gate + GLU epilogue) in one launch.
 #define GGML_CUDA_MMV_GROUP_MAX 4

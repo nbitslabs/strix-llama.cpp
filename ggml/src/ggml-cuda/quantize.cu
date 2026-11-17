@@ -51,11 +51,13 @@ static __device__ __forceinline__ float nvfp4_native_scale_error(
 #endif // CUDART_VERSION >= 12080
 #endif // defined(BLACKWELL_MMA_AVAILABLE)
 
+template <bool prologue>
 __launch_bounds__(CUDA_QUANTIZE_BLOCK_SIZE, 1)
 static __global__ void quantize_q8_1(
         const float * x_ptr, void * vy_ptr,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
-        const int64_t ne0, const uint32_t ne1, const uint3 ne2) {
+        const int64_t ne0, const uint32_t ne1, const uint3 ne2,
+        const float y_scale, const float y_bias, const int y_op) {
     ggml_cuda_pdl_lc();
     const float * GGML_CUDA_RESTRICT x  = x_ptr;
     void        * GGML_CUDA_RESTRICT vy = vy_ptr;
@@ -82,7 +84,11 @@ static __global__ void quantize_q8_1(
     const int64_t iqs = i_cont % QK8_1; // quant index
 
     ggml_cuda_pdl_sync();
-    const float xi = i0 < ne00 ? x[i03*s03 + i02*s02 + i01*s01 + i00] : 0.0f;
+    float xi = i0 < ne00 ? x[i03*s03 + i02*s02 + i01*s01 + i00] : 0.0f;
+    if (prologue && i0 < ne00) {
+        const float t = y_scale * xi + y_bias;
+        xi = y_op == 1 ? ggml_cuda_op_silu_single(t) : 1.0f / (1.0f + expf(-t));
+    }
     float amax = fabsf(xi);
 
     amax = warp_reduce_max<QK8_1>(amax);
@@ -618,7 +624,18 @@ void quantize_row_q8_1_cuda(
     const dim3 num_blocks(block_num_x, ne1, ne2*ne3);
     const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE, 1, 1);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(num_blocks, block_size, 0, stream);
-    ggml_cuda_kernel_launch(quantize_q8_1, launch_params, x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv);
+    ggml_cuda_kernel_launch(quantize_q8_1<false>, launch_params, x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv, 1.0f, 0.0f, 0);
+}
+
+void quantize_row_q8_1_prologue_cuda(
+        const float * x, void * vy, const int64_t ne00, const int64_t ne0, const int64_t ne1,
+        const float y_scale, const float y_bias, const int y_op, cudaStream_t stream) {
+    GGML_ASSERT(ne0 >= ne00 && ne0 % QK8_1 == 0 && (y_op == 1 || y_op == 2));
+    const dim3 num_blocks((ne0 + CUDA_QUANTIZE_BLOCK_SIZE - 1) / CUDA_QUANTIZE_BLOCK_SIZE, ne1, 1);
+    const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE, 1, 1);
+    const ggml_cuda_kernel_launch_params params(num_blocks, block_size, 0, stream);
+    ggml_cuda_kernel_launch(quantize_q8_1<true>, params, x, vy, ne00, ne00, ne00*ne1, ne00*ne1,
+            ne0, ne1, init_fastdiv_values(1), y_scale, y_bias, y_op);
 }
 
 void quantize_mmq_q8_1_cuda(

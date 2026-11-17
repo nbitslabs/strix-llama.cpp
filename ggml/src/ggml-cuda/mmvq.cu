@@ -3088,6 +3088,50 @@ static bool mul_mat_vec_q_fq_try(
     return true;
 }
 
+bool ggml_cuda_mul_mat_vec_q_prologue_ok(const ggml_tensor * dst, const ggml_tensor * y) {
+    const ggml_tensor * w = dst->src[0];
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    static const bool shortk_global_q = [] {
+        const char * env = getenv("GGML_CUDA_SHORTK_GLOBAL_Q");
+        return !env || atoi(env) != 0;
+    }();
+    // Caller measured HC up K=320, T=1 at 119 GB/s on gfx1151 (2026-11-16); remove this gate if fq catches up.
+    const bool shortk = shortk_global_q && y->ne[1] == 1 && w->ne[0] > 0 && w->ne[0] <= 512 &&
+        w->ne[0] % QK8_0 == 0 && w->ne[1] > 0 && w->ne[1] <= INT32_MAX && !ggml_cuda_mmb_dq_packed(w) &&
+        dst->src[1]->op == GGML_OP_UNARY && ggml_get_unary_op(dst->src[1]) == GGML_UNARY_OP_SILU;
+    // HC up on gfx1151: caller measured 114 GB/s at T=4 (2026-11-16); remeasure before widening this shape gate.
+    return GGML_CUDA_CC_IS_RDNA3_5(cc) && ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size == 32 &&
+        dst->op == GGML_OP_MUL_MAT && w->type == GGML_TYPE_Q8_0 &&
+        (shortk || (w->ne[0] == 320 && w->ne[1] == 10240 && y->ne[1] >= 2 && y->ne[1] <= 8)) &&
+        ggml_is_matrix(w) && ggml_is_contiguous(w) &&
+        (!w->buffer || ggml_backend_buffer_get_usage(w->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE) &&
+        y->type == GGML_TYPE_F32 && y->ne[0] == w->ne[0] &&
+        ggml_is_matrix(y) && ggml_is_contiguous(y) && ggml_are_same_shape(y, dst->src[1]) &&
+        dst->type == GGML_TYPE_F32 && ggml_is_matrix(dst) && ggml_is_contiguous(dst) &&
+        dst->ne[0] == w->ne[1] && dst->ne[1] == y->ne[1];
+}
+
+void ggml_cuda_mul_mat_vec_q_prologue(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_tensor * y,
+        const float y_scale, const float y_bias, const int y_op) {
+    GGML_ASSERT(ggml_cuda_mul_mat_vec_q_prologue_ok(dst, y));
+    const ggml_tensor * w = dst->src[0];
+    const int ncols = w->ne[0];
+    const int ncols_padded = GGML_PAD(ncols, MATRIX_ROW_PADDING);
+    ggml_cuda_pool_alloc<block_q8_1> y_q8(ctx.pool(), y->ne[1]*ncols_padded/QK8_1);
+    quantize_row_q8_1_prologue_cuda((const float *) y->data, y_q8.get(), ncols, ncols_padded, y->ne[1],
+            y_scale, y_bias, y_op, ctx.stream());
+
+    ggml_cuda_mm_fusion_args_device fusion{};
+    fusion.x_pk = ggml_cuda_mmb_dq_packed(w) ? 1 : 0;
+    const int64_t stride_col_y = ncols_padded / QK8_1;
+    const int64_t stride_channel_y = y->ne[1] * stride_col_y;
+    mul_mat_vec_q_switch_type(
+        w->data, w->type, y_q8.get(), nullptr, fusion, (float *) dst->data, ncols,
+        w->ne[1], y->ne[1], w->nb[1] / sizeof(block_q8_0), stride_col_y, dst->nb[1] / sizeof(float),
+        1, 1, 1, w->nb[2] / sizeof(block_q8_0), stride_channel_y, dst->nb[2] / sizeof(float),
+        1, 1, w->nb[3] / sizeof(block_q8_0), stride_channel_y, dst->nb[3] / sizeof(float), 0, ctx.stream());
+}
+
 bool ggml_cuda_mul_mat_vec_q_fq_prologue_ok(ggml_backend_cuda_context & ctx, const ggml_tensor * dst, const ggml_tensor * y) {
     if (dst->op != GGML_OP_MUL_MAT || !ggml_is_quantized(dst->src[0]->type) || y->type != GGML_TYPE_F32 ||
         !ggml_is_contiguous(y) || !ggml_are_same_shape(y, dst->src[1])) {
