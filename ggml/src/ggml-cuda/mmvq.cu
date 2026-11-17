@@ -1405,7 +1405,7 @@ static __global__ void mul_mat_vec_q(
                         vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs));
                     tmp[j][i] = __fadd_rn(tmp[j][i], dot);
                 } else if constexpr (packed) {
-                    static_assert(type == GGML_TYPE_Q8_0 && !has_fusion, "packed MMVQ requires Q8_0 without fusion");
+                    static_assert(type == GGML_TYPE_Q8_0, "packed MMVQ requires Q8_0");
                     tmp[j][i] += vec_dot_q8_0_q8_1_pk(vx, &y[j*stride_col_y + kby], row0 + i, kbx, kqs, blocks_per_row_x);
                 } else {
                     tmp[j][i] += vec_dot_q_cuda(
@@ -1417,6 +1417,8 @@ static __global__ void mul_mat_vec_q(
                             const float dot_gate = ggml_cuda_materialize(vec_dot_q_cuda(
                                 vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs));
                             tmp_gate[j][i] = __fadd_rn(tmp_gate[j][i], dot_gate);
+                        } else if constexpr (packed) {
+                            tmp_gate[j][i] += vec_dot_q8_0_q8_1_pk(vgate, &y[j*stride_col_y + kby], row0 + i, kbx, kqs, blocks_per_row_x);
                         } else {
                             tmp_gate[j][i] += vec_dot_q_cuda(
                                 vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
@@ -1478,16 +1480,24 @@ static __global__ void mul_mat_vec_q(
                     if constexpr (type == GGML_TYPE_NVFP4) {
                         result *= x_scales;
                     }
-                    result += x_biases[j];
+                    if (!packed || use_bias) {
+                        result += x_biases[j];
+                    }
                     if (use_gate) {
                         float gate_value = tmp_gate[j][i];
                         if constexpr (type == GGML_TYPE_NVFP4) {
                             gate_value *= gate_scales;
                         }
-                        gate_value += gate_biases[j];
+                        if (!packed || use_gate_bias) {
+                            gate_value += gate_biases[j];
+                        }
                         switch (active_glu) {
                             case GGML_GLU_OP_SWIGLU:
-                                result *= ggml_cuda_op_silu_single(gate_value);
+                                if constexpr (packed) {
+                                    result = ggml_cuda_op_silu_single(gate_value) * result;
+                                } else {
+                                    result *= ggml_cuda_op_silu_single(gate_value);
+                                }
                                 break;
                             case GGML_GLU_OP_GEGLU:
                                 result *= ggml_cuda_op_gelu_single(gate_value);
@@ -2493,11 +2503,19 @@ static void mul_mat_vec_q_switch_fusion(
         }
     }
 
-    GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst=1");
-
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
     if constexpr (type == GGML_TYPE_Q8_0 && c_ncols_dst > 1) {
         if (fusion.x_pk) {
+            if constexpr (c_ncols_dst <= 8) {
+                if (has_fusion) {
+                    ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, halve_iters, true>, launch_params,
+                        vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
+                        channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+                        sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
+                    return;
+                }
+            }
+            GGML_ASSERT(!has_fusion);
             ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters, true>, launch_params,
                 vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
                 channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
@@ -2505,6 +2523,7 @@ static void mul_mat_vec_q_switch_fusion(
             return;
         }
     }
+    GGML_ASSERT(!has_fusion && "fusion requires ncols_dst=1 or packed Q8_0 at ncols_dst=2..8");
     ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters>, launch_params,
         vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
         channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
@@ -3308,7 +3327,7 @@ void ggml_cuda_mul_mat_vec_q(
     if (fusion) {
         const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
         GGML_ASSERT( !ids || dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc));
-        GGML_ASSERT(  ids || dst->ne[1] == 1);
+        GGML_ASSERT(ids || dst->ne[1] == 1 || (ggml_cuda_mmb_dq_packed(src0) && dst->ne[1] >= 2 && dst->ne[1] <= 8));
         // Scale fusion is only allowed for NVFP4 currently as the cost of checking this at run-time in the prologue is
         // non-negligible for some models such as gpt-oss-20b
         GGML_ASSERT((fusion->x_scale == nullptr && fusion->gate_scale == nullptr) || src0->type == GGML_TYPE_NVFP4);
@@ -3377,8 +3396,14 @@ void ggml_cuda_mul_mat_vec_q(
         return;
     }
     const bool x_pk = ggml_cuda_mmb_dq_packed(src0);
-    GGML_ASSERT(!(fusion && fusion->gate && ggml_cuda_mmb_dq_packed(fusion->gate)));
-    GGML_ASSERT(!x_pk || (src0->type == GGML_TYPE_Q8_0 && !ids && !fusion && ggml_is_contiguous(src0) &&
+    const bool packed_gate = fusion && fusion->gate && ggml_cuda_mmb_dq_packed(fusion->gate);
+    GGML_ASSERT(!packed_gate || x_pk);
+    GGML_ASSERT(!x_pk || !fusion || (packed_gate && GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[ctx.device].cc) &&
+        ne1 >= 2 && ne1 <= 8 && ne00 == 2560 && ne01 == 640 &&
+        ggml_are_same_shape(src0, fusion->gate) && ggml_are_same_stride(src0, fusion->gate) &&
+        ggml_is_contiguous(fusion->gate) && fusion->glu_op == GGML_GLU_OP_SWIGLU &&
+        !fusion->x_bias && !fusion->gate_bias && !fusion->x_scale && !fusion->gate_scale && !fusion->shared_up));
+    GGML_ASSERT(!x_pk || (src0->type == GGML_TYPE_Q8_0 && !ids && ggml_is_contiguous(src0) &&
         ne01 % 128 == 0 && ne00 % 64 == 0 && ne02 == 1 && ne03 == 1 && ne2 == 1 && ne3 == 1));
     fusion_local.x_pk = x_pk ? 1 : 0;
 

@@ -2221,6 +2221,40 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
     }
 }
 
+static int ggml_cuda_dq_mmvq_max() {
+    // gfx1151 (2026-10-30): rows 2-4 gained 10-18%; row 8 regressed. Recheck before raising the cutoff.
+    static const int max_cols = [] {
+        const char * env = getenv("GGML_CUDA_DQ_MMVQ_MAX");
+        return env ? std::max(0, std::min(atoi(env), MMVQ_MAX_BATCH_SIZE)) : 4;
+    }();
+    return max_cols;
+}
+
+static bool ggml_cuda_packed_shexp_glu_ok(const ggml_tensor * up, const ggml_tensor * gate) {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_FUSE_SHEXP_GLU");
+        return !env || atoi(env) != 0;
+    }();
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    if (!enabled || !GGML_CUDA_CC_IS_RDNA3_5(cc) || !gate ||
+            up->op != GGML_OP_MUL_MAT || gate->op != GGML_OP_MUL_MAT) {
+        return false;
+    }
+    const ggml_tensor * w = up->src[0];
+    const ggml_tensor * g = gate->src[0];
+    const ggml_tensor * x = up->src[1];
+    // Dense-R2 has one layout for this shape; only fuse the existing MMVQ dispatch, not the F16 WMMA fallback.
+    return w->type == GGML_TYPE_Q8_0 && g->type == GGML_TYPE_Q8_0 &&
+        w->ne[0] == 2560 && w->ne[1] == 640 && ggml_is_matrix(w) &&
+        ggml_are_same_shape(w, g) && ggml_are_same_stride(w, g) &&
+        ggml_is_contiguous(w) && ggml_is_contiguous(g) &&
+        ggml_cuda_mmb_dq_packed(w) && ggml_cuda_mmb_dq_packed(g) &&
+        x == gate->src[1] && x->type == GGML_TYPE_F32 && ggml_is_matrix(x) &&
+        ggml_is_contiguous(x) && ggml_is_contiguous(up) && ggml_is_contiguous(gate) &&
+        x->ne[1] >= 2 && x->ne[1] <= 8 && x->ne[1] <= ggml_cuda_dq_mmvq_max() &&
+        up->type == GGML_TYPE_F32 && gate->type == GGML_TYPE_F32;
+}
+
 static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
                                           const ggml_tensor * ffn_gate,
                                           const ggml_tensor * glu,
@@ -2239,7 +2273,10 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
     }
 
     if (ggml_cuda_mmb_dq_packed(ffn_up->src[0]) || ggml_cuda_mmb_dq_packed(ffn_gate->src[0])) {
-        return false;   // MMB_DENSE_R2 in-place layout: no fused gate/up kernel reads it
+        if (has_bias || has_scale || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU ||
+                !ggml_cuda_packed_shexp_glu_ok(ffn_up, ffn_gate)) {
+            return false;
+        }
     }
 
     const bool is_mul_mat     = ffn_up->op == GGML_OP_MUL_MAT     && ffn_gate->op == GGML_OP_MUL_MAT     && glu->op == GGML_OP_GLU;
@@ -2352,7 +2389,7 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor, cons
     return use_mul_mat_vec_f;
 }
 
-static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
+static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor, const ggml_tensor * gate = nullptr) {
     ggml_tensor *       src0 = tensor->src[0];
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
@@ -2362,7 +2399,7 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
                                    src0->view_src;
 
     if (ggml_cuda_mmb_dq_packed(src0)) {
-        return false;   // MMB_DENSE_R2 in-place layout
+        return !bad_padding_clear && ggml_cuda_packed_shexp_glu_ok(tensor, gate);
     }
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -2419,6 +2456,7 @@ static bool ggml_cuda_match_shared_expert(const ggml_cgraph * graph, int routed_
     // size, otherwise ggml-alloc has to re-reserve (and the scheduler to synchronize) at runtime.
     // the MMVQ batch size check is done in ggml_cuda_try_fuse
     if (!is_pair(gate, up, routed_idx) || !is_pair(shared_gate, shared_up, shared_idx) ||
+            ggml_cuda_mmb_dq_packed(shared_up->src[0]) || ggml_cuda_mmb_dq_packed(shared_gate->src[0]) ||
             !ggml_cuda_should_fuse_mul_mat(up, gate, routed) ||
             !ggml_cuda_should_fuse_mul_mat(shared_up, shared_gate, shared) ||
             !up->src[0]->buffer ||
@@ -2569,11 +2607,6 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     // But if src0 is also a view of another tensor then this cannot be done safely because it may overwrite valid tensor data.
     // Therefore, in such cases use cuBLAS.
     if (ggml_cuda_mmb_dq_packed(src0)) {   // MMB_DENSE_R2: use only packed-aware kernels
-        // gfx1151 (2026-10-30): rows 2-4 gained 10-18%; row 8 regressed. Recheck before raising the cutoff.
-        static const int dq_mmvq_max = [] {
-            const char * env = getenv("GGML_CUDA_DQ_MMVQ_MAX");
-            return env ? std::max(0, std::min(atoi(env), MMVQ_MAX_BATCH_SIZE)) : 4;
-        }();
         if (ggml_cuda_mmb_supported_mm(ctx, src0, src1, dst)) {
             ggml_cuda_mul_mat_mmb(ctx, src0, src1, dst);
         } else if (dst->op == GGML_OP_MUL_MAT && dst->src[0] == src0 && dst->src[1] == src1 && ggml_nrows(src1) == 1 &&
@@ -2583,7 +2616,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
             ggml_cuda_mmv_group_seg seg;
             seg.w = src0; seg.dst = dst;
             ggml_cuda_mmv_group(ctx, src1, &seg, 1);
-        } else if (ggml_nrows(src1) > 1 && ggml_nrows(src1) <= dq_mmvq_max && src0->type == GGML_TYPE_Q8_0 && src0->ne[1] % 128 == 0 && src0->ne[0] % 64 == 0 &&
+        } else if (ggml_nrows(src1) > 1 && ggml_nrows(src1) <= ggml_cuda_dq_mmvq_max() && src0->type == GGML_TYPE_Q8_0 && src0->ne[1] % 128 == 0 && src0->ne[0] % 64 == 0 &&
                 ggml_is_matrix(src0) && ggml_is_matrix(src1) && ggml_is_matrix(dst) &&
                 ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst) &&
                 src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
@@ -7078,7 +7111,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 break;
             }
 
-            if (ggml_cuda_should_fuse_mul_mat_vec_q(up)) {
+            if (ggml_cuda_should_fuse_mul_mat_vec_q(up, gate)) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
                 fusion_data.gate      = gate->src[0];
                 fusion_data.glu_op    = ggml_get_glu_op(glu);

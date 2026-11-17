@@ -9095,6 +9095,27 @@ struct test_mmv_group : public test_case {
     }
 };
 
+// Shared-expert shape with persistent weights. The harness rewrites weights after graph_optimize, so packed-path validation needs a model run.
+struct test_shexp_glu_packed : public test_case {
+    const int64_t tokens;
+    test_shexp_glu_packed(int64_t tokens) : tokens(tokens) {}
+    std::string vars() override { return VARS_TO_STR1(tokens); }
+    std::string op_desc(ggml_tensor *) override { return "SHEXP_GLU_PACKED"; }
+    bool run_whole_graph() override { return true; }
+    bool use_weight_context() override { return true; }
+    bool use_scheduler_allocation() override { return true; }
+    double max_nmse_err() override { return 5e-4; }
+    ggml_tensor * build_graph(ggml_context * ctx) override { return build_graph(ctx, ctx); }
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2560, tokens);
+        ggml_tensor * gate = ggml_new_tensor_2d(ctx_weights, GGML_TYPE_Q8_0, 2560, 640);
+        ggml_tensor * up = ggml_new_tensor_2d(ctx_weights, GGML_TYPE_Q8_0, 2560, 640);
+        ggml_set_name(gate, "ffn_gate_shexp.weight");
+        ggml_set_name(up, "ffn_up_shexp.weight");
+        return ggml_swiglu_split(ctx, ggml_mul_mat(ctx, gate, x), ggml_mul_mat(ctx, up, x));
+    }
+};
+
 // qwen4exp hyper-connection up projection + stream mix chain (decode):
 //   silu(scale(lo)) -> mul_mat(W_up) -> sigmoid -> mul(xn) -> reshape -> view/cont -> adds -> scale
 struct test_hc_up_mix : public test_case {
@@ -18941,6 +18962,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int64_t rows : {6271, 6272, 6273}) {
         test_cases.emplace_back(new test_mul_mat_fusion(GGML_TYPE_Q4_K, GGML_GLU_OP_SWIGLU, 2, rows, 256,
             false, 16, 8, false, false, true, false, { 1, 1 }));
+    }
+
+    for (int64_t tokens : { 2, 4, 8 }) {
+        test_cases.emplace_back(new test_shexp_glu_packed(tokens));
     }
 
     // Fused gate/up + GLU on the MMQ path, only used if its tiling is efficient: ~1280 tiles per case, one case per type and GLU op.
