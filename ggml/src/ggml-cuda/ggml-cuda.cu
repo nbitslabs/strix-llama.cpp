@@ -7658,6 +7658,23 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 2;
     }
 
+    // HC up at T=2..8 or short K at T=1: quantize the prologue once, then use generic MMVQ.
+    if (node->op == GGML_OP_SCALE && node->type == GGML_TYPE_F32 && i + 2 < cgraph->n_nodes &&
+        cgraph->nodes[i + 1]->op == GGML_OP_UNARY &&
+        (ggml_get_unary_op(cgraph->nodes[i + 1]) == GGML_UNARY_OP_SILU || ggml_get_unary_op(cgraph->nodes[i + 1]) == GGML_UNARY_OP_SIGMOID) &&
+        cgraph->nodes[i + 2]->op == GGML_OP_MUL_MAT && cgraph->nodes[i + 2]->src[1] == cgraph->nodes[i + 1] &&
+        cgraph->nodes[i + 1]->src[0] == node && cgraph->nodes[i + 1]->type == GGML_TYPE_F32 && node->src[0]->type == GGML_TYPE_F32 &&
+        ggml_is_contiguous(node->src[0]) && ggml_are_same_shape(node->src[0], cgraph->nodes[i + 1]) &&
+        ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_MUL_MAT }, { i + 2 }) &&
+        ggml_cuda_mul_mat_vec_q_prologue_ok(cgraph->nodes[i + 2], node->src[0])) {
+        const int y_op = ggml_get_unary_op(cgraph->nodes[i + 1]) == GGML_UNARY_OP_SILU ? 1 : 2;
+        ggml_tensor * mm = cgraph->nodes[i + 2];
+
+        ggml_cuda_mul_mat_vec_q_prologue(*cuda_ctx, mm, node->src[0],
+            ggml_get_op_params_f32(node, 0), ggml_get_op_params_f32(node, 1), y_op);
+        return 2;
+    }
+
     // scale -> silu/sigmoid -> quantized matvec (decode): apply the activation while the matvec quantizes it
     if (node->op == GGML_OP_SCALE && node->type == GGML_TYPE_F32 && i + 2 < cgraph->n_nodes &&
         cgraph->nodes[i + 1]->op == GGML_OP_UNARY &&
