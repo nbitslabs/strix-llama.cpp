@@ -192,6 +192,13 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
     add((new field_bool("post_sampling_probs", params.post_sampling_probs))
         ->set_desc("Return probabilities of top n_probs tokens after applying the sampling chain"));
 
+    add((new field_nested("trace"))
+        ->add_subfield((new field_bool("experts", params.trace_experts))
+            ->set_desc("Return the MoE router choices per generated token: expert ids, gate weights and the shared-expert gate of every layer (single slot only)"))
+        ->add_subfield((new field_bool("block_update", params.trace_block_update))
+            ->set_desc("Reserved: per-block residual update size (not implemented yet)"))
+        ->set_desc("Opt-in per-token model internals; absent or all false leaves the response unchanged"));
+
     //
     // Speculative decoding params
     //

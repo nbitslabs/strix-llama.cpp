@@ -80,6 +80,8 @@ struct task_params {
     bool include_usage   = false;
     bool cache_prompt    = true; // remember the prompt to avoid reprocessing all prompt
     bool return_tokens   = false;
+    bool trace_experts      = false; // opt-in per-token MoE router trace (request field "trace": {"experts": true})
+    bool trace_block_update = false; // reserved: per-block residual update size, not implemented yet
     bool return_progress = false;
 
     int32_t sse_ping_interval = 30; // seconds between SSE comment pings while the stream stays silent, -1 disables
@@ -396,6 +398,8 @@ struct completion_token_output {
     };
     std::vector<prob_info> probs;
 
+    json trace; // opt-in MoE router trace of this token (null unless the request asked for it)
+
     json to_json(bool post_sampling_probs) const;
 
     static json probs_vector_to_json(const std::vector<completion_token_output> & probs, bool post_sampling_probs);
@@ -429,6 +433,7 @@ struct server_task_result_cmpl_final : server_task_result {
 
     bool post_sampling_probs;
     std::vector<completion_token_output> probs_output;
+    json trace_output; // non-streaming traced request: array with one entry per generated token
     std::vector<std::string>  response_fields;
 
     task_params generation_params;
@@ -500,6 +505,7 @@ struct server_task_result_cmpl_partial : server_task_result {
                            // ref: https://github.com/ggml-org/llama.cpp/pull/23884
     bool audio_commit_drained = false; // realtime: non-final commit has fully decoded
     completion_token_output prob_output;
+    json trace_output; // streaming traced request: the trace entry of the token in this chunk
     server_slot_stats stats;
     result_prompt_progress progress;
 

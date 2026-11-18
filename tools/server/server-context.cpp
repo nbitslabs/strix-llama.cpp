@@ -7,6 +7,7 @@
 #include "server-decision.h"
 #include "server-http.h"
 #include "server-task.h"
+#include "server-trace.h"
 #include "server-queue.h"
 #include "server-realtime.h"
 #include "server-schema.h"
@@ -1133,6 +1134,8 @@ private:
 
     llama_context * ctx_tgt = nullptr;
 
+    server_moe_trace moe_trace; // opt-in per-token MoE router trace, installed on ctx_tgt only while a traced request runs
+
     server_batch batch;
 
     llama_model   * model_dft = nullptr;
@@ -2137,6 +2140,23 @@ private:
         // anchor the throughput series before the counters start moving after an idle period
         dash_sample();
 
+        // opt-in MoE router trace: the eval callback is installed only for a traced request and removed again
+        // by the next untraced launch (or by the final response), so normal requests keep the normal graph path
+        if (task.params.trace_block_update) {
+            send_error(task, "trace.block_update is not implemented yet, use trace.experts", ERROR_TYPE_NOT_SUPPORTED);
+            return false;
+        }
+        if (task.params.trace_experts) {
+            if (slots.size() > 1) {
+                send_error(task, "trace.experts needs a single slot (-np 1): the capture is per context, not per slot", ERROR_TYPE_NOT_SUPPORTED);
+                return false;
+            }
+            moe_trace.init(llama_model_n_layer(model_tgt));
+            moe_trace.install(ctx_tgt);
+        } else if (moe_trace.installed) {
+            moe_trace.remove(ctx_tgt);
+        }
+
         // per-request lora if given, otherwise the global config
         auto task_loras = task.params.lora.empty() ? params_base.lora_adapters : construct_lora_list(task.params.lora);
         if (!are_lora_equal(task_loras, slot.lora)) {
@@ -2589,6 +2609,10 @@ private:
             res->prob_output = tkn; // copy the token probs
         }
 
+        if (slot.task->params.trace_experts && !tkn.trace.is_null()) {
+            res->trace_output = tkn.trace;
+        }
+
         // populate timings if this is final response or timings_per_token is enabled
         if (slot.stop != STOP_TYPE_NONE || slot.task->params.timings_per_token) {
             res->stats = slot.stats;
@@ -2666,6 +2690,17 @@ private:
                         slot.generated_token_probs.begin(),
                         slot.generated_token_probs.end());
             }
+        }
+
+        if (slot.task->params.trace_experts) {
+            if (!slot.task->params.stream) {
+                // every generated token, including the ones of a stop word (they were generated, so they were routed)
+                res->trace_output = json::array();
+                for (const auto & t : slot.generated_token_probs) {
+                    res->trace_output.push_back(t.trace);
+                }
+            }
+            moe_trace.remove(ctx_tgt);
         }
 
         res->generation_params = slot.task->params; // copy the parameters
@@ -4913,6 +4948,9 @@ private:
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
         queue_tasks.yield_to_queue([&]() {
+            if (moe_trace.installed) {
+                moe_trace.begin_batch();
+            }
             ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
@@ -5121,6 +5159,10 @@ private:
             result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
             result.prob         = 1.0f; // TODO: set it here instead of doing inside populate_token_probs
 
+            if (slot.task->params.trace_experts) {
+                result.trace = moe_trace.token_json(tok_idx, id);
+            }
+
             if (slot.task->params.sampling.n_probs > 0) {
                 populate_token_probs(slot, result, slot.task->params.post_sampling_probs, params_base.special, tok_idx);
             }
@@ -5265,6 +5307,10 @@ private:
                 result.tok          = ids[i];
                 result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
                 result.prob         = 1.0f; // set later
+
+                if (slot.task->params.trace_experts) {
+                    result.trace = moe_trace.token_json(spec_i_batch[i], ids[i]);
+                }
 
                 // post_sampling_probs is not supported with speculative decoding
                 if (slot.task->params.sampling.n_probs > 0 && !slot.task->params.post_sampling_probs) {

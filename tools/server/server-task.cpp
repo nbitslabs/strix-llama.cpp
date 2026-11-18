@@ -81,6 +81,7 @@ json task_params::to_json(bool only_metrics) const {
             {"speculative.types",         common_speculative_type_name_str(speculative.types)},
             {"timings_per_token",         timings_per_token},
             {"post_sampling_probs",       post_sampling_probs},
+            {"trace",                     json{{"experts", trace_experts}, {"block_update", trace_block_update}}},
             {"backend_sampling",          sampling.backend_sampling},
             {"lora",                      lora},
         };
@@ -140,6 +141,7 @@ json task_params::to_json(bool only_metrics) const {
         {"speculative.types",         common_speculative_type_name_str(speculative.types)},
         {"timings_per_token",         timings_per_token},
         {"post_sampling_probs",       post_sampling_probs},
+        {"trace",                     json{{"experts", trace_experts}, {"block_update", trace_block_update}}},
         {"backend_sampling",          sampling.backend_sampling},
         {"lora",                      lora},
     };
@@ -351,6 +353,9 @@ json server_task_result_cmpl_final::to_json_non_oaicompat() {
     if (!stream && !probs_output.empty()) {
         res["completion_probabilities"] = completion_token_output::probs_vector_to_json(probs_output, post_sampling_probs);
     }
+    if (!stream && !trace_output.is_null()) {
+        res["trace"] = trace_output;
+    }
     return response_fields.empty() ? res : json_get_nested_values(response_fields, res);
 }
 
@@ -411,6 +416,9 @@ json server_task_result_cmpl_final::to_json_oaicompat() {
         res["timings"] = stats.to_json();
     }
 
+    if (!stream && !trace_output.is_null()) {
+        res["trace"] = trace_output;
+    }
     return res;
 }
 
@@ -459,6 +467,9 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat() {
         res["timings"] = stats.to_json();
     }
 
+    if (!stream && !trace_output.is_null()) {
+        res["trace"] = trace_output;
+    }
     return res;
 }
 
@@ -1083,6 +1094,9 @@ json server_task_result_cmpl_partial::to_json_non_oaicompat() {
     if (!prob_output.probs.empty()) {
         res["completion_probabilities"] = completion_token_output::probs_vector_to_json({prob_output}, post_sampling_probs);
     }
+    if (!trace_output.is_null()) {
+        res["trace"] = trace_output;
+    }
     return res;
 }
 
@@ -1121,6 +1135,9 @@ json server_task_result_cmpl_partial::to_json_oaicompat() {
         res["prompt_progress"] = progress.to_json();
     }
 
+    if (!trace_output.is_null()) {
+        res["trace"] = trace_output;
+    }
     return res;
 }
 
@@ -1173,6 +1190,9 @@ json server_task_result_cmpl_partial::to_json_oaicompat_chat() {
         }
         if (is_progress) {
             last_json["prompt_progress"] = progress.to_json();
+        }
+        if (!trace_output.is_null()) {
+            last_json["trace"] = trace_output;
         }
     }
 
