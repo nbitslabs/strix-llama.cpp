@@ -1715,9 +1715,16 @@ __global__ void mmb_build_desc3(const int32_t * __restrict__ bounds, uint32_t * 
     for (int i = e; i < nmid_max;   i += blockDim.x) desc_mid[i]   = UINT32_MAX;
     for (int i = e; i < nsmall_max; i += blockDim.x) desc_small[i] = UINT32_MAX;
     int cnt = (e < E) ? bounds[e + 1] - bounds[e] : 0;
-    const int ts = cnt < 32 ? (cnt + BN_SMALL - 1) / BN_SMALL : 0;
-    const int tm = (cnt >= 32 && cnt < 64) ? 1 : 0;
-    const int tb = cnt >= 64 ? (cnt + BN_BIG - 1) / BN_BIG : 0;
+    // Full big tiles, then the remainder on the narrower tiers instead of a mostly padded big tile: a mid (BN_BIG/2)
+    // tile up to half a big tile, mid + small up to that plus a small tile, a big tile only when it would be > 3/4 full.
+    // The tier kernels address rows as bounds[e] + jt * BN_tier, so jt_mid = 2 nb and jt_small = 4 nb (+ 2 behind a mid).
+    const int BN_MID = BN_BIG / 2;
+    const int nb  = cnt / BN_BIG, rem = cnt - nb * BN_BIG;
+    const int ts  = (rem > 0 && (rem <= BN_SMALL || (rem > BN_MID && rem <= BN_MID + BN_SMALL))) ? 1 : 0;
+    const int tm  = (rem > BN_SMALL && rem <= BN_MID + BN_SMALL) ? 1 : 0;
+    const int tb  = nb + (rem > BN_MID + BN_SMALL ? 1 : 0);
+    const int jts = (BN_BIG / BN_SMALL) * nb + (rem > BN_MID ? BN_MID / BN_SMALL : 0);
+    const int jtm = (BN_BIG / BN_MID) * nb;
     su[e] = ts; sm[e] = tm; sb[e] = tb;
     __syncthreads();
     for (int off = 1; off < 1024; off <<= 1) {
@@ -1727,8 +1734,8 @@ __global__ void mmb_build_desc3(const int32_t * __restrict__ bounds, uint32_t * 
         __syncthreads();
     }
     const int bu = su[e] - ts, bm = sm[e] - tm, bb = sb[e] - tb;
-    for (int jt = 0; jt < ts; ++jt) { const int idx = bu + jt; if (idx < nsmall_max) desc_small[idx] = (uint32_t)e | ((uint32_t)jt << 16); }
-    for (int jt = 0; jt < tm; ++jt) { const int idx = bm + jt; if (idx < nmid_max)   desc_mid[idx]   = (uint32_t)e | ((uint32_t)jt << 16); }
+    if (ts && bu < nsmall_max) desc_small[bu] = (uint32_t)e | ((uint32_t)jts << 16);
+    if (tm && bm < nmid_max)   desc_mid[bm]   = (uint32_t)e | ((uint32_t)jtm << 16);
     for (int jt = 0; jt < tb; ++jt) { const int idx = bb + jt; if (idx < nbig_max)   desc_big[idx]   = (uint32_t)e | ((uint32_t)jt << 16); }
 }
 
