@@ -979,7 +979,7 @@ static constexpr __host__ __device__ bool ggml_cuda_mmq_use_prefetch() {
 #if defined(RDNA3_5) && defined(AMD_WMMA_AVAILABLE)
     // Whitelist: the extra registers cause spills in several other specializations.
     return (type == GGML_TYPE_Q8_0    && (J == 48 || J == 128) && !fallback) ||
-           (type == GGML_TYPE_IQ3_S   &&  J == 128              && !fallback) ||
+           (type == GGML_TYPE_IQ3_S   && (J == 64 || J == 128)  && !fallback) ||
            (type == GGML_TYPE_Q6_K    &&  J == 32)              ||
            (type == GGML_TYPE_Q5_K    &&  J == 32)              ||
            (type == GGML_TYPE_Q4_K    &&  J == 48)              ||
@@ -1791,7 +1791,9 @@ static constexpr int mmq_rdna3_5_id_get_J(const ggml_type type, const int64_t ro
         case GGML_TYPE_Q8_0:
             return rows_per_expert <= 12 ? 16 : rows_per_expert <= 64 ? 48 : 128;
         // the IQ expert types of the Unsloth qwen4exp mixes (512 experts, 10 active: 40 rows per expert at ubatch 2048)
-        case GGML_TYPE_IQ3_S:
+        case GGML_TYPE_IQ3_S:   // J=64 above 64 rows: no column padding at 320 rows per expert, and the 64-wide tile
+                                // has the register room for the staged weight prefetch (J=128 spills)
+            return rows_per_expert <= 12 ? 16 : rows_per_expert <= 32 ? 48 : rows_per_expert <= 64 ? MMQ_IQ_ID_J_MID : 64;
         case GGML_TYPE_IQ4_NL:
         case GGML_TYPE_IQ4_XS:
             return rows_per_expert <= 12 ? 16 : rows_per_expert <= 32 ? 48 : rows_per_expert <= 64 ? MMQ_IQ_ID_J_MID : 128;
@@ -1810,6 +1812,7 @@ static constexpr bool mmq_rdna3_5_id_use_compact(const ggml_type type, const int
         case GGML_TYPE_Q8_0:
             return J == 16 || J == 48 || J == 128;
         case GGML_TYPE_IQ3_S:
+            return J == 16 || J == 48 || J == MMQ_IQ_ID_J_MID || J == 64 || J == 128;
         case GGML_TYPE_IQ4_NL:
         case GGML_TYPE_IQ4_XS:
             return J == 16 || J == 48 || J == MMQ_IQ_ID_J_MID || J == 128;
