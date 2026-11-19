@@ -799,6 +799,10 @@ __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ W
 #else
     constexpr bool DEFER_B = false;
 #endif
+    // IQ3_S routed GLU: the activation gather is the tile's longest phase and one step of lookahead does not cover its
+    // latency at 1-2 resident blocks; stage B two K steps ahead in two register sets (the weights keep their one-step
+    // prefetch). Same values in the same LDS slots.
+    constexpr bool B2 = !DEFER_B && WTYPE == 32 + GGML_TYPE_IQ3_S;
     int weight_ks = 0;
     auto load_regs = [&](const int ks) {
         weight_ks = ks;
@@ -839,7 +843,7 @@ __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ W
                 } else { gm[i] = um[i] = g0[i] = g1[i] = u0[i] = u1[i] = make_uint4(0,0,0,0); }
             }
         }
-        if constexpr (!DEFER_B) {
+        if constexpr (!DEFER_B && !B2) {
 #pragma unroll
             for (int i = 0; i < B_ITEMS; ++i) {
                 const int c = tid + i * MMB_NT; const int off = (c & 7) * 8;
@@ -890,7 +894,7 @@ __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ W
                 const int c = tid + i * MMB_NT, row = xrow(c >> 3);
                 *(uint4 *)(Bs + (c >> 3) * MMB_LDS_STRIDE + (c & 7) * 8) = row >= 0 ? *(const uint4 *)(Xh + (size_t)row * K + weight_ks * MMB_BK + (c & 7) * 8) : make_uint4(0,0,0,0);
             }
-        } else {
+        } else if constexpr (!B2) {
 #pragma unroll
             for (int i = 0; i < B_ITEMS; ++i) { const int c = tid + i * MMB_NT; *(uint4 *)(Bs + (c >> 3) * MMB_LDS_STRIDE + (c & 7) * 8) = bst[i]; }
         }
@@ -906,9 +910,19 @@ __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ W
 #pragma unroll
     for (int j = 0; j < TN; ++j) jact[j] = !TAIL || (wn * WTN + j * 16) < n_cols;
     const int nks = K / MMB_BK;
-    load_regs(0); if constexpr (LB) __syncthreads(); store_lds(); __syncthreads();
-    for (int ks = 0; ks < nks; ++ks) {
-        if (ks + 1 < nks) load_regs(ks + 1);
+    uint4 bst2[B_ITEMS];
+    auto load_b2 = [&](const int ks, uint4 (&dst)[B_ITEMS]) {
+#pragma unroll
+        for (int i = 0; i < B_ITEMS; ++i) {
+            const int c = tid + i * MMB_NT; const int off = (c & 7) * 8;
+            dst[i] = (brow[i] >= 0) ? *(const uint4 *)(Xh + (size_t)brow[i] * K + ks * MMB_BK + off) : make_uint4(0,0,0,0);
+        }
+    };
+    auto store_b2 = [&](const uint4 (&src)[B_ITEMS]) {
+#pragma unroll
+        for (int i = 0; i < B_ITEMS; ++i) { const int c = tid + i * MMB_NT; *(uint4 *)(Bs + (c >> 3) * MMB_LDS_STRIDE + (c & 7) * 8) = src[i]; }
+    };
+    auto wmma_step = [&]() {
 #pragma unroll
         for (int kk = 0; kk < MMB_BK; kk += 16) {
             // gfx1151/ROCm 10.1 clang 24: streaming gate/up fragments clears 20 GLU spill names.
@@ -958,9 +972,34 @@ __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ W
                     }
             }
         }
-        __syncthreads();
-        if (ks + 1 < nks) store_lds();
-        __syncthreads();
+    };
+    load_regs(0);
+    if constexpr (B2) { load_b2(0, bst); if (nks > 1) load_b2(1, bst2); }
+    if constexpr (LB) __syncthreads();
+    store_lds();
+    if constexpr (B2) store_b2(bst);
+    __syncthreads();
+    if constexpr (B2) {
+        auto step = [&](const int ks, uint4 (&cur)[B_ITEMS], uint4 (&nxt)[B_ITEMS]) {   // cur held B(ks), already in LDS
+            if (ks + 1 < nks) load_regs(ks + 1);
+            if (ks + 2 < nks) load_b2(ks + 2, cur);
+            wmma_step();
+            __syncthreads();
+            if (ks + 1 < nks) { store_lds(); store_b2(nxt); }
+            __syncthreads();
+        };
+        for (int ks = 0; ks < nks; ks += 2) {
+            step(ks, bst, bst2);
+            if (ks + 1 < nks) step(ks + 1, bst2, bst);
+        }
+    } else {
+        for (int ks = 0; ks < nks; ++ks) {
+            if (ks + 1 < nks) load_regs(ks + 1);
+            wmma_step();
+            __syncthreads();
+            if (ks + 1 < nks) store_lds();
+            __syncthreads();
+        }
     }
     float * stg = (float *)((BN * MMB_LDS_STRIDE * 2 >= MMB_NT / 32 * 1024) ? Bs : Ag) + wave * 256;
 #pragma unroll
