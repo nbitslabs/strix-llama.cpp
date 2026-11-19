@@ -1181,6 +1181,156 @@ mmb_routed_glu_ms_kernel(const uint8_t * __restrict__ Wg, const uint8_t * __rest
 #endif
 }
 
+// IQ3_S big GLU tier, 128 rows x 128 tokens on register operands: wave w owns rows 16 w .. +15 of BOTH gate and up (its
+// lanes decode the two weight rows), so every B fragment read from LDS feeds two WMMAs, the token tile is gathered for
+// 128 weight rows, and silu(gate) * up forms in registers (the fp32 staging for the row stores runs in two passes of
+// four waves through Bs). Operands, decode and per-output K order as mmb_routed_glu_ms_kernel -> bit-identical.
+template <int WTYPE>
+__global__ void __launch_bounds__(MMB_NT, 2)
+mmb_routed_glu_ms2_kernel(const uint8_t * __restrict__ Wg, const uint8_t * __restrict__ Wu, const size_t expert_bytes, const uint16_t * __restrict__ Xh,
+        float * __restrict__ D, uint16_t * __restrict__ Dh, const bool store_f32,
+        const int32_t * __restrict__ ids_src, const int32_t * __restrict__ ids_dst, const int32_t * __restrict__ bounds,
+        const uint32_t * __restrict__ desc, const int M, const int K) {
+#if defined(__HIP_DEVICE_COMPILE__) && !defined(RDNA3)
+    NO_DEVICE_CODE;
+#else
+    using LBT = mmb_ms3<WTYPE>;
+    static_assert(LBT::ok && WTYPE == 32 + GGML_TYPE_IQ3_S, "IQ3_S only");
+    constexpr int BM = 128, BN = 128, TN = BN / 16, BSZ = BN * MMB_LDS_STRIDE, B_ITEMS = BN * 8 / MMB_NT;
+    constexpr int XLD = 17;
+    static_assert(2 * BSZ * 2 >= 4 * TN * 16 * XLD * 4, "the epilogue's fp32 staging (four waves per pass) reuses Bs");
+    __shared__ __align__(16) uint16_t Bs[2 * BSZ];
+    __shared__ typename LBT::grid_t lbgrid[LBT::N];
+    const uint32_t dsc = desc[blockIdx.y];
+    if (dsc == UINT32_MAX) return;
+    const int e = dsc & 0xffff, jt = dsc >> 16;
+    const int r0 = bounds[e] + jt * BN, cnt = min(bounds[e + 1] - r0, BN);
+    const int m0 = blockIdx.x * BM;
+    const size_t wrow_bytes = mmb_row_bytes<WTYPE>(K);
+    const int tid = threadIdx.x, lane = tid & 31, wave = __builtin_amdgcn_readfirstlane(tid >> 5);
+    const int r = lane & 15, pc = mmb_ms_piece(lane);
+    // rows past M read row M - 1 and tokens past cnt the last token's activations: both only reach outputs that are
+    // never stored
+    const size_t wro = (size_t) e * expert_bytes + (size_t) min(m0 + wave * 16 + r, M - 1) * wrow_bytes;
+    const uint8_t * wrow_g = Wg + wro, * wrow_u = Wu + wro;
+    for (int i = tid; i < LBT::N; i += MMB_NT) lbgrid[i] = LBT::entry(i);
+
+    uint32_t fg[2][LBT::NR], fu[2][LBT::NR];   // [32-K half] raw fields of the lane's 16 gate / up weights of one K step
+    auto fetch = [&](const int ks) {
+#pragma unroll
+        for (int q = 0; q < 2; ++q) { LBT::fetch(wrow_g, ks, q, pc, fg[q]); LBT::fetch(wrow_u, ks, q, pc, fu[q]); }
+    };
+    const uint16_t * bsrc[B_ITEMS];
+    bool bzero[B_ITEMS];
+    uint4 bst[B_ITEMS];
+#pragma unroll
+    for (int i = 0; i < B_ITEMS; ++i) {
+        const int c = tid + i * MMB_NT, sr = ids_src[r0 + min(c >> 3, cnt - 1)];
+        bzero[i] = sr < 0;
+        bsrc[i] = Xh + (size_t) max(sr, 0) * K + (c & 7) * 8;
+    }
+    auto load_b = [&](const int ks) {
+#pragma unroll
+        for (int i = 0; i < B_ITEMS; ++i) {
+            const uint4 v = *(const uint4 *) (bsrc[i] + ks * MMB_BK);
+            bst[i] = bzero[i] ? make_uint4(0, 0, 0, 0) : v;
+        }
+    };
+    auto store_b = [&](const int buf) {
+#pragma unroll
+        for (int i = 0; i < B_ITEMS; ++i) {
+            const int c = tid + i * MMB_NT;
+            *(uint4 *) (Bs + buf * BSZ + (c >> 3) * MMB_LDS_STRIDE + (c & 7) * 8) = bst[i];
+        }
+    };
+
+    v8f accg[TN], accu[TN];
+#pragma unroll
+    for (int j = 0; j < TN; ++j) { accg[j] = v8f{0, 0, 0, 0, 0, 0, 0, 0}; accu[j] = v8f{0, 0, 0, 0, 0, 0, 0, 0}; }
+    const int njt = (cnt + 15) >> 4;
+    const int nks = K / MMB_BK;
+    fetch(0); load_b(0); store_b(0);
+    __syncthreads();
+    auto kloop = [&](auto full) {
+        constexpr bool FULL = decltype(full)::value;
+        for (int ks = 0; ks < nks; ++ks) {
+            mmb_v8u wg[2], wu[2];
+#pragma unroll
+            for (int q = 0; q < 2; ++q) {
+                uint4 lo, hi;
+                LBT::decode(lbgrid, fg[q], pc, lo, hi); wg[q] = mmb_v8u{lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w};
+                LBT::decode(lbgrid, fu[q], pc, lo, hi); wu[q] = mmb_v8u{lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w};
+            }
+            if (ks + 1 < nks) { fetch(ks + 1); load_b(ks + 1); }
+            const uint16_t * bb = Bs + (ks & 1) * BSZ + r * MMB_LDS_STRIDE;
+#pragma unroll
+            for (int q = 0; q < 2; ++q) {
+                const mmb_v8u yg = mmb_ms_xhalf(wg[q]), yu = mmb_ms_xhalf(wu[q]);
+#pragma unroll
+                for (int j = 0; j < TN; ++j) {
+                    if (FULL || j < njt) {
+                        const mmb_v8u b = mmb_ms_lds16(bb + j * 16 * MMB_LDS_STRIDE + 32 * q);
+                        accg[j] = mmb_wmma_bf16_u(wg[q], b, accg[j]); accu[j] = mmb_wmma_bf16_u(wu[q], b, accu[j]);
+                    }
+                }
+#pragma unroll
+                for (int j = 0; j < TN; ++j) {
+                    if (FULL || j < njt) {
+                        const mmb_v8u b = mmb_ms_lds16(bb + j * 16 * MMB_LDS_STRIDE + 32 * q + 16);
+                        accg[j] = mmb_wmma_bf16_u(yg, b, accg[j]); accu[j] = mmb_wmma_bf16_u(yu, b, accu[j]);
+                    }
+                }
+            }
+            if (ks + 1 < nks) { store_b((ks + 1) & 1); mmb_tq8_lds_barrier(); }
+        }
+    };
+    if (njt == TN) kloop(std::true_type{}); else kloop(std::false_type{});
+    // silu(gate) * up in registers; two passes of four waves stage their 64 rows as fp32 in Bs (xs[row group][fragment]
+    // [token][XLD], rows 2 v + h), then every thread stores 8 consecutive rows of one token
+    float * xs = (float *) Bs;
+#pragma unroll
+    for (int pass = 0; pass < 2; ++pass) {
+        __syncthreads();
+        if ((wave >> 2) == pass) {
+            const int xo = ((wave & 3) * TN * 16 + r) * XLD + (lane >> 4);
+#pragma unroll
+            for (int j = 0; j < TN; ++j)
+#pragma unroll
+                for (int v = 0; v < 8; ++v) xs[xo + j * 16 * XLD + 2 * v] = ggml_cuda_op_silu_single(accg[j][v]) * accu[j][v];
+        }
+        __syncthreads();
+#pragma unroll
+        for (int i = 0; i < BN * 8 / MMB_NT; ++i) {
+            const int it = tid + i * MMB_NT, tok = it >> 3, s = it & 7;
+            const int mb = m0 + pass * 64 + 8 * s;
+            if (tok >= cnt || mb >= M) continue;
+            const int dr = ids_dst[r0 + tok];
+            if (dr < 0) continue;
+            const float * src = xs + ((s >> 1) * TN * 16 + tok) * XLD + (s & 1) * 8;   // rows 8 s .. +7 of this pass, token tok
+            float vv[8];
+#pragma unroll
+            for (int k = 0; k < 8; ++k) vv[k] = src[k];
+            const size_t base = (size_t) dr * M + mb;
+            const bool full = mb + 8 <= M;
+            if (store_f32) {
+                if (full && (M & 3) == 0) { *(float4 *) (D + base) = make_float4(vv[0], vv[1], vv[2], vv[3]); *(float4 *) (D + base + 4) = make_float4(vv[4], vv[5], vv[6], vv[7]); }
+                else {
+#pragma unroll
+                    for (int k = 0; k < 8; ++k) { if (mb + k < M) D[base + k] = vv[k]; }
+                }
+            }
+            if (Dh) {
+                if (full && (M & 7) == 0) { *(uint4 *) (Dh + base) = make_uint4(mmb_pack2(vv[0], vv[1]), mmb_pack2(vv[2], vv[3]), mmb_pack2(vv[4], vv[5]), mmb_pack2(vv[6], vv[7])); }
+                else {
+#pragma unroll
+                    for (int k = 0; k < 8; ++k) { if (mb + k < M) Dh[base + k] = mmb_f2bf(vv[k]); }
+                }
+            }
+        }
+    }
+#endif
+}
+
 // F32 x F32 -> F32 GEMM on WMMA: operands split into F16 hi + lo at tile load; TWO: Xhi*Whi + Xlo*Whi, !TWO adds Xhi*Wlo, !XSPLIT keeps only Xhi*Whi.
 __device__ __forceinline__ void mmb_split2(float x, uint16_t & hi, uint16_t & lo) {
     hi = __builtin_bit_cast(uint16_t, (_Float16) x); lo = __builtin_bit_cast(uint16_t, (_Float16) (x - (float) __builtin_bit_cast(_Float16, hi)));
@@ -4216,6 +4366,10 @@ void ggml_cuda_mul_mat_id_mmb_glu(ggml_backend_cuda_context & ctx, const ggml_te
             const dim3 gbig((M + 63) / 64, nbig_max);
             if constexpr (WT == 32 + GGML_TYPE_Q4_K) {
                 mmb_routed_glu_kernel<64, BN_sel, 32, BN_sel / 4, WT, true><<<gbig, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), M, K);
+            } else if constexpr (WT == 32 + GGML_TYPE_IQ3_S) {
+                static_assert(BN_sel == 128, "mmb_routed_glu_ms2_kernel tiles 128 tokens");
+                const dim3 g128((M + 127) / 128, nbig_max);
+                mmb_routed_glu_ms2_kernel<WT><<<g128, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), M, K);
             } else if constexpr (mmb_glu_ms_type(WT)) {
                 static_assert(BN_sel == 128, "mmb_routed_glu_ms_kernel tiles 128 tokens");
                 mmb_routed_glu_ms_kernel<WT><<<gbig, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), M, K);
