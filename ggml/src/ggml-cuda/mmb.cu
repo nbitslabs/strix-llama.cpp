@@ -18,6 +18,11 @@ namespace {
 typedef short v16s __attribute__((ext_vector_type(16)));
 typedef float v8f  __attribute__((ext_vector_type(8)));
 constexpr int MMB_BK = 64, MMB_NT = 256, MMB_LDS_STRIDE = MMB_BK + 8;
+// PROBES (experiment branch, wrong math): split the routed IQ3_S GLU tile time: no weight fetch/decode (stale A tiles),
+// no activation gather (stale B tile), no WMMA (accumulators untouched)
+#define MMB_PROBE_NODECODE 0
+#define MMB_PROBE_NOB      0
+#define MMB_PROBE_NOWMMA   0
 
 __device__ __forceinline__ uint16_t mmb_f2bf(float f) { uint32_t u = __float_as_uint(f); u += 0x7fffu + ((u >> 16) & 1u); return (uint16_t)(u >> 16); }
 // same RNE as mmb_f2bf on both halves, the two high halves joined by one v_perm_b32 (no mov_b16 + and_or). Unguarded
@@ -799,10 +804,11 @@ __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ W
 #else
     constexpr bool DEFER_B = false;
 #endif
+    constexpr bool PROBE_T = WTYPE == 32 + GGML_TYPE_IQ3_S;
     int weight_ks = 0;
     auto load_regs = [&](const int ks) {
         weight_ks = ks;
-        if constexpr (LB) {
+        if constexpr (LB && !(MMB_PROBE_NODECODE && PROBE_T)) {
             const int lr = tid & ((1 << LSH) - 1), sub = M3 ? lr >> 1 : lr & 1, il = M3 ? lr & 1 : lr >> 1;
 #pragma unroll
             for (int r = 0; r < LBR; ++r) {
@@ -839,7 +845,7 @@ __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ W
                 } else { gm[i] = um[i] = g0[i] = g1[i] = u0[i] = u1[i] = make_uint4(0,0,0,0); }
             }
         }
-        if constexpr (!DEFER_B) {
+        if constexpr (!DEFER_B && !(MMB_PROBE_NOB && PROBE_T)) {
 #pragma unroll
             for (int i = 0; i < B_ITEMS; ++i) {
                 const int c = tid + i * MMB_NT; const int off = (c & 7) * 8;
@@ -848,7 +854,7 @@ __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ W
         }
     };
     auto store_lds = [&]() {
-        if constexpr (LB) {
+        if constexpr (LB && !(MMB_PROBE_NODECODE && PROBE_T)) {
             // branchless (padding rows decode to zero); same fp32 arithmetic and the same RNE + sign-XOR packing
             // as dequantize_*, so the BF16 weights are bit-identical to the generic decoder path
             const int lr = tid & ((1 << LSH) - 1), sub = M3 ? lr >> 1 : lr & 1, il = M3 ? lr & 1 : lr >> 1;
@@ -884,7 +890,8 @@ __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ W
                 }
             }
         }
-        if constexpr (DEFER_B) {
+        if constexpr (MMB_PROBE_NOB && PROBE_T) {
+        } else if constexpr (DEFER_B) {
 #pragma unroll 2
             for (int i = 0; i < B_ITEMS; ++i) {
                 const int c = tid + i * MMB_NT, row = xrow(c >> 3);
@@ -953,8 +960,13 @@ __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ W
 #pragma unroll
                     for (int j = 0; j < TN; ++j) {
                         if constexpr (TAIL) { if (WAVE_GUARD ? !wact : !jact[j]) continue; }
+                        if constexpr (MMB_PROBE_NOWMMA && PROBE_T) {   // keep the fragments observable so the LDS reads stay
+                            accg[i][j][0] += __builtin_bit_cast(float, (uint32_t) b[j][0]) + __builtin_bit_cast(float, (uint32_t) ag[i][0]);
+                            accu[i][j][0] += __builtin_bit_cast(float, (uint32_t) au[i][0]);
+                        } else {
                         accg[i][j] = mmb_wmma_glu<F16>(b[j], ag[i], accg[i][j]);
                         accu[i][j] = mmb_wmma_glu<F16>(b[j], au[i], accu[i][j]);
+                        }
                     }
             }
         }
