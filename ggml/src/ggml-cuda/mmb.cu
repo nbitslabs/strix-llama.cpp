@@ -15,6 +15,8 @@
 
 namespace {
 
+static constexpr bool MMB_W8A8_DENSE = true;
+
 typedef short v16s __attribute__((ext_vector_type(16)));
 typedef float v8f  __attribute__((ext_vector_type(8)));
 constexpr int MMB_BK = 64, MMB_NT = 256, MMB_LDS_STRIDE = MMB_BK + 8;
@@ -1445,7 +1447,13 @@ mmb_idx_score_kernel(const float * __restrict__ W, const uint16_t * __restrict__
 // result: lane holds c[l] = (row 2l + (lane>>4), col lane&15), so the fork's mmb_store_tile staging maps the
 // tile rows to the output rows unchanged. Activations come quantized in the [kb][token][32] layout the GEMM
 // reads: 32 int8 per (32-K block, token) plus one f32 scale per (block, token).
-__global__ void mmb_quantize_q8_act_kernel(const uint16_t * __restrict__ X, uint8_t * __restrict__ Xq8,
+template <typename XT>
+__device__ __forceinline__ float mmb_q8_act_float(const XT x) { return (float) x; }
+template <>
+__device__ __forceinline__ float mmb_q8_act_float<uint16_t>(const uint16_t x) { return gm_bf2f(x); }
+
+template <typename XT>
+__global__ void mmb_quantize_q8_act_kernel(const XT * __restrict__ X, uint8_t * __restrict__ Xq8,
         float * __restrict__ Xs, const int K, const int T, const bool allow_vec = false) {
     int t = blockIdx.x * blockDim.x + threadIdx.x;
     int kb = blockIdx.y;
@@ -1463,21 +1471,21 @@ __global__ void mmb_quantize_q8_act_kernel(const uint16_t * __restrict__ X, uint
     if (vec) {
         const uint4 * xp = (const uint4 *) (X + (size_t) t * K + base);
 #pragma unroll
-        for (int q = 0; q < 4; ++q) {
+        for (int q = 0; q < 32 * sizeof(XT) / sizeof(uint4); ++q) {
             const uint4 u = xp[q];
-            const uint32_t w[4] = { u.x, u.y, u.z, u.w };
+            XT values[sizeof(uint4) / sizeof(XT)];
+            __builtin_memcpy(values, &u, sizeof(u));
 #pragma unroll
-            for (int h = 0; h < 4; ++h) {
-                v[q * 8 + 2 * h]     = __uint_as_float(w[h] << 16);
-                v[q * 8 + 2 * h + 1] = __uint_as_float(w[h] & 0xffff0000u);
+            for (int h = 0; h < sizeof(uint4) / sizeof(XT); ++h) {
+                v[q * (sizeof(uint4) / sizeof(XT)) + h] = mmb_q8_act_float(values[h]);
             }
         }
 #pragma unroll
         for (int i = 0; i < 32; ++i) amax = fmaxf(amax, fabsf(v[i]));
     } else {
 #pragma unroll
-    // FIX (inference-path): X is the BF16 activation in [T][K] row-major (was read as f16 bits in a [K][T] layout)
-    for (int i = 0; i < 32; ++i) { v[i] = __uint_as_float(((uint32_t) X[(size_t) t * K + base + i]) << 16); amax = fmaxf(amax, fabsf(v[i])); }
+    // X is the activation in [T][K] row-major.
+    for (int i = 0; i < 32; ++i) { v[i] = mmb_q8_act_float(X[(size_t) t * K + base + i]); amax = fmaxf(amax, fabsf(v[i])); }
     }
     const float d = amax / 127.0f;
     const float id = d > 0.0f ? 1.0f / d : 0.0f;
@@ -1505,7 +1513,7 @@ __global__ void mmb_quantize_q8_act_kernel(const uint16_t * __restrict__ X, uint
 typedef int mmb_vi4 __attribute__((ext_vector_type(4)));
 typedef int mmb_vi8 __attribute__((ext_vector_type(8)));
 struct mmb_tok_identity { int T; __device__ int operator()(int i) const { return i < T ? i : -1; } };
-template <int BM, int BN, int BK, int WM, int WN, typename DRowFn>
+template <int BM, int BN, int BK, int WM, int WN, bool TQ8 = false, typename DRowFn>
 __global__ void __launch_bounds__(MMB_NT, 2)
 mmb_hcd_w8a8_kernel(const uint8_t * __restrict__ W, const uint8_t * __restrict__ Xq8, const float * __restrict__ Xs,
         float * __restrict__ D, uint16_t * __restrict__ Dh, const bool store_f32, const int M, const int K, const int T, DRowFn drow,
@@ -1516,6 +1524,10 @@ mmb_hcd_w8a8_kernel(const uint8_t * __restrict__ W, const uint8_t * __restrict__
     constexpr int ROW_TILES = BM / 16, TOK_TILES = BN / 16;
     constexpr int WROWS = ROW_TILES / WM, WTOKS = TOK_TILES / WN;
     static_assert(WM * WN == 8 && ROW_TILES % WM == 0 && TOK_TILES % WN == 0, "wave layout");
+    static_assert(BM % 16 == 0 && BN == 128 && (!TQ8 || (BM * BK) % MMB_NT == 0), "loader layout");
+    static_assert(!TQ8 || BM == 128, "tq8 row tile");
+    static_assert(BK * TOK_TILES * 32 * sizeof(mmb_vi4) >= 8 * 256 * sizeof(float), "epilogue staging");
+    static_assert(BK * (ROW_TILES + TOK_TILES) * (32 * sizeof(mmb_vi4) + 16 * sizeof(float)) <= 65536, "LDS size");
     __shared__ __align__(16) mmb_vi4 s_a[BK][ROW_TILES][32];
     __shared__ float s_dw[BK][ROW_TILES][16];
     __shared__ __align__(16) mmb_vi4 s_b[BK][TOK_TILES][32];
@@ -1538,7 +1550,8 @@ mmb_hcd_w8a8_kernel(const uint8_t * __restrict__ W, const uint8_t * __restrict__
         const int row = idx / BK;
         const int r = m0 + row;
         a_live[p] = idx < BM * BK && r < M;
-        a_ptr[p] = W + (size_t)(a_live[p] ? r : (M - 1)) * wrow_bytes;
+        if constexpr (TQ8) a_ptr[p] = W + (size_t) (r / 128) * (K / 64) * MMB_TQ8_CHUNK;
+        else              a_ptr[p] = W + (size_t)(a_live[p] ? r : (M - 1)) * wrow_bytes;
     }
     const int b_ts = wave;   // one wave per token tile
     // activation layout: [kb][t][32] + scales [kb][t] (x_gs < 0), or token-grouped [t/G][kb][G][32] + [t/G][kb][G]
@@ -1559,11 +1572,20 @@ mmb_hcd_w8a8_kernel(const uint8_t * __restrict__ W, const uint8_t * __restrict__
             const int kb_in = (p * MMB_NT + tid) % BK;
             const int kb = kb0 + kb_in;
             const int kb_c = kb < nkb ? kb : nkb - 1;
-            const uint8_t * blk = a_ptr[p] + (size_t) kb_c * 34;
             const bool live = a_live[p] && kb < nkb;
-            __builtin_memcpy(&r_q0[p], blk + 2, 16);
-            __builtin_memcpy(&r_q1[p], blk + 18, 16);
-            r_dw[p] = live ? mmb_h2f(*(const uint16_t *) blk) : 0.0f;
+            if constexpr (TQ8) {
+                const int r = (m0 + (p * MMB_NT + tid) / BK) % 128;
+                const uint8_t * chunk = a_ptr[p] + (size_t) (kb_c / 2) * MMB_TQ8_CHUNK;
+                const uint8_t * qs = chunk + r * 64 + (kb_c % 2) * 32;
+                __builtin_memcpy(&r_q0[p], qs, 16);
+                __builtin_memcpy(&r_q1[p], qs + 16, 16);
+                r_dw[p] = live ? mmb_h2f(*(const uint16_t *) (chunk + 8192 + (r * 2 + kb_c % 2) * 2)) : 0.0f;
+            } else {
+                const uint8_t * blk = a_ptr[p] + (size_t) kb_c * 34;
+                __builtin_memcpy(&r_q0[p], blk + 2, 16);
+                __builtin_memcpy(&r_q1[p], blk + 18, 16);
+                r_dw[p] = live ? mmb_h2f(*(const uint16_t *) blk) : 0.0f;
+            }
         }
         if (b_live) {
 #pragma unroll
@@ -1573,6 +1595,9 @@ mmb_hcd_w8a8_kernel(const uint8_t * __restrict__ W, const uint8_t * __restrict__
                 r_b[i] = *(const mmb_vi4 *)(b_base + (size_t) kb_c * x_kb * 32);
                 r_dx[i] = kb < nkb ? b_scale[(size_t) kb_c * s_kb] : 0.0f;
             }
+        } else if constexpr (TQ8) {
+#pragma unroll
+            for (int i = 0; i < BK; ++i) { r_b[i] = mmb_vi4{0, 0, 0, 0}; r_dx[i] = 0.0f; }
         }
     };
     const auto commit_stage = [&]() {
@@ -1586,7 +1611,7 @@ mmb_hcd_w8a8_kernel(const uint8_t * __restrict__ W, const uint8_t * __restrict__
             s_a[kk][rs][16 + rl] = r_q1[p];
             s_dw[kk][rs][(rl & 1) == 0 ? rl / 2 : 8 + rl / 2] = r_dw[p];
         }
-        if (b_live) {
+        if (b_live || TQ8) {
 #pragma unroll
             for (int i = 0; i < BK; ++i) {
                 s_b[i][b_ts][lane] = r_b[i];
@@ -2304,14 +2329,18 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * 
         }
         CUDA_CHECK(cudaGetLastError()); return;
     }
+    const bool dense_w8a8 = MMB_W8A8_DENSE && src0->type == GGML_TYPE_Q8_0 && ggml_cuda_mmb_dq_packed(src0) &&
+        T >= 512 && T <= 16384 && M % 128 == 0 && K % 128 == 0 &&
+        ((K == 2560 && (M == 10240 || M == 6144)) || (K == 6144 && M == 2560));
     // dense F16 on a repacked weight: the producer's F16 copy, else its BF16 copy (BF16 kernel), else convert to F16
     const uint16_t * xf16 = nullptr;
     if (ggml_cuda_mmb_dq_packed(src0)) {
         const size_t n = (size_t) T * K;
         xf16 = mmb_act_lookup(ctx, src1, n, true);
-        if (!xf16 && !mmb_act_lookup(ctx, src1, n, false)) xf16 = mmb_f16sat_activation(ctx, src1, n, stream);
+        if (!dense_w8a8 && !xf16 && !mmb_act_lookup(ctx, src1, n, false)) xf16 = mmb_f16sat_activation(ctx, src1, n, stream);
     }
-    const uint16_t * xhp = xf16 ? xf16 : mmb_bf16_activation(ctx, src1, (size_t) T * K, stream);
+    const uint16_t * xhp = xf16 ? xf16 : (dense_w8a8 ? mmb_act_lookup(ctx, src1, (size_t) T * K, false) :
+        mmb_bf16_activation(ctx, src1, (size_t) T * K, stream));
     const uint8_t * W = (const uint8_t *) src0->data; float * D = (float *) dst->data;
     if (mmb_tall() && src0->type == GGML_TYPE_IQ4_NL && M <= 384 && K >= 4096 && T >= 2048) {   // tall-M tile: HC down|inject [10240 -> 324], activations read once
         dim3 grid(1, (T + 63) / 64);
@@ -2368,7 +2397,28 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     if (ggml_cuda_mmb_blk16() && !Dh && ggml_cuda_mmb_is_bf16_only(ctx, dst) && (M & 7) == 0) {
         Dh = (uint16_t *) dst->data; store_f32 = false;
     }
-    if (ggml_cuda_mmb_dq_packed(src0)) {   // dense R2 in-place tile layout: only mmb_tq8_dense_kernel reads it here
+    // Prototype int8 activations for the three big tq8 GEMMs; M and K must be multiples of 128.
+    // Measure KL/perplexity against the F16 path before any default change.
+    if (dense_w8a8) {
+        const int nkb = K / 32;
+        // Tail tokens clamp to T-1 in the loader; codes and scales need no BN padding.
+        ggml_cuda_pool_alloc<uint8_t> xq(ctx.pool(), (size_t) nkb * T * 32);
+        ggml_cuda_pool_alloc<float> xsc(ctx.pool(), (size_t) nkb * T);
+        dim3 gq((T + 255) / 256, nkb);
+        if (xf16) {
+            mmb_quantize_q8_act_kernel<<<gq, 256, 0, stream>>>((const _Float16 *) xf16, xq.get(), xsc.get(), K, T, true);
+        } else if (xhp) {
+            mmb_quantize_q8_act_kernel<<<gq, 256, 0, stream>>>(xhp, xq.get(), xsc.get(), K, T, true);
+        } else {
+            mmb_quantize_q8_act_kernel<<<gq, 256, 0, stream>>>((const float *) src1->data, xq.get(), xsc.get(), K, T, true);
+        }
+        CUDA_CHECK(cudaGetLastError());
+        mmb_hcd_w8a8_kernel<128, 128, 4, 4, 2, true><<<dim3(M / 128, (T + 127) / 128), MMB_NT, 0, stream>>>(W, xq.get(), xsc.get(), D, Dh, store_f32, M, K, T,
+            mmb_tok_identity{T}, -1, true);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+    if (ggml_cuda_mmb_dq_packed(src0)) {   // dense R2 in-place tile layout
         mmb_tq8_launch(W, xhp, D, Dh, store_f32, M, K, T, mmb_tq8_k7(M, K), xf16 != nullptr, stream);
         return;
     }
