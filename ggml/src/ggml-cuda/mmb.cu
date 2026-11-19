@@ -760,6 +760,12 @@ __device__ __forceinline__ v8f mmb_wmma_glu(const v16s b, const v16s a, const v8
     }
 }
 
+// Routed IQ3_S 64x128 GLU tile: the weight tiles are double-buffered in LDS (2 x 2 x 9.2 KB + 18.4 KB = 55 KB), so the
+// decode of the next K step overlaps the current WMMAs and only the B stores sit between the two barriers.
+template <int WTYPE, int BM, int BN> static constexpr __host__ __device__ int mmb_glu_abufs() {
+    return (WTYPE == 32 + GGML_TYPE_IQ3_S && BM == 64 && BN == 128) ? 2 : 1;
+}
+
 template <int BM, int BN, int WTM, int WTN, int WTYPE, bool TAIL, bool Q4K_HALF, typename XRowFn, typename DRowFn>
 __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ Wg, const uint8_t * __restrict__ Wu, const size_t wrow_bytes, const int a_rows,
         const uint16_t * __restrict__ Xh, const int K, XRowFn xrow, float * __restrict__ D, uint16_t * __restrict__ Dh, const bool store_f32, const int M, DRowFn drow, const int m0,
@@ -799,6 +805,7 @@ __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ W
 #else
     constexpr bool DEFER_B = false;
 #endif
+    constexpr bool ADB = mmb_glu_abufs<WTYPE, BM, BN>() == 2;
     int weight_ks = 0;
     auto load_regs = [&](const int ks) {
         weight_ks = ks;
@@ -847,7 +854,7 @@ __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ W
             }
         }
     };
-    auto store_lds = [&]() {
+    auto store_a = [&](uint16_t * Ag, uint16_t * Au) {   // the parameters shadow the base buffers on purpose
         if constexpr (LB) {
             // branchless (padding rows decode to zero); same fp32 arithmetic and the same RNE + sign-XOR packing
             // as dequantize_*, so the BF16 weights are bit-identical to the generic decoder path
@@ -884,6 +891,8 @@ __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ W
                 }
             }
         }
+    };
+    auto store_b = [&]() {
         if constexpr (DEFER_B) {
 #pragma unroll 2
             for (int i = 0; i < B_ITEMS; ++i) {
@@ -895,6 +904,7 @@ __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ W
             for (int i = 0; i < B_ITEMS; ++i) { const int c = tid + i * MMB_NT; *(uint4 *)(Bs + (c >> 3) * MMB_LDS_STRIDE + (c & 7) * 8) = bst[i]; }
         }
     };
+    auto store_lds = [&]() { store_a(Ag, Au); store_b(); };
     v8f accg[TM][TN], accu[TM][TN];
 #pragma unroll
     for (int i = 0; i < TM; ++i)
@@ -908,6 +918,8 @@ __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ W
     const int nks = K / MMB_BK;
     load_regs(0); if constexpr (LB) __syncthreads(); store_lds(); __syncthreads();
     for (int ks = 0; ks < nks; ++ks) {
+        const uint16_t * Ag_k = Ag + (ADB ? (ks & 1) * BM * MMB_LDS_STRIDE : 0);
+        const uint16_t * Au_k = Au + (ADB ? (ks & 1) * BM * MMB_LDS_STRIDE : 0);
         if (ks + 1 < nks) load_regs(ks + 1);
 #pragma unroll
         for (int kk = 0; kk < MMB_BK; kk += 16) {
@@ -927,13 +939,13 @@ __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ W
                 for (int i = 0; i < TM; ++i) {
                     const int off = (wm * WTM + i * 16 + r) * MMB_LDS_STRIDE + kk;
                     {
-                        const v16s a = __builtin_bit_cast(v16s, (uint4[2]){*(const uint4 *)(Ag + off), *(const uint4 *)(Ag + off + 8)});
+                        const v16s a = __builtin_bit_cast(v16s, (uint4[2]){*(const uint4 *)(Ag_k + off), *(const uint4 *)(Ag_k + off + 8)});
 #pragma unroll
                         for (int j = 0; j < TN; ++j) { if constexpr (TAIL) { if (WAVE_GUARD ? !wact : !jact[j]) continue; }
                             accg[i][j] = mmb_wmma_glu<F16>(b[j], a, accg[i][j]); }
                         }
                     {
-                        const v16s a = __builtin_bit_cast(v16s, (uint4[2]){*(const uint4 *)(Au + off), *(const uint4 *)(Au + off + 8)});
+                        const v16s a = __builtin_bit_cast(v16s, (uint4[2]){*(const uint4 *)(Au_k + off), *(const uint4 *)(Au_k + off + 8)});
 #pragma unroll
                         for (int j = 0; j < TN; ++j) { if constexpr (TAIL) { if (WAVE_GUARD ? !wact : !jact[j]) continue; }
                             accu[i][j] = mmb_wmma_glu<F16>(b[j], a, accu[i][j]); }
@@ -943,8 +955,8 @@ __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ W
                 v16s ag[TM], au[TM], b[TN]; const int r = lane & 15;
 #pragma unroll
                 for (int i = 0; i < TM; ++i) { const int off = (wm * WTM + i * 16 + r) * MMB_LDS_STRIDE + kk;
-                    ag[i] = __builtin_bit_cast(v16s, (uint4[2]){*(const uint4 *)(Ag + off), *(const uint4 *)(Ag + off + 8)});
-                    au[i] = __builtin_bit_cast(v16s, (uint4[2]){*(const uint4 *)(Au + off), *(const uint4 *)(Au + off + 8)}); }
+                    ag[i] = __builtin_bit_cast(v16s, (uint4[2]){*(const uint4 *)(Ag_k + off), *(const uint4 *)(Ag_k + off + 8)});
+                    au[i] = __builtin_bit_cast(v16s, (uint4[2]){*(const uint4 *)(Au_k + off), *(const uint4 *)(Au_k + off + 8)}); }
 #pragma unroll
                 for (int j = 0; j < TN; ++j) { if constexpr (TAIL) { if (WAVE_GUARD ? !wact : !jact[j]) continue; } const uint16_t * p = Bs + (wn * WTN + j * 16 + r) * MMB_LDS_STRIDE + kk;
                     b[j] = __builtin_bit_cast(v16s, (uint4[2]){*(const uint4 *)p, *(const uint4 *)(p + 8)}); }
@@ -958,8 +970,11 @@ __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ W
                     }
             }
         }
+        if constexpr (ADB) {   // decode the next step's weights into the other A buffer while other waves still run WMMAs
+            if (ks + 1 < nks) store_a(Ag + ((ks + 1) & 1) * BM * MMB_LDS_STRIDE, Au + ((ks + 1) & 1) * BM * MMB_LDS_STRIDE);
+        }
         __syncthreads();
-        if (ks + 1 < nks) store_lds();
+        if (ks + 1 < nks) { if constexpr (ADB) store_b(); else store_lds(); }
         __syncthreads();
     }
     float * stg = (float *)((BN * MMB_LDS_STRIDE * 2 >= MMB_NT / 32 * 1024) ? Bs : Ag) + wave * 256;
@@ -987,8 +1002,8 @@ mmb_routed_glu_kernel(const uint8_t * __restrict__ Wg, const uint8_t * __restric
 #if defined(__HIP_DEVICE_COMPILE__) && !defined(RDNA3)
     NO_DEVICE_CODE; // WMMA kernels are RDNA3-only; the host gate keeps other devices off this path
 #else
-    __shared__ __align__(16) uint16_t Ag[BM * MMB_LDS_STRIDE];
-    __shared__ __align__(16) uint16_t Au[BM * MMB_LDS_STRIDE];
+    __shared__ __align__(16) uint16_t Ag[mmb_glu_abufs<WTYPE, BM, BN>() * BM * MMB_LDS_STRIDE];
+    __shared__ __align__(16) uint16_t Au[mmb_glu_abufs<WTYPE, BM, BN>() * BM * MMB_LDS_STRIDE];
     __shared__ __align__(16) uint16_t Bs[BN * MMB_LDS_STRIDE];
     const uint32_t dsc = desc[blockIdx.y];
     if (dsc == UINT32_MAX) return;
