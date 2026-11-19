@@ -18,6 +18,8 @@ namespace {
 typedef short v16s __attribute__((ext_vector_type(16)));
 typedef float v8f  __attribute__((ext_vector_type(8)));
 constexpr int MMB_BK = 64, MMB_NT = 256, MMB_LDS_STRIDE = MMB_BK + 8;
+// Routed GLU big tier rows per block (experiment knob): 128 halves the per-output activation gather of the 64-row tile
+#define MMB_GLU_BIG_BM 128
 
 __device__ __forceinline__ uint16_t mmb_f2bf(float f) { uint32_t u = __float_as_uint(f); u += 0x7fffu + ((u >> 16) & 1u); return (uint16_t)(u >> 16); }
 // same RNE as mmb_f2bf on both halves, the two high halves joined by one v_perm_b32 (no mov_b16 + and_or). Unguarded
@@ -4219,6 +4221,11 @@ void ggml_cuda_mul_mat_id_mmb_glu(ggml_backend_cuda_context & ctx, const ggml_te
             } else if constexpr (mmb_glu_ms_type(WT)) {
                 static_assert(BN_sel == 128, "mmb_routed_glu_ms_kernel tiles 128 tokens");
                 mmb_routed_glu_ms_kernel<WT><<<gbig, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), M, K);
+            } else if constexpr (MMB_GLU_BIG_BM == 128 && WT == 32 + GGML_TYPE_IQ3_S) {
+                // 128-row tile: each block gathers the token tile for twice the weight rows (the gather is the tile's
+                // dominant traffic at 1-2 resident blocks); same per-output K order as the 64-row tile
+                const dim3 g128((M + 127) / 128, nbig_max);
+                mmb_routed_glu_kernel<128, BN_sel, 64, 32, WT><<<g128, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), M, K);
             } else {
                 mmb_routed_glu_kernel<64, BN_sel, 32, BN_sel / 4, WT><<<gbig, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), M, K);
             }
