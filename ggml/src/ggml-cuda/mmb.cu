@@ -2175,7 +2175,7 @@ static bool mmb_tq8_shape(const int64_t M, const int64_t K) {
     if ((K / 64) % 2 != 0) return false;                              // k8: nks even
     return M >= 6144 || K > 4096;
 }
-static bool mmb_tq8_k7(const int M, const int K) { return K <= 4096 && M >= 8192; }
+static bool mmb_tq8_k7(const int M, const int K) { GGML_UNUSED(M); GGML_UNUSED(K); return false; }   // experiment: k7 shapes on the k8 tile
 // Dense F16: the k7/k8 kernels read F16 activations (f16 dequant + f16 WMMA) instead of BF16. The producers of
 // these GEMM inputs (HC gate mix, GDN gated output norm, gated attention output) write the F16 copy themselves
 // (saturating RNE) when the graph marks say a reader wants it; any other input is converted here (F32 -> F16), or
