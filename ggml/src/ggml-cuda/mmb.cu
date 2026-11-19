@@ -1101,14 +1101,15 @@ mmb_routed_glu_ms_kernel(const uint8_t * __restrict__ Wg, const uint8_t * __rest
     // full tiles (most of the big tier) run without the per-fragment guard; a partial tile skips its empty fragments
     auto kloop = [&](auto full) {
         constexpr bool FULL = decltype(full)::value;
-        for (int ks = 0; ks < nks; ++ks) {
-            mmb_v8u w[2];
+        mmb_v8u w[2];
+        auto dec = [&](const uint32_t (&ff)[2][LBT::NR]) {
 #pragma unroll
             for (int q = 0; q < 2; ++q) {
-                uint4 lo, hi; LBT::decode(lbgrid, f[q], pc, lo, hi);
+                uint4 lo, hi; LBT::decode(lbgrid, ff[q], pc, lo, hi);
                 w[q] = mmb_v8u{lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w};
             }
-            if (ks + 1 < nks) { fetch(ks + 1); load_b(ks + 1); }
+        };
+        auto wmmas = [&](const int ks) {
             const uint16_t * bb = Bs + (ks & 1) * BSZ + r * MMB_LDS_STRIDE;
 #pragma unroll
             for (int q = 0; q < 2; ++q) {
@@ -1122,7 +1123,34 @@ mmb_routed_glu_ms_kernel(const uint8_t * __restrict__ Wg, const uint8_t * __rest
                     if (FULL || j < njt) acc[j] = mmb_wmma_bf16_u(y, mmb_ms_lds16(bb + j * 16 * MMB_LDS_STRIDE + 32 * q + 16), acc[j]);
                 }
             }
-            if (ks + 1 < nks) { store_b((ks + 1) & 1); mmb_tq8_lds_barrier(); }
+        };
+        // IQ3_S: decode the next step's operands AFTER this step's WMMAs (where the wave would wait at the barrier),
+        // from raw fields fetched two steps ahead into two banks; the IQ2 types keep the original schedule
+        if constexpr (WTYPE == 32 + GGML_TYPE_IQ3_S) {
+            uint32_t f2[2][LBT::NR];
+            auto fetch2 = [&](const int ks, uint32_t (&ff)[2][LBT::NR]) {
+#pragma unroll
+                for (int q = 0; q < 2; ++q) LBT::fetch(wrow, ks, q, pc, ff[q]);
+            };
+            auto step = [&](const int ks, uint32_t (&cur)[2][LBT::NR], uint32_t (&nxt)[2][LBT::NR]) {   // cur: raw of ks (decoded), nxt: raw of ks+1
+                if (ks + 2 < nks) fetch2(ks + 2, cur);
+                if (ks + 1 < nks) load_b(ks + 1);
+                wmmas(ks);
+                if (ks + 1 < nks) { dec(nxt); store_b((ks + 1) & 1); mmb_tq8_lds_barrier(); }
+            };
+            dec(f);
+            if (nks > 1) fetch2(1, f2);
+            for (int ks = 0; ks < nks; ks += 2) {
+                step(ks, f, f2);
+                if (ks + 1 < nks) step(ks + 1, f2, f);
+            }
+        } else {
+            for (int ks = 0; ks < nks; ++ks) {
+                dec(f);
+                if (ks + 1 < nks) { fetch(ks + 1); load_b(ks + 1); }
+                wmmas(ks);
+                if (ks + 1 < nks) { store_b((ks + 1) & 1); mmb_tq8_lds_barrier(); }
+            }
         }
     };
     if (njt == TN) kloop(std::true_type{}); else kloop(std::false_type{});
