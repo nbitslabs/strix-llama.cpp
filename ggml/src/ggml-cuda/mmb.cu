@@ -23,6 +23,7 @@ constexpr int MMB_BK = 64, MMB_NT = 256, MMB_LDS_STRIDE = MMB_BK + 8;
 #define MMB_PROBE_NODECODE 0
 #define MMB_PROBE_NOB      0
 #define MMB_PROBE_NOWMMA   0
+#define MMB_PROBE_NOSCATTER 0   // the activation gather reads contiguous rows 0..BN-1 instead of the routed rows (same volume)
 
 __device__ __forceinline__ uint16_t mmb_f2bf(float f) { uint32_t u = __float_as_uint(f); u += 0x7fffu + ((u >> 16) & 1u); return (uint16_t)(u >> 16); }
 // same RNE as mmb_f2bf on both halves, the two high halves joined by one v_perm_b32 (no mov_b16 + and_or). Unguarded
@@ -782,7 +783,7 @@ __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ W
     uint4 bst[B_ITEMS];
     int brow[B_ITEMS];
 #pragma unroll
-    for (int i = 0; i < B_ITEMS; ++i) { const int c = tid + i * MMB_NT; brow[i] = xrow(c >> 3); }
+    for (int i = 0; i < B_ITEMS; ++i) { const int c = tid + i * MMB_NT; brow[i] = (MMB_PROBE_NOSCATTER && WTYPE == 32 + GGML_TYPE_IQ3_S) ? (c >> 3) : xrow(c >> 3); }
     // grid-based types (mmb_lb): prefetch each lane's raw block fields into registers during the WMMA loop, grid in
     // LDS, pack + decode in store_lds. Same fp32 math as dequantize_* -> bit-identical.
     // The 3-value IQ2 grid types take the mmb_ms3 decoder instead: 4 lanes per row, a lane's 16 weights (groups 2 il,
