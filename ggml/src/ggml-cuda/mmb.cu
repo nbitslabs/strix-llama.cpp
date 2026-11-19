@@ -16,6 +16,7 @@
 namespace {
 
 static constexpr bool MMB_W8A8_DENSE = true;
+static constexpr int MMB_W8A8_DENSE_BM = 128;  // 128 or 64
 
 typedef short v16s __attribute__((ext_vector_type(16)));
 typedef float v8f  __attribute__((ext_vector_type(8)));
@@ -1525,7 +1526,8 @@ mmb_hcd_w8a8_kernel(const uint8_t * __restrict__ W, const uint8_t * __restrict__
     constexpr int WROWS = ROW_TILES / WM, WTOKS = TOK_TILES / WN;
     static_assert(WM * WN == 8 && ROW_TILES % WM == 0 && TOK_TILES % WN == 0, "wave layout");
     static_assert(BM % 16 == 0 && BN == 128 && (!TQ8 || (BM * BK) % MMB_NT == 0), "loader layout");
-    static_assert(!TQ8 || BM == 128, "tq8 row tile");
+    static_assert(!TQ8 || (BM == 64 || BM == 128), "tq8 row tile");
+    static_assert(!TQ8 || BK % 2 == 0, "tq8 chunk pairs");
     static_assert(BK * TOK_TILES * 32 * sizeof(mmb_vi4) >= 8 * 256 * sizeof(float), "epilogue staging");
     static_assert(BK * (ROW_TILES + TOK_TILES) * (32 * sizeof(mmb_vi4) + 16 * sizeof(float)) <= 65536, "LDS size");
     __shared__ __align__(16) mmb_vi4 s_a[BK][ROW_TILES][32];
@@ -1541,6 +1543,7 @@ mmb_hcd_w8a8_kernel(const uint8_t * __restrict__ W, const uint8_t * __restrict__
     const size_t wrow_bytes = (size_t) nkb * 34;
     constexpr int A_PER = (BM * BK + MMB_NT - 1) / MMB_NT;
     mmb_vi4 r_q0[A_PER], r_q1[A_PER];
+    mmb_vi4 r_q[TQ8 ? 2 * A_PER : 1];
     float r_dw[A_PER];
     const uint8_t * a_ptr[A_PER];
     bool a_live[A_PER];
@@ -1567,20 +1570,36 @@ mmb_hcd_w8a8_kernel(const uint8_t * __restrict__ W, const uint8_t * __restrict__
     mmb_vi4 r_b[BK];
     float r_dx[BK];
     const auto fetch_stage = [&](const int kb0) {
+        if constexpr (TQ8) {
+#pragma unroll
+            for (int p = 0; p < 2 * A_PER; ++p) {
+                const int idx = p * MMB_NT + tid;
+                const int ci = idx / (BM * 4), u = idx % (BM * 4);
+                const int row = u / 4, piece = u % 4;
+                const int kb = kb0 + ci * 2 + piece / 2;
+                const int kb_c = kb < nkb ? kb : nkb - 1;
+                const uint8_t * chunk = W + ((size_t) (m0 / 128) * (K / 64) + kb_c / 2) * MMB_TQ8_CHUNK;
+                const uint4 q = *(const uint4 *) (chunk + ((m0 % 128) + row) * 64 + (kb_c % 2) * 32 + (piece % 2) * 16);
+                __builtin_memcpy(&r_q[p], &q, sizeof(q));
+            }
+#pragma unroll
+            for (int p = 0; p < A_PER; ++p) {
+                const int idx = p * MMB_NT + tid;
+                const int ci = idx / (BM * 2), u = idx % (BM * 2);
+                const int row = u / 2;
+                const int kb = kb0 + ci * 2 + u % 2;
+                const int kb_c = kb < nkb ? kb : nkb - 1;
+                const uint8_t * chunk = W + ((size_t) (m0 / 128) * (K / 64) + kb_c / 2) * MMB_TQ8_CHUNK;
+                r_dw[p] = m0 + row < M && kb < nkb ? mmb_h2f(*(const uint16_t *) (chunk + 8192 + (((m0 % 128) + row) * 2 + kb_c % 2) * 2)) : 0.0f;
+            }
+        }
 #pragma unroll
         for (int p = 0; p < A_PER; ++p) {
             const int kb_in = (p * MMB_NT + tid) % BK;
             const int kb = kb0 + kb_in;
             const int kb_c = kb < nkb ? kb : nkb - 1;
             const bool live = a_live[p] && kb < nkb;
-            if constexpr (TQ8) {
-                const int r = (m0 + (p * MMB_NT + tid) / BK) % 128;
-                const uint8_t * chunk = a_ptr[p] + (size_t) (kb_c / 2) * MMB_TQ8_CHUNK;
-                const uint8_t * qs = chunk + r * 64 + (kb_c % 2) * 32;
-                __builtin_memcpy(&r_q0[p], qs, 16);
-                __builtin_memcpy(&r_q1[p], qs + 16, 16);
-                r_dw[p] = live ? mmb_h2f(*(const uint16_t *) (chunk + 8192 + (r * 2 + kb_c % 2) * 2)) : 0.0f;
-            } else {
+            if constexpr (!TQ8) {
                 const uint8_t * blk = a_ptr[p] + (size_t) kb_c * 34;
                 __builtin_memcpy(&r_q0[p], blk + 2, 16);
                 __builtin_memcpy(&r_q1[p], blk + 18, 16);
@@ -1601,6 +1620,23 @@ mmb_hcd_w8a8_kernel(const uint8_t * __restrict__ W, const uint8_t * __restrict__
         }
     };
     const auto commit_stage = [&]() {
+        if constexpr (TQ8) {
+#pragma unroll
+            for (int p = 0; p < 2 * A_PER; ++p) {
+                const int idx = p * MMB_NT + tid;
+                const int ci = idx / (BM * 4), u = idx % (BM * 4);
+                const int row = u / 4, piece = u % 4;
+                s_a[ci * 2 + piece / 2][row / 16][(piece % 2) * 16 + row % 16] = r_q[p];
+            }
+#pragma unroll
+            for (int p = 0; p < A_PER; ++p) {
+                const int idx = p * MMB_NT + tid;
+                const int ci = idx / (BM * 2), u = idx % (BM * 2);
+                const int row = u / 2, kk = ci * 2 + u % 2;
+                const int rs = row / 16, rl = row % 16;
+                s_dw[kk][rs][(rl & 1) == 0 ? rl / 2 : 8 + rl / 2] = r_dw[p];
+            }
+        } else {
 #pragma unroll
         for (int p = 0; p < A_PER; ++p) {
             const int idx = p * MMB_NT + tid;
@@ -1610,6 +1646,7 @@ mmb_hcd_w8a8_kernel(const uint8_t * __restrict__ W, const uint8_t * __restrict__
             s_a[kk][rs][rl] = r_q0[p];
             s_a[kk][rs][16 + rl] = r_q1[p];
             s_dw[kk][rs][(rl & 1) == 0 ? rl / 2 : 8 + rl / 2] = r_dw[p];
+        }
         }
         if (b_live || TQ8) {
 #pragma unroll
@@ -2337,10 +2374,9 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     if (ggml_cuda_mmb_dq_packed(src0)) {
         const size_t n = (size_t) T * K;
         xf16 = mmb_act_lookup(ctx, src1, n, true);
-        if (!dense_w8a8 && !xf16 && !mmb_act_lookup(ctx, src1, n, false)) xf16 = mmb_f16sat_activation(ctx, src1, n, stream);
+        if (!xf16 && !mmb_act_lookup(ctx, src1, n, false)) xf16 = mmb_f16sat_activation(ctx, src1, n, stream);
     }
-    const uint16_t * xhp = xf16 ? xf16 : (dense_w8a8 ? mmb_act_lookup(ctx, src1, (size_t) T * K, false) :
-        mmb_bf16_activation(ctx, src1, (size_t) T * K, stream));
+    const uint16_t * xhp = xf16 ? xf16 : mmb_bf16_activation(ctx, src1, (size_t) T * K, stream);
     const uint8_t * W = (const uint8_t *) src0->data; float * D = (float *) dst->data;
     if (mmb_tall() && src0->type == GGML_TYPE_IQ4_NL && M <= 384 && K >= 4096 && T >= 2048) {   // tall-M tile: HC down|inject [10240 -> 324], activations read once
         dim3 grid(1, (T + 63) / 64);
@@ -2407,14 +2443,19 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * 
         dim3 gq((T + 255) / 256, nkb);
         if (xf16) {
             mmb_quantize_q8_act_kernel<<<gq, 256, 0, stream>>>((const _Float16 *) xf16, xq.get(), xsc.get(), K, T, true);
-        } else if (xhp) {
-            mmb_quantize_q8_act_kernel<<<gq, 256, 0, stream>>>(xhp, xq.get(), xsc.get(), K, T, true);
         } else {
-            mmb_quantize_q8_act_kernel<<<gq, 256, 0, stream>>>((const float *) src1->data, xq.get(), xsc.get(), K, T, true);
+            mmb_quantize_q8_act_kernel<<<gq, 256, 0, stream>>>(xhp, xq.get(), xsc.get(), K, T, true);
         }
         CUDA_CHECK(cudaGetLastError());
-        mmb_hcd_w8a8_kernel<128, 128, 4, 4, 2, true><<<dim3(M / 128, (T + 127) / 128), MMB_NT, 0, stream>>>(W, xq.get(), xsc.get(), D, Dh, store_f32, M, K, T,
-            mmb_tok_identity{T}, -1, true);
+        static_assert(MMB_W8A8_DENSE_BM == 128 || MMB_W8A8_DENSE_BM == 64, "dense w8a8 row tile");
+        const dim3 grid(M / MMB_W8A8_DENSE_BM, (T + 127) / 128);
+        if constexpr (MMB_W8A8_DENSE_BM == 128) {
+            mmb_hcd_w8a8_kernel<128, 128, 4, 4, 2, true><<<grid, MMB_NT, 0, stream>>>(W, xq.get(), xsc.get(), D, Dh, store_f32, M, K, T,
+                mmb_tok_identity{T}, -1, true);
+        } else {
+            mmb_hcd_w8a8_kernel<64, 128, 4, 4, 2, true><<<grid, MMB_NT, 0, stream>>>(W, xq.get(), xsc.get(), D, Dh, store_f32, M, K, T,
+                mmb_tok_identity{T}, -1, true);
+        }
         CUDA_CHECK(cudaGetLastError());
         return;
     }
