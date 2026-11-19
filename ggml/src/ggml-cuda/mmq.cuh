@@ -1745,7 +1745,7 @@ static constexpr int mmq_rdna3_5_id_get_J(const ggml_type type, const int64_t ro
         case GGML_TYPE_IQ3_S:
         case GGML_TYPE_IQ4_NL:
         case GGML_TYPE_IQ4_XS:
-            return rows_per_expert <= 12 ? 16 : rows_per_expert <= 32 ? 48 : rows_per_expert <= 64 ? MMQ_IQ_ID_J_MID : 128;
+            return rows_per_expert <= 12 ? 16 : rows_per_expert <= 32 ? 48 : rows_per_expert <= 64 ? MMQ_IQ_ID_J_MID : 64;
         case GGML_TYPE_Q4_K:
         case GGML_TYPE_Q5_K:
         case GGML_TYPE_Q6_K:
@@ -1763,7 +1763,7 @@ static constexpr bool mmq_rdna3_5_id_use_compact(const ggml_type type, const int
         case GGML_TYPE_IQ3_S:
         case GGML_TYPE_IQ4_NL:
         case GGML_TYPE_IQ4_XS:
-            return J == 16 || J == 48 || J == MMQ_IQ_ID_J_MID || J == 128;
+            return J == 16 || J == 48 || J == MMQ_IQ_ID_J_MID || J == 64 || J == 128;
         case GGML_TYPE_Q4_K:
         case GGML_TYPE_Q5_K:
         case GGML_TYPE_Q6_K:
