@@ -613,12 +613,14 @@ static constexpr bool mmb_quant_type_any(ggml_type type) {
     }
 }
 
-// dense GEMMs: the two types measured faster than MMQ on every arch (#123)
+// dense GEMMs: IQ4_NL measured faster than MMQ on every arch (#123). Q8_0 left MMB on gfx1151 after the int8-WMMA MMQ
+// configs landed: MMQ 14.9 / 9.1 / 9.7 ms vs MMB 53.9 / 30.8 / 29.6 ms at 7680 tokens on [2560x10240], [2560x6144],
+// [6144x2560] (test-backend-ops perf, 2026-11-19); the tile-repacked tq8 path is gated off with it (mmb_tq8_shape).
 static constexpr bool mmb_quant_type_dense_supported(ggml_type type) {
 #ifdef GGML_USE_TRELLIS
     if (ggml_cuda_type_is_tq(type)) return true;
 #endif
-    return type == GGML_TYPE_Q8_0 || type == GGML_TYPE_IQ4_NL;
+    return type == GGML_TYPE_IQ4_NL;
 }
 
 static bool mmb_quant_type_dense(ggml_type type) {

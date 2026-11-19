@@ -2168,6 +2168,8 @@ void ggml_cuda_mmb_idx_score(ggml_backend_cuda_context & ctx, const ggml_tensor 
 // The small dense Q8_0 shapes (shared expert gate/up [2560 -> 640], down [640 -> 2560], attention K/V [2560 -> 512])
 // are repacked to the k8 tile too, so they run on mmb_tq8_dense_kernel (F16) instead of mmb_dense_kernel<128,128>.
 static bool mmb_tq8_shape(const int64_t M, const int64_t K) {
+    // off: dense Q8_0 runs on MMQ now (see mmb_quant_type_dense_supported); kept for the IQ4_NL and trellis callers
+    if (true) return false;
     if (M % 128 != 0 || K % 64 != 0 || M > 65536 || K > 16384) return false;
     if (M >= 512 && K >= 512 && (M < 2560 || K < 2560)) return (K / 64) % 2 == 0;   // k8 only
     if (M < 2560 || K < 2560) return false;   // not vocab-sized (tied embeddings)
