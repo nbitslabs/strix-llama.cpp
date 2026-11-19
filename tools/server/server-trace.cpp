@@ -47,6 +47,10 @@ static int trace_classify(const char * name, int32_t & il) {
         il = 0;
         return TRACE_KIND_RESID;
     }
+    if (strcmp(name, "h_nextn") == 0) {
+        il = -2; // the last layer's l_last, renamed when it is handed to the MTP head; mapped to n_layer below
+        return TRACE_KIND_RESID;
+    }
     return TRACE_KIND_NONE;
 }
 
@@ -86,8 +90,11 @@ bool server_moe_trace::eval_cb(struct ggml_tensor * t, bool ask, void * user_dat
     auto * self = (server_moe_trace *) user_data;
 
     int32_t il = -1;
-    const int kind = trace_classify(ggml_get_name(t), il);
-    const bool wanted = kind == TRACE_KIND_RESID ? (self->want_block_update && il <= self->n_layer)
+    int kind = trace_classify(ggml_get_name(t), il);
+    if (kind == TRACE_KIND_RESID && il == -2) {
+        il = self->n_layer;
+    }
+    const bool wanted = kind == TRACE_KIND_RESID ? (self->want_block_update && il >= 0 && il <= self->n_layer)
                                                  : (kind != TRACE_KIND_NONE && il < self->n_layer);
 
     if (ask) {
@@ -176,6 +183,12 @@ void server_moe_trace::capture_resid(struct ggml_tensor * t, int32_t idx) {
     }
     const int32_t base = ubatch_base + (nt < ubatch_n_tok ? ubatch_n_tok - (int32_t) nt : 0);
     const int64_t t_first = nt > 16 ? nt - 1 : 0;
+    auto & R = resid[idx];
+    for (int32_t c : R.cols) {
+        if (c == base + (int32_t) t_first) {
+            return; // already captured (l_last and h_nextn can both name the last layer's residual)
+        }
+    }
 
     std::vector<uint8_t> buf(ggml_nbytes(t));
     ggml_backend_tensor_get(t, buf.data(), 0, buf.size());
@@ -187,7 +200,6 @@ void server_moe_trace::capture_resid(struct ggml_tensor * t, int32_t idx) {
             default:             return 0.0f;
         }
     };
-    auto & R = resid[idx];
     R.rows = n0*n1;
     for (int64_t tk = t_first; tk < nt; ++tk) {
         R.cols.push_back(base + (int32_t) tk);
