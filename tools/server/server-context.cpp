@@ -2142,16 +2142,13 @@ private:
 
         // opt-in MoE router trace: the eval callback is installed only for a traced request and removed again
         // by the next untraced launch (or by the final response), so normal requests keep the normal graph path
-        if (task.params.trace_block_update) {
-            send_error(task, "trace.block_update is not implemented yet, use trace.experts", ERROR_TYPE_NOT_SUPPORTED);
-            return false;
-        }
-        if (task.params.trace_experts) {
+        if (task.params.trace_any()) {
             if (slots.size() > 1) {
-                send_error(task, "trace.experts needs a single slot (-np 1): the capture is per context, not per slot", ERROR_TYPE_NOT_SUPPORTED);
+                send_error(task, "trace needs a single slot (-np 1): the capture is per context, not per slot", ERROR_TYPE_NOT_SUPPORTED);
                 return false;
             }
             moe_trace.init(llama_model_n_layer(model_tgt));
+            moe_trace.want_block_update = task.params.trace_block_update;
             moe_trace.install(ctx_tgt);
         } else if (moe_trace.installed) {
             moe_trace.remove(ctx_tgt);
@@ -2609,7 +2606,7 @@ private:
             res->prob_output = tkn; // copy the token probs
         }
 
-        if (slot.task->params.trace_experts && !tkn.trace.is_null()) {
+        if (slot.task->params.trace_any() && !tkn.trace.is_null()) {
             res->trace_output = tkn.trace;
         }
 
@@ -2692,7 +2689,7 @@ private:
             }
         }
 
-        if (slot.task->params.trace_experts) {
+        if (slot.task->params.trace_any()) {
             if (!slot.task->params.stream) {
                 // every generated token, including the ones of a stop word (they were generated, so they were routed)
                 res->trace_output = json::array();
@@ -5159,8 +5156,8 @@ private:
             result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
             result.prob         = 1.0f; // TODO: set it here instead of doing inside populate_token_probs
 
-            if (slot.task->params.trace_experts) {
-                result.trace = moe_trace.token_json(tok_idx, id);
+            if (slot.task->params.trace_any()) {
+                result.trace = moe_trace.token_json(tok_idx, id, slot.task->params.trace_experts, slot.task->params.trace_block_update);
             }
 
             if (slot.task->params.sampling.n_probs > 0) {
@@ -5308,8 +5305,8 @@ private:
                 result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
                 result.prob         = 1.0f; // set later
 
-                if (slot.task->params.trace_experts) {
-                    result.trace = moe_trace.token_json(spec_i_batch[i], ids[i]);
+                if (slot.task->params.trace_any()) {
+                    result.trace = moe_trace.token_json(spec_i_batch[i], ids[i], slot.task->params.trace_experts, slot.task->params.trace_block_update);
                 }
 
                 // post_sampling_probs is not supported with speculative decoding

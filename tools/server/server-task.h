@@ -81,7 +81,8 @@ struct task_params {
     bool cache_prompt    = true; // remember the prompt to avoid reprocessing all prompt
     bool return_tokens   = false;
     bool trace_experts      = false; // opt-in per-token MoE router trace (request field "trace": {"experts": true})
-    bool trace_block_update = false; // reserved: per-block residual update size, not implemented yet
+    bool trace_block_update = false; // per-block residual update size ("trace": {"block_update": true})
+    bool trace_any() const { return trace_experts || trace_block_update; }
     bool return_progress = false;
 
     int32_t sse_ping_interval = 30; // seconds between SSE comment pings while the stream stays silent, -1 disables
