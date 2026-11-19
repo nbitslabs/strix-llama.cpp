@@ -8,6 +8,11 @@
 
 #define MMQ_DP4A_MAX_BATCH_SIZE 64 // Max. batch size to use for dp4a MMQ kernels when FP16 tensor cores are available.
 #define MMQ_ITER_K             256
+// PROBES (experiment branch only, wrong math where marked): unrolled K slices in the IQ3_S mma loop,
+// no scale epilogue, weight tile loaded once per block
+#define MMQ_PROBE_UNROLL_K 0
+#define MMQ_PROBE_NOSCALE  0
+#define MMQ_PROBE_NOLOAD   0
 #define MMQ_ITER_K_FP4         512
 #define MMQ_NWARPS               8
 
@@ -1105,7 +1110,9 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
     }
 
     for (int kb0 = kb0_start; kb0 < kb0_stop; kb0 += blocks_per_iter) {
-        load_tiles(x, x_gate, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
+        if (!(MMQ_PROBE_NOLOAD && type == GGML_TYPE_IQ3_S) || kb0 == kb0_start) {   // PROBE: stale weight tile after the first step
+            load_tiles(x, x_gate, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
+        }
         {
             const int * by0 = y + ncols_y * (kb0 * qk / ne_block) * sz;
 #pragma unroll

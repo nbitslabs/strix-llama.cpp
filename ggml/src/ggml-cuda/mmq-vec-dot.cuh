@@ -169,12 +169,7 @@ static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma(
 
     const int i0 = (warp_i / ntx) * rows_per_warp;
 
-// ROCm 10.1 clang 24: rolling K clears gfx1151 J32 spills (2026-10).
-// Remove this limit when the compiler keeps WMMA results within each K slice.
-#if defined(RDNA3_5)
-#pragma clang loop unroll(disable)
-#endif
-    for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QI8_0) {
+    auto k_step = [&](const int k01) {
         const int k0 = k00 + k01;
 
         tile_A A[ntx];
@@ -205,9 +200,29 @@ static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma(
                 for (int l = 0; l < tile_C::ne; ++l) {
                     const int i = i0 + n*tile_A::I + tile_C::get_i(l);
                     const float dA = x_df[i*sram_stride + k0/QI8_0];
-                    sum[(j0/tile_C::J + n)*tile_C::ne + l] += C.x[l]*dA*dB;
+                    if constexpr (MMQ_PROBE_NOSCALE && type == GGML_TYPE_IQ3_S) {   // PROBE: wrong math, no scale epilogue
+                        sum[(j0/tile_C::J + n)*tile_C::ne + l] += (float) C.x[l];
+                    } else {
+                        sum[(j0/tile_C::J + n)*tile_C::ne + l] += C.x[l]*dA*dB;
+                    }
                 }
             }
+        }
+    };
+
+    if constexpr (MMQ_PROBE_UNROLL_K && type == GGML_TYPE_IQ3_S && J >= 64) {   // the K slices unrolled (fragment loads can overlap)
+#pragma unroll
+        for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QI8_0) {
+            k_step(k01);
+        }
+    } else {
+// ROCm 10.1 clang 24: rolling K clears gfx1151 J32 spills (2026-10).
+// Remove this limit when the compiler keeps WMMA results within each K slice.
+#if defined(RDNA3_5)
+#pragma clang loop unroll(disable)
+#endif
+        for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QI8_0) {
+            k_step(k01);
         }
     }
 #else
