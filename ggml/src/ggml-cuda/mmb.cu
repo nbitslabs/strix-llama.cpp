@@ -2226,11 +2226,10 @@ static void mmb_tq8_launch(const uint8_t * wt, const uint16_t * xhp, float * D, 
     // GM=8: [K=6144, M=2560] 1770 vs 2157 / 1934, [K=2560, M=10240] 2661 vs - / 2861.
     const int GM = 1 << 20;
     if (f16) {
-        if (k7) mmb_tq8_dense_kernel<128, 256, 64, 64, 1, 72, true><<<(M / 128) * ((T + 255) / 256), MMB_NT, 0, stream>>>(wt, xhp, D, Dh, store_f32, M, K, T, GM);
+        if (k7 && false) mmb_tq8_dense_kernel<128, 256, 64, 64, 1, 72, true><<<(M / 128) * ((T + 255) / 256), MMB_NT, 0, stream>>>(wt, xhp, D, Dh, store_f32, M, K, T, GM);
         else {
-            // up to 1024 tokens: 128x64 tiles when the 128x128 grid has fewer than 160 blocks,
-            // e.g. M=2560 at T=512 (80 blocks): +1.3% pp512 on gfx1151; 320 is worse at ub1024. Same per-output sums.
-            if (T <= 1024 && (M / 128) * ((T + 127) / 128) < 160)
+            // experiment: the 128x64 tile at every T (27 KiB LDS, 2 CTAs per CU). Same per-output sums.
+            if (true)
                 mmb_tq8_dense_kernel<128, 64, 64, 16, 2, 72, true><<<(M / 128) * ((T + 63) / 64), MMB_NT, 0, stream>>>(wt, xhp, D, Dh, store_f32, M, K, T, GM);
             else
                 mmb_tq8_dense_kernel<128, 128, 64, 32, 2, 72, true><<<(M / 128) * ((T + 127) / 128), MMB_NT, 0, stream>>>(wt, xhp, D, Dh, store_f32, M, K, T, GM);
