@@ -2120,6 +2120,42 @@ bool llama_context::adapters_lora_are_same(llama_adapter_lora ** adapters, size_
     return true;
 }
 
+bool llama_context::set_intervention(const llama_intervene_item * items, size_t n_items, llama_pos from_pos) {
+    if (n_items == 0 || items == nullptr) {
+        intv.reset();
+        return true;
+    }
+    const auto & hp = model.hparams;
+    std::vector<int32_t> n_banned(hp.n_layer(), 0);
+    auto spec = std::make_shared<llama_intervention>();
+    spec->from_pos = std::max<llama_pos>(from_pos, 0);
+    for (size_t i = 0; i < n_items; ++i) {
+        const auto & it = items[i];
+        if (it.block < 0 || it.block >= (int32_t) hp.n_layer()) {
+            return false;
+        }
+        switch (it.mode) {
+            case LLAMA_INTERVENE_EXPERT_ZERO:
+            case LLAMA_INTERVENE_EXPERT_MASK:
+                if (hp.n_expert == 0 || it.expert < 0 || it.expert >= (int32_t) hp.n_expert) {
+                    return false;
+                }
+                // the router must keep enough experts to fill its top-k
+                if (it.mode == LLAMA_INTERVENE_EXPERT_MASK && ++n_banned[it.block] > (int32_t) (hp.n_expert - hp.n_expert_used(it.block))) {
+                    return false;
+                }
+                break;
+            case LLAMA_INTERVENE_BLOCK_SKIP:
+                break;
+            default:
+                return false;
+        }
+        spec->items.push_back(it);
+    }
+    intv = std::move(spec); // a new object, so no graph built for the previous set is reused
+    return true;
+}
+
 bool llama_context::set_adapter_cvec(
             const float * data,
                  size_t   len,
@@ -3530,6 +3566,7 @@ llm_graph_params llama_context::graph_params(
         /*.h_nextn_src   =*/ supports_state_row() ? cparams.ctx_state_src->get_h_nextn_dev() : nullptr,
         /*.samplers    =*/ sampling.samplers,
         /*.mtp_draft   =*/ mtp_draft.get(),
+        /*.intv        =*/ intv,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
@@ -5602,6 +5639,14 @@ int32_t llama_set_adapters_lora(
     ctx->set_adapters_lora(adapters, n_adapters, scales);
 
     return 0;
+}
+
+int32_t llama_set_intervention(
+        llama_context * ctx,
+        const llama_intervene_item * items,
+        size_t n_items,
+        llama_pos from_pos) {
+    return ctx->set_intervention(items, n_items, from_pos) ? 0 : -1;
 }
 
 int32_t llama_set_adapter_cvec(

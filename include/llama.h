@@ -799,6 +799,27 @@ extern "C" {
                          int32_t   il_start,
                          int32_t   il_end);
 
+    // Research knock-outs, applied to every token at position >= from_pos of the following decodes (models whose graph
+    // supports them: the MoE router of build_moe_ffn, block skip in qwen4exp). n_items = 0 clears them; a context without
+    // knock-outs builds exactly the normal graph. Returns -1 (and keeps the previous set) on an out-of-range item.
+    enum llama_intervene_mode {
+        LLAMA_INTERVENE_EXPERT_ZERO = 0, // the router still selects the expert, its output is discarded
+        LLAMA_INTERVENE_EXPERT_MASK = 1, // the router may not select the expert, so the next-ranked one runs
+        LLAMA_INTERVENE_BLOCK_SKIP  = 2, // the block writes nothing to the residual (expert is ignored)
+    };
+
+    struct llama_intervene_item {
+        int32_t block;
+        int32_t expert;
+        int32_t mode; // enum llama_intervene_mode
+    };
+
+    LLAMA_API int32_t llama_set_intervention(
+            struct llama_context * ctx,
+            const struct llama_intervene_item * items,
+                          size_t   n_items,
+                       llama_pos   from_pos);
+
     //
     // Memory
     //

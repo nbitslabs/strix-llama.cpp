@@ -154,6 +154,8 @@ struct llama_context {
                 int32_t   il_start,
                 int32_t   il_end);
 
+    bool set_intervention(const llama_intervene_item * items, size_t n_items, llama_pos from_pos);
+
     // process a single ubatch with a specific graph type
     // if memory_context is provided, it will be applied first to the context's memory
     // ret contains the status of the graph computation
@@ -351,6 +353,8 @@ private:
 
     llama_adapter_cvec_ptr  cvec;
     llama_adapter_loras_ptr loras;
+
+    std::shared_ptr<const llama_intervention> intv; // research knock-outs, nullptr = none (the normal graph)
 
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 

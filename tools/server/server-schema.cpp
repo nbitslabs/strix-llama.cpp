@@ -201,6 +201,12 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
             ->set_desc("Also return, per generated token, the logit-lens change each block makes to the sampled token and its top candidates (the logprobs set, else the top 5)"))
         ->set_desc("Opt-in per-token model internals; absent or all false leaves the response unchanged"));
 
+    add((new field_json("intervene"))
+        ->set_desc("Research knock-outs: {\"experts\": [{\"block\", \"expert\", \"mode\": \"zero\"|\"mask\"}], \"blocks\": [{\"block\", \"mode\": \"skip\"}], \"from_pos\": n} (single slot only, no prompt cache reuse)")
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            parse_intervene(data.at("intervene"), ctx.params.intervene, ctx.params.intervene_from_pos);
+        }));
+
     //
     // Speculative decoding params
     //

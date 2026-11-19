@@ -10,7 +10,9 @@
 #include "speculative.h"
 #include "server-common.h"
 
+#include <algorithm>
 #include <sstream>
+#include <tuple>
 
 //
 // task_params
@@ -356,6 +358,9 @@ json server_task_result_cmpl_final::to_json_non_oaicompat() {
     if (!stream && !trace_output.is_null()) {
         res["trace"] = trace_output;
     }
+    if (!intervene_applied.is_null()) {
+        res["intervene_applied"] = intervene_applied;
+    }
     return response_fields.empty() ? res : json_get_nested_values(response_fields, res);
 }
 
@@ -419,6 +424,9 @@ json server_task_result_cmpl_final::to_json_oaicompat() {
     if (!stream && !trace_output.is_null()) {
         res["trace"] = trace_output;
     }
+    if (!intervene_applied.is_null()) {
+        res["intervene_applied"] = intervene_applied;
+    }
     return res;
 }
 
@@ -469,6 +477,9 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat() {
 
     if (!stream && !trace_output.is_null()) {
         res["trace"] = trace_output;
+    }
+    if (!intervene_applied.is_null()) {
+        res["intervene_applied"] = intervene_applied;
     }
     return res;
 }
@@ -1761,4 +1772,111 @@ json server_task_result_get_lora::to_json() {
 
 json server_task_result_apply_lora::to_json() {
     return json {{ "success", true }};
+}
+
+static const char * intervene_mode_name(int32_t mode) {
+    switch (mode) {
+        case LLAMA_INTERVENE_EXPERT_ZERO: return "zero";
+        case LLAMA_INTERVENE_EXPERT_MASK: return "mask";
+        case LLAMA_INTERVENE_BLOCK_SKIP:  return "skip";
+        default:                          return "?";
+    }
+}
+
+json intervene_to_json(const std::vector<llama_intervene_item> & items, int32_t from_pos) {
+    json experts = json::array();
+    json blocks  = json::array();
+    for (const auto & it : items) {
+        if (it.mode == LLAMA_INTERVENE_BLOCK_SKIP) {
+            blocks.push_back({{"block", it.block}, {"mode", intervene_mode_name(it.mode)}});
+        } else {
+            experts.push_back({{"block", it.block}, {"expert", it.expert}, {"mode", intervene_mode_name(it.mode)}});
+        }
+    }
+    return json {
+        {"experts",  experts},
+        {"blocks",   blocks},
+        {"from_pos", from_pos},
+    };
+}
+
+void parse_intervene(const json & v, std::vector<llama_intervene_item> & items, int32_t & from_pos) {
+    auto fail = [](const std::string & msg) {
+        throw std::invalid_argument("intervene: " + msg);
+    };
+    auto get_int = [&](const json & o, const char * key, const char * where) -> int32_t {
+        if (!o.contains(key) || !o.at(key).is_number_integer()) {
+            fail(std::string(where) + " needs an integer \"" + key + "\"");
+        }
+        const int64_t x = o.at(key).get<int64_t>();
+        if (x < 0 || x > INT32_MAX) {
+            fail(std::string(where) + " \"" + key + "\" out of range");
+        }
+        return (int32_t) x;
+    };
+    auto check_keys = [&](const json & o, std::initializer_list<const char *> keys, const char * where) {
+        for (const auto & [k, _] : o.items()) {
+            bool known = false;
+            for (const char * key : keys) {
+                known = known || k == key;
+            }
+            if (!known) {
+                fail(std::string("unknown key \"") + k + "\" in " + where);
+            }
+        }
+    };
+
+    if (!v.is_object()) {
+        fail("must be an object");
+    }
+    check_keys(v, {"experts", "blocks", "from_pos"}, "intervene"); // "directions" is not implemented: rejected here
+    items.clear();
+    from_pos = v.contains("from_pos") ? get_int(v, "from_pos", "intervene") : 0;
+    if (v.contains("experts")) {
+        if (!v.at("experts").is_array()) {
+            fail("\"experts\" must be an array");
+        }
+        for (const auto & e : v.at("experts")) {
+            if (!e.is_object()) {
+                fail("each experts entry must be an object");
+            }
+            check_keys(e, {"block", "expert", "mode"}, "an experts entry");
+            const std::string mode = e.contains("mode") && e.at("mode").is_string() ? e.at("mode").get<std::string>() : "";
+            if (mode != "zero" && mode != "mask") {
+                fail("experts mode must be \"zero\" or \"mask\"");
+            }
+            items.push_back({ get_int(e, "block", "an experts entry"), get_int(e, "expert", "an experts entry"),
+                              mode == "zero" ? LLAMA_INTERVENE_EXPERT_ZERO : LLAMA_INTERVENE_EXPERT_MASK });
+        }
+    }
+    if (v.contains("blocks")) {
+        if (!v.at("blocks").is_array()) {
+            fail("\"blocks\" must be an array");
+        }
+        for (const auto & b : v.at("blocks")) {
+            if (!b.is_object()) {
+                fail("each blocks entry must be an object");
+            }
+            check_keys(b, {"block", "mode"}, "a blocks entry");
+            if (!b.contains("mode") || b.at("mode") != "skip") {
+                fail("blocks mode must be \"skip\"");
+            }
+            items.push_back({ get_int(b, "block", "a blocks entry"), -1, LLAMA_INTERVENE_BLOCK_SKIP });
+        }
+    }
+    // normalised: sorted, duplicates dropped; zero and mask of the same expert would both apply, so reject that
+    std::sort(items.begin(), items.end(), [](const llama_intervene_item & a, const llama_intervene_item & b) {
+        return std::tie(a.mode, a.block, a.expert) < std::tie(b.mode, b.block, b.expert);
+    });
+    items.erase(std::unique(items.begin(), items.end(), [](const llama_intervene_item & a, const llama_intervene_item & b) {
+        return a.mode == b.mode && a.block == b.block && a.expert == b.expert;
+    }), items.end());
+    for (size_t i = 0; i < items.size(); ++i) {
+        for (size_t j = i + 1; j < items.size(); ++j) {
+            if (items[i].mode != LLAMA_INTERVENE_BLOCK_SKIP && items[j].mode != LLAMA_INTERVENE_BLOCK_SKIP &&
+                items[i].block == items[j].block && items[i].expert == items[j].expert) {
+                fail("expert " + std::to_string(items[i].expert) + " of block " + std::to_string(items[i].block) + " is both zeroed and masked");
+            }
+        }
+    }
 }

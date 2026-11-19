@@ -133,6 +133,41 @@ static llm_attn_mask build_attn_inp_attn_mask(
 
 // impl
 
+void llm_graph_input_intervene::set_input(const llama_ubatch * ubatch) {
+    std::vector<float> data;
+    for (const auto & m : masks) {
+        const int64_t ne0 = m.t->ne[0];
+        const int64_t nt  = m.t->ne[1];
+        GGML_ASSERT(nt == (int64_t) ubatch->n_tokens);
+        const float off = m.mode == LLAMA_INTERVENE_EXPERT_MASK ? 0.0f : 1.0f; // value of an untouched entry
+        const float on  = m.mode == LLAMA_INTERVENE_EXPERT_MASK ? -INFINITY : 0.0f;
+        data.assign(ne0*nt, off);
+        for (int64_t j = 0; j < nt; ++j) {
+            if (ubatch->pos[j] < spec->from_pos) {
+                continue;
+            }
+            for (const auto & it : spec->items) {
+                if (it.block != m.il || it.mode != m.mode) {
+                    continue;
+                }
+                const int64_t e = m.mode == LLAMA_INTERVENE_BLOCK_SKIP ? 0 : it.expert;
+                if (e >= 0 && e < ne0) {
+                    data[j*ne0 + e] = on;
+                }
+            }
+        }
+        ggml_backend_tensor_set(m.t, data.data(), 0, data.size()*sizeof(float));
+    }
+}
+
+bool llm_graph_input_intervene::can_reuse(const llm_graph_params & params) {
+    bool res = params.intv == spec;
+    for (const auto & m : masks) {
+        res = res && m.t->ne[1] == (int64_t) params.ubatch.n_tokens;
+    }
+    return res;
+}
+
 void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
     if (ubatch->token) {
         const int64_t n_tokens = ubatch->n_tokens;
@@ -1652,6 +1687,8 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     cb_func          (params.cb),
     res              (params.res),
     vsub             (params.vsub),
+    intv             (params.intv.get()),
+    intv_ref         (params.intv),
     ctx0             (res->get_ctx()),
     gf               (res->get_gf()) {
         res->set_params(params);
@@ -1669,6 +1706,29 @@ ggml_tensor * llm_graph_context::build_cvec(
          ggml_tensor * cur,
                  int   il) const {
     return cvec->apply_to(ctx0, cur, il);
+}
+
+ggml_tensor * llm_graph_context::build_intv_mask(int il, int32_t mode) const {
+    if (!intv) {
+        return nullptr;
+    }
+    bool any = false;
+    for (const auto & it : intv->items) {
+        any = any || (it.block == il && it.mode == mode);
+    }
+    if (!any) {
+        return nullptr;
+    }
+    if (!inp_intv) {
+        auto inp = std::make_unique<llm_graph_input_intervene>(intv_ref);
+        inp_intv = inp.get();
+        res->add_input(std::move(inp));
+    }
+    ggml_tensor * t = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, mode == LLAMA_INTERVENE_BLOCK_SKIP ? 1 : n_expert, n_tokens);
+    ggml_format_name(t, "intv_mask-%d-%d", mode, il);
+    ggml_set_input(t);
+    inp_intv->masks.push_back({ il, mode, t });
+    return t;
 }
 
 ggml_tensor * llm_graph_context::build_hadamard_input(
@@ -2424,6 +2484,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(logits, "ffn_moe_logits_biased", il);
     }
 
+    // knock-out "mask": -inf router logits for the banned experts, so top-k takes the next-ranked ones
+    if (ggml_tensor * ban = build_intv_mask(il, LLAMA_INTERVENE_EXPERT_MASK); ban && ban->ne[0] == logits->ne[0]) {
+        logits = ggml_add(ctx0, logits, ban);
+        cb(logits, "ffn_moe_logits_intv", il);
+    }
+
     ggml_tensor * probs = nullptr;
     switch (gating_op) {
         case LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX:
@@ -2544,6 +2610,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     if (w_scale != 0.0f && w_scale != 1.0f) {
         weights = ggml_scale(ctx0, weights, w_scale);
         cb(weights, "ffn_moe_weights_scaled", il);
+    }
+
+    // knock-out "zero": the router's choice stands, the weight of a zeroed expert becomes 0 (no renormalisation)
+    if (ggml_tensor * keep = build_intv_mask(il, LLAMA_INTERVENE_EXPERT_ZERO); keep && keep->ne[0] == n_expert) {
+        keep = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, keep, 1, n_expert, n_tokens), selected_experts); // [1, n_expert_used, n_tokens]
+        weights = ggml_mul(ctx0, weights, keep);
+        cb(weights, "ffn_moe_weights_intv", il);
     }
 
     //call early so that topk-moe can be used

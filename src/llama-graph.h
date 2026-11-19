@@ -116,6 +116,12 @@ struct llama_mtp_draft_vocab;
 // llm_graph_input
 //
 
+// llama_set_intervention: the knock-outs of a context, shared with the graphs built for them
+struct llama_intervention {
+    llama_pos from_pos = 0;
+    std::vector<llama_intervene_item> items;
+};
+
 class llm_graph_input_i {
 public:
     llm_graph_input_i() {
@@ -141,6 +147,26 @@ protected:
 };
 
 using llm_graph_input_ptr = std::unique_ptr<llm_graph_input_i>;
+
+// per-token knock-out masks of llama_set_intervention: 0 before from_pos, the knock-out from it on
+class llm_graph_input_intervene : public llm_graph_input_i {
+public:
+    llm_graph_input_intervene(std::shared_ptr<const llama_intervention> spec) : spec(std::move(spec)) {}
+    virtual ~llm_graph_input_intervene() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override;
+
+    struct mask {
+        int32_t       il;
+        int32_t       mode; // EXPERT_MASK: F32 [n_expert, n_tokens] router bias 0 / -inf, EXPERT_ZERO: F32 [n_expert, n_tokens]
+        ggml_tensor * t;    // expert keep 1 / 0, BLOCK_SKIP: F32 [1, n_tokens] block keep 1 / 0
+    };
+    std::vector<mask> masks;
+
+    std::shared_ptr<const llama_intervention> spec;
+};
 
 class llm_graph_input_embd : public llm_graph_input_i {
 public:
@@ -861,6 +887,8 @@ struct llm_graph_params {
 
     const llama_mtp_draft_vocab * mtp_draft; // MTP draft vocabulary subset of the context (nullptr = full vocabulary)
 
+    std::shared_ptr<const llama_intervention> intv; // knock-outs, nullptr = none (llama_set_intervention)
+
     static bool samplers_equal(
           const std::map<llama_seq_id, llama_sampler *> & lhs,
           const std::map<llama_seq_id, llama_sampler *> & rhs) {
@@ -963,6 +991,7 @@ struct llm_graph_params {
             model == other.model &&
             gtype == other.gtype &&
             cvec  == other.cvec  &&
+            intv  == other.intv  &&
             loras == other.loras &&
             cross == other.cross;
     }
@@ -1158,6 +1187,10 @@ struct llm_graph_context {
 
     const llama_vocab_subset * vsub;
 
+    const llama_intervention * intv; // nullptr = no knock-outs: nothing below adds a node
+    std::shared_ptr<const llama_intervention> intv_ref;
+    mutable llm_graph_input_intervene * inp_intv = nullptr;
+
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;
 
@@ -1183,6 +1216,9 @@ struct llm_graph_context {
     ggml_tensor * build_cvec(
              ggml_tensor * cur,
                      int   il) const;
+
+    // the llama_set_intervention mask of block il for mode (see llm_graph_input_intervene), nullptr when none applies
+    ggml_tensor * build_intv_mask(int il, int32_t mode) const;
 
     // apply the activation-side transform of a Hadamard-folded weight, if any
     ggml_tensor * build_hadamard_input(

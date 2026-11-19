@@ -2946,7 +2946,8 @@ struct llama_model_qwen4exp : public llama_model_base {
              llm_graph_input_rs * inp,
                     ggml_tensor * emb,
                     ggml_tensor * hidden,
-                            int   il);
+                            int   il,
+                    ggml_tensor * keep = nullptr);
 
         // returns pair of qkv, z
         std::pair<ggml_tensor *, ggml_tensor *> build_qkvz(

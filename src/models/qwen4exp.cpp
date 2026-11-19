@@ -1030,8 +1030,11 @@ llama_model_qwen4exp::graph::graph(const llm_graph_params & params) :
             ggml_build_forward_expand(gf, res->t_layer_inp[il]);
         }
 
+        // knock-out "skip" (llama_set_intervention): [1, T] keep, 0 where block il must not write to the residual
+        ggml_tensor * keep = build_intv_mask(il, LLAMA_INTERVENE_BLOCK_SKIP);
+
         if (hparams.is_ple(il)) {
-            res_hc = build_ple(inp->get_recr(), ple_emb, res_hc, il);
+            res_hc = build_ple(inp->get_recr(), ple_emb, res_hc, il, keep);
         }
 
         ggml_tensor * inject = nullptr;
@@ -1078,8 +1081,14 @@ llama_model_qwen4exp::graph::graph(const llm_graph_params & params) :
             res_hc = ggml_reshape_2d(ctx0, res_hc, n_embd*hc, res_hc->ne[2]);
             res_hc = ggml_get_rows(ctx0, res_hc, inp_out_ids);
             res_hc = ggml_reshape_3d(ctx0, res_hc, n_embd, hc, res_hc->ne[1]);
+            if (keep) {
+                keep = ggml_get_rows(ctx0, keep, inp_out_ids);
+            }
         }
 
+        if (keep) {
+            cur = ggml_mul(ctx0, cur, ggml_reshape_4d(ctx0, keep, 1, cur->ne[1], cur->ne[2], cur->ne[3]));
+        }
         res_hc = build_hc_combine(res_hc, cur, inject, il);
 
         cur = build_hc_mix(res_hc,
@@ -1093,6 +1102,9 @@ llama_model_qwen4exp::graph::graph(const llm_graph_params & params) :
         cur = build_layer_ffn(cur, il);
         cb(cur, "ffn_out", il);
 
+        if (keep) {
+            cur = ggml_mul(ctx0, cur, ggml_reshape_4d(ctx0, keep, 1, cur->ne[1], cur->ne[2], cur->ne[3]));
+        }
         res_hc = build_hc_combine(res_hc, cur, inject, il);
 
         // "l_last" is the layer output name that build_cvec and imatrix look for
@@ -2911,7 +2923,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_ple(
         llm_graph_input_rs * inp,
         ggml_tensor *        emb,
         ggml_tensor *        hidden,
-        int                  il) {
+        int                  il,
+        ggml_tensor *        keep) {
     const int64_t hc      = hparams.dsv4_hc_mult;
     const int64_t hc_dim  = hc * n_embd;
 
@@ -2999,5 +3012,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_ple(
     conv_out = ggml_reshape_3d(ctx0, ggml_cont(ctx0, conv_out), n_embd, hc, n_tokens);
     cb(conv_out, "ple_conv_out", il);
 
-    return ggml_add(ctx0, hidden, ggml_add(ctx0, gated, conv_out));
+    ggml_tensor * delta = ggml_add(ctx0, gated, conv_out);
+    if (keep) {
+        // knock-out "skip": the [1, T] block keep scales what this layer adds to the residual
+        delta = ggml_mul(ctx0, delta, ggml_reshape_3d(ctx0, keep, 1, 1, n_tokens));
+    }
+    return ggml_add(ctx0, hidden, delta);
 }

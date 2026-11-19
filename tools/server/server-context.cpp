@@ -262,6 +262,41 @@ struct server_batch {
     }
 };
 
+// "intervene" ranges against the model: block < n_layer, expert < expert_count, and the router keeps enough unmasked
+// experts to fill its top-k (throws std::invalid_argument, answered with a 400)
+static void validate_intervene(const llama_model * model, const std::vector<llama_intervene_item> & items) {
+    auto meta_int = [&](const char * suffix) -> int64_t {
+        char arch[64] = {0};
+        char buf[64]  = {0};
+        if (llama_model_meta_val_str(model, "general.architecture", arch, sizeof(arch)) <= 0 ||
+            llama_model_meta_val_str(model, (std::string(arch) + suffix).c_str(), buf, sizeof(buf)) <= 0) {
+            return 0;
+        }
+        return strtoll(buf, nullptr, 10);
+    };
+    const int32_t n_layer  = llama_model_n_layer(model);
+    const int64_t n_expert = meta_int(".expert_count");
+    const int64_t n_used   = meta_int(".expert_used_count");
+    std::map<int32_t, int64_t> n_masked;
+    for (const auto & it : items) {
+        if (it.block >= n_layer) {
+            throw std::invalid_argument(string_format("intervene: block %d out of range (the model has %d blocks)", it.block, n_layer));
+        }
+        if (it.mode == LLAMA_INTERVENE_BLOCK_SKIP) {
+            continue;
+        }
+        if (n_expert <= 0) {
+            throw std::invalid_argument("intervene: experts given, but the model has no MoE router");
+        }
+        if (it.expert >= n_expert) {
+            throw std::invalid_argument(string_format("intervene: expert %d out of range (the model has %" PRId64 " experts)", it.expert, n_expert));
+        }
+        if (it.mode == LLAMA_INTERVENE_EXPERT_MASK && ++n_masked[it.block] > n_expert - n_used) {
+            throw std::invalid_argument(string_format("intervene: block %d masks more experts than the router can spare", it.block));
+        }
+    }
+}
+
 struct server_slot {
     int id;
 
@@ -2162,6 +2197,21 @@ private:
             moe_trace.remove(ctx_tgt);
         }
 
+        // knock-outs: set on ctx_tgt for this request only (a request without them clears them, so its graph is the
+        // normal one); such a task is stateless, so it neither reuses the prompt cache nor leaves its KV state behind
+        if (task.params.intervene_any()) {
+            if (slots.size() > 1) {
+                send_error(task, "intervene needs a single slot (-np 1): the knock-outs are per context, not per slot", ERROR_TYPE_NOT_SUPPORTED);
+                return false;
+            }
+            if (llama_set_intervention(ctx_tgt, task.params.intervene.data(), task.params.intervene.size(), task.params.intervene_from_pos) != 0) {
+                send_error(task, "intervene: an item is out of range for this model", ERROR_TYPE_INVALID_REQUEST);
+                return false;
+            }
+        } else {
+            llama_set_intervention(ctx_tgt, nullptr, 0, 0);
+        }
+
         // per-request lora if given, otherwise the global config
         auto task_loras = task.params.lora.empty() ? params_base.lora_adapters : construct_lora_list(task.params.lora);
         if (!are_lora_equal(task_loras, slot.lora)) {
@@ -2751,6 +2801,10 @@ private:
                 }
             }
             moe_trace.remove(ctx_tgt);
+        }
+
+        if (slot.task->params.intervene_any()) {
+            res->intervene_applied = intervene_to_json(slot.task->params.intervene, slot.task->params.intervene_from_pos);
         }
 
         res->generation_params = slot.task->params; // copy the parameters
@@ -5980,6 +6034,9 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     params,
                     meta->logit_bias_eog,
                     data);
+            if (task.params.intervene_any()) {
+                validate_intervene(ctx_server.model_tgt, task.params.intervene);
+            }
 
             task.apply_chat_session(chat_session);
 

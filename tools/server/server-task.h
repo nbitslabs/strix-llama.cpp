@@ -84,6 +84,9 @@ struct task_params {
     bool trace_block_update = false; // per-block residual update size ("trace": {"block_update": true})
     bool trace_block_push   = false; // per-block logit-lens push of the sampled and top tokens ("trace": {"block_push": true})
     bool trace_any() const { return trace_experts || trace_block_update || trace_block_push; }
+    std::vector<llama_intervene_item> intervene; // research knock-outs ("intervene"), normalised; empty = none
+    int32_t intervene_from_pos = 0;
+    bool intervene_any() const { return !intervene.empty(); }
     bool return_progress = false;
 
     int32_t sse_ping_interval = 30; // seconds between SSE comment pings while the stream stays silent, -1 disables
@@ -347,8 +350,9 @@ struct server_task {
     }
 
     // embedding and rerank tasks always process their whole prompt, their state is never reused
+    // a request with knock-outs ("intervene") too: its KV state is not the model's, so it neither reuses nor leaves any
     bool is_stateless() const {
-        return type == SERVER_TASK_TYPE_EMBEDDING || type == SERVER_TASK_TYPE_RERANK;
+        return type == SERVER_TASK_TYPE_EMBEDDING || type == SERVER_TASK_TYPE_RERANK || params.intervene_any();
     }
 };
 
@@ -436,6 +440,7 @@ struct server_task_result_cmpl_final : server_task_result {
     bool post_sampling_probs;
     std::vector<completion_token_output> probs_output;
     json trace_output; // non-streaming traced request: array with one entry per generated token
+    json intervene_applied; // the knock-outs this request ran with (null without "intervene")
     std::vector<std::string>  response_fields;
 
     task_params generation_params;
@@ -716,3 +721,7 @@ struct server_task_result_router : server_task_result {
         return new server_task_result_router(*this);
     }
 };
+
+// "intervene" request field <-> knock-out items (throws std::invalid_argument with an "intervene: ..." message)
+void parse_intervene(const json & v, std::vector<llama_intervene_item> & items, int32_t & from_pos);
+json intervene_to_json(const std::vector<llama_intervene_item> & items, int32_t from_pos);
