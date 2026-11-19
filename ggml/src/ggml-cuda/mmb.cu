@@ -23,7 +23,8 @@ constexpr int MMB_BK = 64, MMB_NT = 256, MMB_LDS_STRIDE = MMB_BK + 8;
 #define MMB_PROBE_NODECODE 0
 #define MMB_PROBE_NOB      0
 #define MMB_PROBE_NOWMMA   0
-#define MMB_PROBE_NOSCATTER 0   // the activation gather reads contiguous rows 0..BN-1 instead of the routed rows (same volume)
+#define MMB_PROBE_NOSCATTER 0
+#define MMB_PROBE_NOBLOAD   0   // no activation global loads; the B tile is filled with a register pattern (WMMA stays live)   // the activation gather reads contiguous rows 0..BN-1 instead of the routed rows (same volume)
 
 __device__ __forceinline__ uint16_t mmb_f2bf(float f) { uint32_t u = __float_as_uint(f); u += 0x7fffu + ((u >> 16) & 1u); return (uint16_t)(u >> 16); }
 // same RNE as mmb_f2bf on both halves, the two high halves joined by one v_perm_b32 (no mov_b16 + and_or). Unguarded
@@ -846,7 +847,10 @@ __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ W
                 } else { gm[i] = um[i] = g0[i] = g1[i] = u0[i] = u1[i] = make_uint4(0,0,0,0); }
             }
         }
-        if constexpr (!DEFER_B && !(MMB_PROBE_NOB && PROBE_T)) {
+        if constexpr (MMB_PROBE_NOBLOAD && PROBE_T) {
+#pragma unroll
+            for (int i = 0; i < B_ITEMS; ++i) { const int c = tid + i * MMB_NT; bst[i] = make_uint4(0x3c003c00u + c, 0x3c003c00u ^ ks, 0x3c00u, (uint32_t) brow[i]); }
+        } else if constexpr (!DEFER_B && !(MMB_PROBE_NOB && PROBE_T)) {
 #pragma unroll
             for (int i = 0; i < B_ITEMS; ++i) {
                 const int c = tid + i * MMB_NT; const int off = (c & 7) * 8;
