@@ -670,6 +670,106 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     }
 }
 
+// Register-staged IQ3_S tile loader (RDNA3.5 software prefetch) in three stages so both dependent memory rounds of
+//     ggml_cuda_mmq_load_tiles_iq3_s overlap the WMMA work: 1. the raw block words into registers, 2. the iq3s_grid
+//     lookups on them, 3. the sign application and the shared-memory stores, identical values and layout.
+template <ggml_type type, int J, bool fallback> struct ggml_cuda_mmq_x_regs_iq3_s {
+    static constexpr int warp_size       = WARP_SIZE;
+    static constexpr int nwarps          = ggml_cuda_mmq_get_nthreads(type, J, fallback, GGML_PREC_Q8) / warp_size;
+    static constexpr int I               = ggml_cuda_mmq_get_I(type, J, fallback, GGML_PREC_Q8);
+    static constexpr int threads_per_row = (MMQ_ITER_K / (4 * QR3_S)) / 2;
+    static constexpr int nrows           = warp_size / threads_per_row;
+    static constexpr int rows_per_step   = nrows*nwarps;
+    static constexpr int n_steps         = (I + rows_per_step - 1) / rows_per_step;
+
+    int2 qs[n_steps];
+    int  qh[n_steps];
+    int  signs[n_steps];
+    int  ls[n_steps];
+    half d[n_steps];
+    int2 grid[n_steps][QR3_S];
+};
+
+template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_iq3_s_regs(
+        const char * __restrict__ x, ggml_cuda_mmq_x_regs_iq3_s<type, J, fallback> & r, const int kbx0, const int i_max, const int stride) {
+    using R = ggml_cuda_mmq_x_regs_iq3_s<type, J, fallback>;
+    static_assert(R::warp_size == ggml_cuda_get_physical_warp_size(), "register-staged IQ3_S loader assumes wave32");
+
+    const int kqsx = threadIdx.x % R::threads_per_row;
+
+#pragma unroll
+    for (int s = 0; s < R::n_steps; ++s) {
+        int i = s*R::rows_per_step + threadIdx.y*R::nrows + threadIdx.x/R::threads_per_row;
+
+        if (fallback) {
+            i = min(i, i_max);
+        }
+
+        const block_iq3_s * bxi = (const block_iq3_s *) x + kbx0 + i*stride;
+
+        r.qs[s]    = make_int2(get_int_b2(bxi->qs, 2*kqsx+0), get_int_b2(bxi->qs, 2*kqsx+1));
+        r.qh[s]    = bxi->qh[kqsx];
+        r.signs[s] = get_int_b2(bxi->signs, kqsx);
+        r.ls[s]    = 1 + 2*((bxi->scales[kqsx/2] >> (((2*kqsx) << 1) & 0x04)) & 0x0F);
+        r.d[s]     = bxi->d;
+    }
+}
+
+template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_decode_tiles_iq3_s_regs(
+        ggml_cuda_mmq_x_regs_iq3_s<type, J, fallback> & r) {
+    using R = ggml_cuda_mmq_x_regs_iq3_s<type, J, fallback>;
+
+#pragma unroll
+    for (int s = 0; s < R::n_steps; ++s) {
+        const uint8_t * qs = (const uint8_t *) &r.qs[s];
+        const int       qh = r.qh[s];
+
+#pragma unroll
+        for (int l = 0; l < QR3_S; ++l) {
+            r.grid[s][l] = make_int2(
+                iq3s_grid[qs[2*l+0] | ((qh << (8 - 2*l)) & 0x100)],
+                iq3s_grid[qs[2*l+1] | ((qh << (7 - 2*l)) & 0x100)]);
+        }
+    }
+}
+
+template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_store_tiles_iq3_s_regs(
+        const ggml_cuda_mmq_x_regs_iq3_s<type, J, fallback> & r, int * __restrict__ x_tile, const int i_max) {
+    using R = ggml_cuda_mmq_x_regs_iq3_s<type, J, fallback>;
+    constexpr int sram_stride = ggml_cuda_mmq_get_sram_stride(type, J, fallback, GGML_PREC_Q8);
+
+    int   * x_qs = (int   *)  x_tile;
+    float * x_df = (float *) (x_qs + MMQ_TILE_NE_K*2);
+
+    const int kqsx = threadIdx.x % R::threads_per_row;
+
+#pragma unroll
+    for (int s = 0; s < R::n_steps; ++s) {
+        int i = s*R::rows_per_step + threadIdx.y*R::nrows + threadIdx.x/R::threads_per_row;
+
+        if (fallback) {
+            i = min(i, i_max);
+        }
+
+        const uint8_t * signs_packed_8 = (const uint8_t *) &r.signs[s];
+
+#pragma unroll
+        for (int l = 0; l < QR3_S; ++l) {
+            const int signs0 = __vcmpne4(((signs_packed_8[l] & 0x03) << 7) | ((signs_packed_8[l] & 0x0C) << 21), 0x00000000);
+            const int signs1 = __vcmpne4(((signs_packed_8[l] & 0x30) << 3) | ((signs_packed_8[l] & 0xC0) << 17), 0x00000000);
+
+            const int grid_l = __vsub4(r.grid[s][l].x ^ signs0, signs0);
+            const int grid_h = __vsub4(r.grid[s][l].y ^ signs1, signs1);
+
+            x_qs[i*sram_stride + 8*kqsx + (2*l+0)] = grid_l;
+            x_qs[i*sram_stride + 8*kqsx + (2*l+1)] = grid_h;
+        }
+
+        const float d = r.d[s];
+        x_df[i*sram_stride + kqsx] = r.ls[s]*d;
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_q2_K(

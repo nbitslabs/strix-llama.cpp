@@ -974,6 +974,7 @@ static constexpr __host__ __device__ bool ggml_cuda_mmq_use_prefetch() {
 #if defined(RDNA3_5) && defined(AMD_WMMA_AVAILABLE)
     // Whitelist: the extra registers cause spills in several other specializations.
     return (type == GGML_TYPE_Q8_0    && (J == 48 || J == 128) && !fallback) ||
+           (type == GGML_TYPE_IQ3_S   &&  J == 128              && !fallback) ||
            (type == GGML_TYPE_Q6_K    &&  J == 32)              ||
            (type == GGML_TYPE_Q5_K    &&  J == 32)              ||
            (type == GGML_TYPE_Q4_K    &&  J == 48)              ||
@@ -1031,12 +1032,15 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
         constexpr int  nthreads  = nwarps*warp_size;
         constexpr int  y_regs_n  = (J*MMQ_TILE_Y_K + nthreads - 1) / nthreads;
         constexpr bool x_regs_ok = type == GGML_TYPE_Q8_0;
+        constexpr bool x_regs_i3 = type == GGML_TYPE_IQ3_S;   // three-stage weight prefetch, see ggml_cuda_mmq_x_regs_iq3_s
         const     int  tid       = threadIdx.y*warp_size + threadIdx.x;
 
         int yr0[y_regs_n];
         int yr1[y_regs_n];
         ggml_cuda_mmq_x_regs_q8_0<type, J, fallback> xr;
+        ggml_cuda_mmq_x_regs_iq3_s<type, J, fallback> xr3;
         GGML_UNUSED(xr);
+        GGML_UNUSED(xr3);
 
         auto load_y_regs = [&](int (&yr)[y_regs_n], const int kb0, const int half) {
             const int * by0 = y + ncols_y * ((kb0 * qk / ne_block) * sz + half*sz);
@@ -1056,6 +1060,10 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
             if constexpr (x_regs_ok) {
                 ggml_cuda_mmq_load_tiles_q8_0_regs<type, J, fallback>(x, xr, offset_x + kb0_start, tile_x_max_i, stride_row_x);
             }
+            if constexpr (x_regs_i3) {
+                ggml_cuda_mmq_load_tiles_iq3_s_regs<type, J, fallback>(x, xr3, offset_x + kb0_start, tile_x_max_i, stride_row_x);
+                ggml_cuda_mmq_decode_tiles_iq3_s_regs<type, J, fallback>(xr3);
+            }
             load_y_regs(yr0, kb0_start, 0);
             load_y_regs(yr1, kb0_start, 1);
         }
@@ -1065,6 +1073,8 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
             if constexpr (x_regs_ok) {
                 ggml_cuda_mmq_store_tiles_q8_0_regs<type, J, fallback>(xr, tile_x, tile_x_max_i);
+            } else if constexpr (x_regs_i3) {
+                ggml_cuda_mmq_store_tiles_iq3_s_regs<type, J, fallback>(xr3, tile_x, tile_x_max_i);
             } else {
                 load_tiles(x, x_gate, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
             }
@@ -1076,6 +1086,9 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
                 if constexpr (x_regs_ok) {
                     ggml_cuda_mmq_load_tiles_q8_0_regs<type, J, fallback>(x, xr, offset_x + kb0 + blocks_per_iter, tile_x_max_i, stride_row_x);
                 }
+                if constexpr (x_regs_i3) {
+                    ggml_cuda_mmq_load_tiles_iq3_s_regs<type, J, fallback>(x, xr3, offset_x + kb0 + blocks_per_iter, tile_x_max_i, stride_row_x);
+                }
                 load_y_regs(yr0, kb0 + blocks_per_iter, 0);
             }
 
@@ -1084,6 +1097,12 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
             __syncthreads();
 
             store_y_regs(yr1);
+
+            if constexpr (x_regs_i3) {
+                if (has_next) {   // the raw words landed during the first half; the grid lookups overlap the second
+                    ggml_cuda_mmq_decode_tiles_iq3_s_regs<type, J, fallback>(xr3);
+                }
+            }
 
             __syncthreads();
 
