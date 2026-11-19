@@ -1707,36 +1707,43 @@ __global__ void mmb_build_desc2(const int32_t * __restrict__ bounds, uint32_t * 
 }
 
 __global__ void mmb_build_desc3(const int32_t * __restrict__ bounds, uint32_t * __restrict__ desc_small,
-        uint32_t * __restrict__ desc_mid, uint32_t * __restrict__ desc_big,
-        const int E, const int nsmall_max, const int nmid_max, const int nbig_max, const int BN_BIG, const int BN_SMALL) {
-    __shared__ int su[1024], sm[1024], sb[1024];
+        uint32_t * __restrict__ desc_mid, uint32_t * __restrict__ desc_big, uint32_t * __restrict__ desc_wide,
+        const int E, const int nsmall_max, const int nmid_max, const int nbig_max, const int nwide_max, const int BN_BIG, const int BN_SMALL, const int BN_WIDE) {
+    __shared__ int su[1024], sm[1024], sb[1024], sw[1024];
     const int e = threadIdx.x;
+    for (int i = e; i < nwide_max;  i += blockDim.x) desc_wide[i]  = UINT32_MAX;
     for (int i = e; i < nbig_max;   i += blockDim.x) desc_big[i]   = UINT32_MAX;
     for (int i = e; i < nmid_max;   i += blockDim.x) desc_mid[i]   = UINT32_MAX;
     for (int i = e; i < nsmall_max; i += blockDim.x) desc_small[i] = UINT32_MAX;
     int cnt = (e < E) ? bounds[e + 1] - bounds[e] : 0;
-    // Full big tiles, then the remainder on the narrower tiers instead of a mostly padded big tile: a mid (BN_BIG/2)
-    // tile up to half a big tile, mid + small up to that plus a small tile, a big tile only when it would be > 3/4 full.
-    // The tier kernels address rows as bounds[e] + jt * BN_tier, so jt_mid = 2 nb and jt_small = 4 nb (+ 2 behind a mid).
-    const int BN_MID = BN_BIG / 2;
-    const int nb  = cnt / BN_BIG, rem = cnt - nb * BN_BIG;
+    // Widest tile first: 2 BN_BIG token tiles (the weights are decoded once per tile, so a wide tile halves the expert's
+    // weight traffic), a last wide tile when it would be > 3/4 full; then one big tile; then the remainder on the narrower
+    // tiers instead of a mostly padded big tile: a mid (BN_BIG/2) tile up to half a big tile, mid + small up to that plus
+    // a small tile, a big tile only when it would be > 3/4 full. The tier kernels address rows as bounds[e] + jt * BN_tier,
+    // so every jt is expressed in the tier's own width.
+    const int BN_MID = BN_BIG / 2;   // BN_WIDE == 0: no wide tier (types whose big tier has no 2 BN_BIG kernel)
+    int nw = BN_WIDE > 0 ? cnt / BN_WIDE : 0, r = cnt - nw * BN_WIDE;
+    if (BN_WIDE > 0 && r > BN_WIDE - BN_BIG / 2) { nw += 1; r = 0; }
+    const int nb0 = r / BN_BIG, rem = r - nb0 * BN_BIG;
     const int ts  = (rem > 0 && (rem <= BN_SMALL || (rem > BN_MID && rem <= BN_MID + BN_SMALL))) ? 1 : 0;
     const int tm  = (rem > BN_SMALL && rem <= BN_MID + BN_SMALL) ? 1 : 0;
-    const int tb  = nb + (rem > BN_MID + BN_SMALL ? 1 : 0);
-    const int jts = (BN_BIG / BN_SMALL) * nb + (rem > BN_MID ? BN_MID / BN_SMALL : 0);
-    const int jtm = (BN_BIG / BN_MID) * nb;
-    su[e] = ts; sm[e] = tm; sb[e] = tb;
+    const int tb  = nb0 + (rem > BN_MID + BN_SMALL ? 1 : 0);
+    const int nb  = nw * 2;   // big-tile units covered by the wide tiles
+    const int jts = (BN_BIG / BN_SMALL) * (nb + nb0) + (rem > BN_MID ? BN_MID / BN_SMALL : 0);
+    const int jtm = (BN_BIG / BN_MID) * (nb + nb0);
+    su[e] = ts; sm[e] = tm; sb[e] = tb; sw[e] = nw;
     __syncthreads();
     for (int off = 1; off < 1024; off <<= 1) {
-        const int vu = (e >= off) ? su[e - off] : 0, vm = (e >= off) ? sm[e - off] : 0, vb = (e >= off) ? sb[e - off] : 0;
+        const int vu = (e >= off) ? su[e - off] : 0, vm = (e >= off) ? sm[e - off] : 0, vb = (e >= off) ? sb[e - off] : 0, vw = (e >= off) ? sw[e - off] : 0;
         __syncthreads();
-        su[e] += vu; sm[e] += vm; sb[e] += vb;
+        su[e] += vu; sm[e] += vm; sb[e] += vb; sw[e] += vw;
         __syncthreads();
     }
-    const int bu = su[e] - ts, bm = sm[e] - tm, bb = sb[e] - tb;
+    const int bu = su[e] - ts, bm = sm[e] - tm, bb = sb[e] - tb, bw = sw[e] - nw;
     if (ts && bu < nsmall_max) desc_small[bu] = (uint32_t)e | ((uint32_t)jts << 16);
     if (tm && bm < nmid_max)   desc_mid[bm]   = (uint32_t)e | ((uint32_t)jtm << 16);
-    for (int jt = 0; jt < tb; ++jt) { const int idx = bb + jt; if (idx < nbig_max)   desc_big[idx]   = (uint32_t)e | ((uint32_t)jt << 16); }
+    for (int jt = 0; jt < tb; ++jt) { const int idx = bb + jt; if (idx < nbig_max)  desc_big[idx]  = (uint32_t)e | ((uint32_t)(nb + jt) << 16); }
+    for (int jt = 0; jt < nw; ++jt) { const int idx = bw + jt; if (idx < nwide_max) desc_wide[idx] = (uint32_t)e | ((uint32_t)jt << 16); }
 }
 
 } // namespace
@@ -4187,10 +4194,13 @@ void ggml_cuda_mul_mat_id_mmb_glu(ggml_backend_cuda_context & ctx, const ggml_te
     auto & desc_big = mmb_hold_alloc<uint32_t>(ctx, nbig_cap);
     auto & desc_small = mmb_hold_alloc<uint32_t>(ctx, nsmall_max);
     auto & desc_mid = mmb_hold_alloc<uint32_t>(ctx, glk_this ? 1 : E + 1);
+    const bool wide_ok = !glk_this && !mmb_glu_ms_type(32 + (int) gw->type);   // the ms big tier has no 2 BN_sel kernel
+    const int nwide_cap = wide_ok ? n_rows / (2 * BN_sel) + E + 2 : 1;
+    auto & desc_wide = mmb_hold_alloc<uint32_t>(ctx, nwide_cap);
     if (glk_this)
         mmb_build_desc2<<<1, 1024, 0, stream>>>(bounds.get(), desc_big.get(), desc_small.get(), E, nbig_cap, nsmall_max, BN_rt, BN_SMALL, THRESH);
     else
-        mmb_build_desc3<<<1, 1024, 0, stream>>>(bounds.get(), desc_small.get(), desc_mid.get(), desc_big.get(), E, nsmall_max, E + 1, nbig_cap, BN_rt, BN_SMALL);
+        mmb_build_desc3<<<1, 1024, 0, stream>>>(bounds.get(), desc_small.get(), desc_mid.get(), desc_big.get(), desc_wide.get(), E, nsmall_max, E + 1, nbig_cap, nwide_cap, BN_rt, BN_SMALL, wide_ok ? 2 * BN_sel : 0);
     uint16_t * Dh = ggml_cuda_mmb_slot_reserve(ctx, 2, glu, (size_t) n_rows * M);
     const bool store_f32 = !ggml_cuda_mmb_is_bf16_only(ctx, glu);
     const uint8_t * Wg = (const uint8_t *) gw->data, * Wu = (const uint8_t *) uw->data; float * D = (float *) glu->data; const size_t eb = (size_t) gw->nb[2];
@@ -4218,6 +4228,13 @@ void ggml_cuda_mul_mat_id_mmb_glu(ggml_backend_cuda_context & ctx, const ggml_te
                     }
                     CUDA_CHECK(cudaGetLastError());
                     return;
+                }
+            }
+            // wide tier (2 x BN_sel tokens) for the experts with more than one big tile of rows: half the weight decodes
+            if constexpr (!mmb_glu_ms_type(WT)) {
+                if (wide_ok) {
+                    static_assert(BN_sel == 128, "the wide GLU tile is 64 x 256");
+                    mmb_routed_glu_kernel<64, 2 * BN_sel, 32, 64, WT><<<dim3((M + 63) / 64, nwide_cap), MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_wide.get(), M, K);
                 }
             }
             const dim3 gbig((M + 63) / 64, nbig_max);
