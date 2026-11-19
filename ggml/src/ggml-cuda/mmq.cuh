@@ -978,7 +978,8 @@ static constexpr __host__ __device__ bool ggml_cuda_mmq_use_prefetch() {
            (type == GGML_TYPE_Q5_K    &&  J == 32)              ||
            (type == GGML_TYPE_Q4_K    &&  J == 48)              ||
            (type == GGML_TYPE_IQ2_S   &&  J == 128)             ||
-           (type == GGML_TYPE_IQ3_XXS &&  J == 128);
+           (type == GGML_TYPE_IQ3_XXS &&  J == 128)             ||
+           (type == GGML_TYPE_IQ3_S   &&  J == 128 && !fallback);
 #else
     return false;
 #endif // defined(RDNA3_5) && defined(AMD_WMMA_AVAILABLE)
