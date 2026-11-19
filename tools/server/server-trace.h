@@ -12,6 +12,8 @@
 //   shared_expert_gate_sigmoid-<il>  the shared expert's gate (one value per token), when the model has one
 // With "block_update": true the wide residual after every layer (l_last-<il>, hc_init before layer 0) is captured as
 // well, and each token reports ||l_last[il] - l_last[il-1]|| / ||l_last[il-1]|| over all streams at its column.
+// With "block_push": true the same residuals go through a logit lens on the CPU (the model's own final hc mixer, then
+// the output rows of the sampled token and its top candidates), and each token reports the per-block logit change.
 // A generated token's entry is the column its logits came from, so the trace also works under speculative
 // decoding, where one verify batch yields several accepted tokens.
 
@@ -20,12 +22,31 @@
 #include "llama.h"
 #include "ggml.h"
 
+#include <unordered_map>
 #include <vector>
 
 struct server_moe_trace {
     int32_t n_layer   = 0;
+    int64_t n_embd    = 0;
+    int64_t n_stream  = 1;     // hyper-connection streams of the wide residual (n_embd_out / n_embd)
     bool    installed = false;
     bool    want_block_update = false; // capture the residuals too (more data per layer, slower while on)
+
+    // logit lens for block_push: the final hc mixer weights (dequantized once) and the output rows asked for so far
+    struct lens_weights {
+        bool    ready  = false;
+        int64_t n_embd = 0;
+        int64_t hc     = 0;
+        int64_t hc_lr  = 0;
+        float   eps    = 1e-6f;
+        float   out_scale = 1.0f;
+        std::vector<float> norm; // [hc][n_embd]
+        std::vector<float> down; // [hc_lr][hc*n_embd]
+        std::vector<float> up;   // [hc*n_embd][hc_lr]
+        struct ggml_tensor * output = nullptr;
+        std::unordered_map<llama_token, std::vector<float>> rows;
+    };
+    lens_weights lens;
 
     struct layer_capture {
         int32_t n_used_experts = 0;
@@ -49,7 +70,7 @@ struct server_moe_trace {
     int32_t ubatch_base   = 0;            // batch column of the current ubatch's first token (from hc_init)
     int32_t ubatch_n_tok  = 0;
 
-    void init(int32_t n_layer);
+    void init(int32_t n_layer, int64_t n_embd, int64_t n_stream);
 
     // install/remove the eval callback on the target context
     void install(llama_context * ctx);
@@ -62,9 +83,19 @@ struct server_moe_trace {
     // col is the token's column in the decoded batch; experts selects the moe part, block_update the residual part
     json token_json(int32_t col, llama_token tok, bool experts, bool block_update) const;
 
+    // load the final mixer weights of the model (once); false with an error message when the model has none
+    bool lens_prepare(const llama_model * model, std::string & err);
+
+    // {"token_ids": [...], "base": [...], "push": [[n_layer] per token], "logit": [...]} for the residuals at col;
+    // tokens[0] is the sampled token, logits[t] the engine's final logit of tokens[t] (NaN when not available)
+    json block_push_json(int32_t col, const std::vector<llama_token> & tokens, const std::vector<float> & logits);
+
     static bool eval_cb(struct ggml_tensor * t, bool ask, void * user_data);
 
 private:
     void capture(struct ggml_tensor * t, int kind, int32_t il);
     void capture_resid(struct ggml_tensor * t, int32_t idx);
+    const std::vector<float> & lens_row(llama_token tok);
+    // the lens hidden state (final hc mixer output, [n_embd]) of one wide residual [hc][n_embd]
+    void lens_hidden(const float * x, std::vector<float> & out) const;
 };

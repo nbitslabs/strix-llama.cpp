@@ -2147,8 +2147,16 @@ private:
                 send_error(task, "trace needs a single slot (-np 1): the capture is per context, not per slot", ERROR_TYPE_NOT_SUPPORTED);
                 return false;
             }
-            moe_trace.init(llama_model_n_layer(model_tgt));
-            moe_trace.want_block_update = task.params.trace_block_update;
+            if (task.params.trace_block_push) {
+                std::string err;
+                if (!moe_trace.lens_prepare(model_tgt, err)) {
+                    send_error(task, err, ERROR_TYPE_NOT_SUPPORTED);
+                    return false;
+                }
+            }
+            moe_trace.init(llama_model_n_layer(model_tgt), llama_model_n_embd(model_tgt),
+                           llama_model_n_embd_out(model_tgt) / std::max(1, llama_model_n_embd(model_tgt)));
+            moe_trace.want_block_update = task.params.trace_block_update || task.params.trace_block_push; // the lens reads the same residuals
             moe_trace.install(ctx_tgt);
         } else if (moe_trace.installed) {
             moe_trace.remove(ctx_tgt);
@@ -2487,6 +2495,51 @@ private:
         SLT_DBG(slot, "n_gen = %d, n_remaining = %d, next token: %5d '%s'\n", (int) slot.stats.n_gen, slot.n_remaining(), result.tok, token_str.c_str());
 
         return slot.has_next_token; // continue
+    }
+
+    // trace.block_push: the sampled token, then the logprobs top set when the request has one, else the top 5 logits
+    void trace_block_push(completion_token_output & result, int idx) {
+        std::vector<llama_token> toks = { result.tok };
+        if (!result.probs.empty()) {
+            for (const auto & p : result.probs) {
+                if (p.tok != result.tok) {
+                    toks.push_back(p.tok);
+                }
+            }
+        } else {
+            for (const auto & c : get_token_probabilities(ctx_tgt, idx, 6)) {
+                if (c.id != result.tok && toks.size() < 6) {
+                    toks.push_back(c.id);
+                }
+            }
+        }
+        if (result.trace.is_null()) {
+            result.trace = json { {"token_id", result.tok} };
+        }
+        // final logits: the full row, or the backend sampler's candidate subset when it ran on the device
+        const float       * logits = llama_get_logits_ith(ctx_tgt, idx);
+        const llama_token * cand   = llama_get_sampled_candidates_ith(ctx_tgt, idx);
+        const int           n_cand = llama_get_sampled_logits_count_ith(ctx_tgt, idx);
+        std::vector<float> fin(toks.size(), NAN);
+        for (size_t t = 0; t < toks.size() && logits; ++t) {
+            if (!cand) {
+                fin[t] = toks[t] < n_cand ? logits[toks[t]] : NAN;
+                continue;
+            }
+            for (int i = 0; i < n_cand; ++i) {
+                if (cand[i] == toks[t]) {
+                    fin[t] = logits[i];
+                    break;
+                }
+            }
+        }
+        result.trace["block_push"]     = moe_trace.block_push_json(idx, toks, fin);
+        result.trace["block_push_def"] = "lens(r) = output_head(final_hc_mixer(r)) for token t, where final_hc_mixer is the model's own head path "
+            "(per-stream RMSNorm with output_hc_norm, gate = output_hc_up(silu(output_hc_down(.)/hc)), mean over the hc streams of "
+            "norm * sigmoid(gate)) applied to the full wide residual [n_embd x hc]; base[t] = lens(hc_init), push[t][il] = "
+            "lens(l_last[il]) - lens(l_last[il-1]) (block 0 against hc_init), computed on the CPU in f32/f64 from the captured "
+            "residuals and dequantized output rows; logit[t] = the engine's final logit, so base + sum(push) - logit is the lens "
+            "reconstruction error; token_ids[0] is the sampled token, the rest the logprobs set or else the top 5 by final logit";
     }
 
     void populate_token_probs(const server_slot & slot, completion_token_output & result, bool post_sampling, bool special, int idx) const {
@@ -5164,6 +5217,10 @@ private:
                 populate_token_probs(slot, result, slot.task->params.post_sampling_probs, params_base.special, tok_idx);
             }
 
+            if (slot.task->params.trace_block_push) {
+                trace_block_push(result, tok_idx);
+            }
+
             if (!process_token(result, slot)) {
                 // release slot because of stop condition
                 slot.print_timings();
@@ -5312,6 +5369,10 @@ private:
                 // post_sampling_probs is not supported with speculative decoding
                 if (slot.task->params.sampling.n_probs > 0 && !slot.task->params.post_sampling_probs) {
                     populate_token_probs(slot, result, false, params_base.special, spec_i_batch[i]);
+                }
+
+                if (slot.task->params.trace_block_push) {
+                    trace_block_push(result, spec_i_batch[i]);
                 }
 
                 slot.stats.n_gen += 1;

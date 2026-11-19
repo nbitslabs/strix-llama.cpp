@@ -81,7 +81,7 @@ json task_params::to_json(bool only_metrics) const {
             {"speculative.types",         common_speculative_type_name_str(speculative.types)},
             {"timings_per_token",         timings_per_token},
             {"post_sampling_probs",       post_sampling_probs},
-            {"trace",                     json{{"experts", trace_experts}, {"block_update", trace_block_update}}},
+            {"trace",                     json{{"experts", trace_experts}, {"block_update", trace_block_update}, {"block_push", trace_block_push}}},
             {"backend_sampling",          sampling.backend_sampling},
             {"lora",                      lora},
         };
@@ -141,7 +141,7 @@ json task_params::to_json(bool only_metrics) const {
         {"speculative.types",         common_speculative_type_name_str(speculative.types)},
         {"timings_per_token",         timings_per_token},
         {"post_sampling_probs",       post_sampling_probs},
-        {"trace",                     json{{"experts", trace_experts}, {"block_update", trace_block_update}}},
+        {"trace",                     json{{"experts", trace_experts}, {"block_update", trace_block_update}, {"block_push", trace_block_push}}},
         {"backend_sampling",          sampling.backend_sampling},
         {"lora",                      lora},
     };

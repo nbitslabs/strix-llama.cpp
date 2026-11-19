@@ -197,6 +197,8 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
             ->set_desc("Return the MoE router choices per generated token: expert ids, gate weights and the shared-expert gate of every layer (single slot only)"))
         ->add_subfield((new field_bool("block_update", params.trace_block_update))
             ->set_desc("Also return, per generated token and layer, the relative L2 change of the residual stream across the block (slower while on)"))
+        ->add_subfield((new field_bool("block_push", params.trace_block_push))
+            ->set_desc("Also return, per generated token, the logit-lens change each block makes to the sampled token and its top candidates (the logprobs set, else the top 5)"))
         ->set_desc("Opt-in per-token model internals; absent or all false leaves the response unchanged"));
 
     //

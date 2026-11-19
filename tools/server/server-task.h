@@ -82,7 +82,8 @@ struct task_params {
     bool return_tokens   = false;
     bool trace_experts      = false; // opt-in per-token MoE router trace (request field "trace": {"experts": true})
     bool trace_block_update = false; // per-block residual update size ("trace": {"block_update": true})
-    bool trace_any() const { return trace_experts || trace_block_update; }
+    bool trace_block_push   = false; // per-block logit-lens push of the sampled and top tokens ("trace": {"block_push": true})
+    bool trace_any() const { return trace_experts || trace_block_update || trace_block_push; }
     bool return_progress = false;
 
     int32_t sse_ping_interval = 30; // seconds between SSE comment pings while the stream stays silent, -1 disables

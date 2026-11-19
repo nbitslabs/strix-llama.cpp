@@ -5,6 +5,10 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <string>
+
+// libllama's (unexported in llama.h) name -> weight map, the same one tests/test-quantize-stats reads
+const std::vector<std::pair<std::string, ggml_tensor *>> & llama_internal_get_tensor_map(const llama_model * model);
 
 enum trace_kind {
     TRACE_KIND_NONE = 0,
@@ -54,8 +58,10 @@ static int trace_classify(const char * name, int32_t & il) {
     return TRACE_KIND_NONE;
 }
 
-void server_moe_trace::init(int32_t n_layer_) {
-    n_layer = n_layer_;
+void server_moe_trace::init(int32_t n_layer_, int64_t n_embd_, int64_t n_stream_) {
+    n_layer  = n_layer_;
+    n_embd   = n_embd_;
+    n_stream = n_stream_ > 0 ? n_stream_ : 1;
     layers.assign(n_layer, layer_capture());
     resid.assign(n_layer + 1, resid_capture());
 }
@@ -73,6 +79,7 @@ void server_moe_trace::remove(llama_context * ctx) {
         installed = false;
     }
     begin_batch();
+    lens.rows.clear(); // the dequantized output rows are per request; the mixer weights stay
 }
 
 void server_moe_trace::begin_batch() {
@@ -166,16 +173,21 @@ void server_moe_trace::capture(struct ggml_tensor * t, int kind, int32_t il) {
     }
 }
 
-// residual [n_embd, n_streams, n_tokens] (or [n_embd, n_tokens]); a long ubatch keeps only its last column, which is
-// the one a token sampled after a prompt needs. The last layer may hold only the output rows (trailing tokens).
+// residual [n_embd, n_streams, n_tokens] (or flat [n_embd*n_streams, n_tokens]); the stream count comes from the model,
+// since a one-token [n_embd, n_streams, 1] has the same dims as [n_embd, n_tokens]. A long ubatch keeps only its last
+// column, which is the one a token sampled after a prompt needs. The last layer may hold only the output rows.
 void server_moe_trace::capture_resid(struct ggml_tensor * t, int32_t idx) {
     if (t->ne[3] != 1 || idx < 0 || idx >= (int32_t) resid.size()) {
         return;
     }
-    const bool    three = t->ne[2] != 1 || ggml_n_dims(t) == 3;
-    const int64_t n0 = t->ne[0];
-    const int64_t n1 = three ? t->ne[1] : 1;
+    const bool three = t->ne[0] == n_embd && t->ne[1] == n_stream;
+    if (!three && t->ne[0] != n_embd*n_stream) {
+        return; // not a wide residual of this model
+    }
+    const int64_t n0 = three ? t->ne[0] : n_embd;
+    const int64_t n1 = n_stream;
     const int64_t nt = three ? t->ne[2] : t->ne[1];
+    const size_t  nb_str = three ? t->nb[1] : n_embd*t->nb[0];
     const size_t  nb_tok = three ? t->nb[2] : t->nb[1];
     if (idx == 0) {
         ubatch_base += ubatch_n_tok;
@@ -205,7 +217,7 @@ void server_moe_trace::capture_resid(struct ggml_tensor * t, int32_t idx) {
         R.cols.push_back(base + (int32_t) tk);
         for (int64_t j = 0; j < n1; ++j) {
             for (int64_t i = 0; i < n0; ++i) {
-                R.data.push_back(to_f32(buf.data() + i*t->nb[0] + j*(three ? t->nb[1] : 0) + tk*nb_tok));
+                R.data.push_back(to_f32(buf.data() + i*t->nb[0] + j*nb_str + tk*nb_tok));
             }
         }
     }
@@ -275,5 +287,186 @@ json server_moe_trace::token_json(int32_t col, llama_token tok, bool experts, bo
         moe.push_back(entry);
     }
     out["moe"] = moe;
+    return out;
+}
+
+// a whole weight (or rows [r0, r0 + nr) of it) as f32, through the type's dequantizer
+static bool trace_tensor_f32(const ggml_tensor * t, int64_t r0, int64_t nr, std::vector<float> & out) {
+    if (t == nullptr || !ggml_is_contiguous(t) || r0 < 0 || r0 + nr > ggml_nrows(t)) {
+        return false;
+    }
+    const auto * tt = ggml_get_type_traits(t->type);
+    if (t->type != GGML_TYPE_F32 && tt->to_float == nullptr) {
+        return false;
+    }
+    const int64_t ne0 = t->ne[0];
+    std::vector<uint8_t> buf(t->nb[1]*nr);
+    ggml_backend_tensor_get(const_cast<ggml_tensor *>(t), buf.data(), t->nb[1]*r0, buf.size());
+    out.resize(ne0*nr);
+    if (t->type == GGML_TYPE_F32) {
+        memcpy(out.data(), buf.data(), out.size()*sizeof(float));
+    } else {
+        for (int64_t r = 0; r < nr; ++r) {
+            tt->to_float(buf.data() + r*t->nb[1], out.data() + r*ne0, ne0);
+        }
+    }
+    return true;
+}
+
+bool server_moe_trace::lens_prepare(const llama_model * model, std::string & err) {
+    if (lens.ready) {
+        return true;
+    }
+    auto find = [&](const char * name) -> ggml_tensor * {
+        for (const auto & [n, t] : llama_internal_get_tensor_map(model)) {
+            if (n == name) {
+                return t;
+            }
+        }
+        return nullptr;
+    };
+    ggml_tensor * norm = find("output_hc_norm.weight");
+    ggml_tensor * down = find("output_hc_down.weight");
+    ggml_tensor * up   = find("output_hc_up.weight");
+    ggml_tensor * out  = find("output.weight");
+    if (out == nullptr) {
+        out = find("token_embd.weight"); // tied head
+    }
+    if (!norm || !down || !up || !out) {
+        err = "block_push needs a hyper-connection model with a final hc mixer (output_hc_norm/down/up) and an output head";
+        return false;
+    }
+    lens_weights L;
+    L.n_embd = llama_model_n_embd(model);
+    L.hc     = ggml_nelements(norm) / L.n_embd;
+    L.hc_lr  = down->ne[1];
+    if (L.hc < 1 || down->ne[0] != L.hc*L.n_embd || up->ne[0] != L.hc_lr || up->ne[1] != L.hc*L.n_embd || out->ne[0] != L.n_embd) {
+        err = "block_push: unexpected shapes of the final hc mixer or output head";
+        return false;
+    }
+    if (!trace_tensor_f32(norm, 0, ggml_nrows(norm), L.norm) || !trace_tensor_f32(down, 0, down->ne[1], L.down) ||
+        !trace_tensor_f32(up, 0, up->ne[1], L.up)) {
+        err = "block_push: cannot dequantize the final hc mixer weights";
+        return false;
+    }
+    if (ggml_tensor * os = find("output.scale"); os && ggml_nelements(os) == 1) {
+        std::vector<float> v;
+        if (trace_tensor_f32(os, 0, 1, v)) {
+            L.out_scale = v[0];
+        }
+    }
+    char arch[64] = {0};
+    char buf[64]  = {0};
+    if (llama_model_meta_val_str(model, "general.architecture", arch, sizeof(arch)) > 0 &&
+        llama_model_meta_val_str(model, (std::string(arch) + ".attention.layer_norm_rms_epsilon").c_str(), buf, sizeof(buf)) > 0) {
+        L.eps = strtof(buf, nullptr);
+    }
+    L.output = out;
+    L.ready  = true;
+    lens = std::move(L);
+    return true;
+}
+
+const std::vector<float> & server_moe_trace::lens_row(llama_token tok) {
+    auto it = lens.rows.find(tok);
+    if (it == lens.rows.end()) {
+        std::vector<float> row;
+        if (!trace_tensor_f32(lens.output, tok, 1, row)) {
+            row.assign(lens.n_embd, 0.0f);
+        }
+        it = lens.rows.emplace(tok, std::move(row)).first;
+    }
+    return it->second;
+}
+
+// same math as build_hc_mix(x, hc_head_norm, hc_head_down, hc_head_up) with no inject (the unfused f32 path):
+// per-stream RMSNorm * gamma, gate = up(silu(down(xn)/hc)), out = mean over streams of xn * sigmoid(gate)
+void server_moe_trace::lens_hidden(const float * x, std::vector<float> & out) const {
+    const int64_t n = lens.n_embd, hc = lens.hc, hd = hc*n, lr = lens.hc_lr;
+    std::vector<float> xn(hd);
+    for (int64_t j = 0; j < hc; ++j) {
+        double ss = 0.0;
+        for (int64_t i = 0; i < n; ++i) {
+            ss += (double) x[j*n + i]*x[j*n + i];
+        }
+        const float scale = 1.0f/std::sqrt((float) (ss/n) + lens.eps);
+        for (int64_t i = 0; i < n; ++i) {
+            xn[j*n + i] = x[j*n + i]*scale*lens.norm[j*n + i];
+        }
+    }
+    std::vector<float> lo(lr);
+    for (int64_t r = 0; r < lr; ++r) {
+        double acc = 0.0;
+        const float * w = lens.down.data() + r*hd;
+        for (int64_t k = 0; k < hd; ++k) {
+            acc += (double) w[k]*xn[k];
+        }
+        const float v = (float) acc/(float) hc;
+        lo[r] = v/(1.0f + std::exp(-v));
+    }
+    out.assign(n, 0.0f);
+    for (int64_t k = 0; k < hd; ++k) {
+        double acc = 0.0;
+        const float * w = lens.up.data() + k*lr;
+        for (int64_t r = 0; r < lr; ++r) {
+            acc += (double) w[r]*lo[r];
+        }
+        const float g = 1.0f/(1.0f + std::exp(-(float) acc));
+        out[k % n] += xn[k]*g;
+    }
+    for (auto & v : out) {
+        v /= (float) hc;
+    }
+}
+
+json server_moe_trace::block_push_json(int32_t col, const std::vector<llama_token> & tokens, const std::vector<float> & logits) {
+    json ids = json::array();
+    for (llama_token t : tokens) {
+        ids.push_back(t);
+    }
+    json out = json {
+        {"token_ids", ids},
+    };
+    if (!lens.ready) {
+        out["error"] = "lens weights not loaded";
+        return out;
+    }
+    // lens logit per residual (hc_init, then after every block), per token; null where a residual is missing
+    std::vector<std::vector<double>> lg(n_layer + 1);
+    std::vector<bool> ok(n_layer + 1, false);
+    std::vector<float> h;
+    for (int32_t r = 0; r <= n_layer; ++r) {
+        const auto & R = resid[r];
+        const float * x = R.rows == lens.hc*lens.n_embd ? trace_resid_col(R, col) : nullptr;
+        if (!x) {
+            continue;
+        }
+        lens_hidden(x, h);
+        lg[r].resize(tokens.size());
+        for (size_t t = 0; t < tokens.size(); ++t) {
+            const auto & w = lens_row(tokens[t]);
+            double acc = 0.0;
+            for (int64_t i = 0; i < lens.n_embd; ++i) {
+                acc += (double) w[i]*h[i];
+            }
+            lg[r][t] = acc*lens.out_scale;
+        }
+        ok[r] = true;
+    }
+    json base = json::array();
+    json push = json::array();
+    json fin  = json::array();
+    for (size_t t = 0; t < tokens.size(); ++t) {
+        base.push_back(ok[0] ? json((float) lg[0][t]) : json(nullptr));
+        json p = json::array();
+        for (int32_t il = 0; il < n_layer; ++il) {
+            p.push_back(ok[il] && ok[il + 1] ? json((float) (lg[il + 1][t] - lg[il][t])) : json(nullptr));
+        }
+        push.push_back(p);
+        fin.push_back(t < logits.size() && std::isfinite(logits[t]) ? json(logits[t]) : json(nullptr));
+    }
+    out["base"]  = base;
+    out["push"]  = push;
+    out["logit"] = fin;
     return out;
 }
