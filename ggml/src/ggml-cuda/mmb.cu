@@ -906,9 +906,41 @@ __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ W
 #pragma unroll
     for (int j = 0; j < TN; ++j) jact[j] = !TAIL || (wn * WTN + j * 16) < n_cols;
     const int nks = K / MMB_BK;
+    // IQ3_S 64x128 GLU tile: software-pipelined fragments. At 1-2 resident blocks each kk group's six fragment reads
+    // (ag[2], au[2], b[2]) were waited on before its WMMAs; load the next kk's fragments into a second bank while the
+    // current WMMAs run. Same WMMA sequence per accumulator -> bit-identical.
+    constexpr bool PIPE = WTYPE == 32 + GGML_TYPE_IQ3_S && BM == 64 && BN == 128 && WTM == 32 && WTN == 32 && MMB_BK == 64;
     load_regs(0); if constexpr (LB) __syncthreads(); store_lds(); __syncthreads();
     for (int ks = 0; ks < nks; ++ks) {
         if (ks + 1 < nks) load_regs(ks + 1);
+        if constexpr (PIPE) {
+            const int r = lane & 15;
+            auto ldfrag = [&](const int kk, v16s (&fg)[TM], v16s (&fu)[TM], v16s (&fb)[TN]) {
+#pragma unroll
+                for (int i = 0; i < TM; ++i) { const int off = (wm * WTM + i * 16 + r) * MMB_LDS_STRIDE + kk;
+                    fg[i] = __builtin_bit_cast(v16s, (uint4[2]){*(const uint4 *)(Ag + off), *(const uint4 *)(Ag + off + 8)});
+                    fu[i] = __builtin_bit_cast(v16s, (uint4[2]){*(const uint4 *)(Au + off), *(const uint4 *)(Au + off + 8)}); }
+#pragma unroll
+                for (int j = 0; j < TN; ++j) { const uint16_t * p = Bs + (wn * WTN + j * 16 + r) * MMB_LDS_STRIDE + kk;
+                    fb[j] = __builtin_bit_cast(v16s, (uint4[2]){*(const uint4 *)p, *(const uint4 *)(p + 8)}); }
+            };
+            auto mmas = [&](const v16s (&fg)[TM], const v16s (&fu)[TM], const v16s (&fb)[TN]) {
+#pragma unroll
+                for (int i = 0; i < TM; ++i)
+#pragma unroll
+                    for (int j = 0; j < TN; ++j) {
+                        if constexpr (TAIL) { if (WAVE_GUARD ? !wact : !jact[j]) continue; }
+                        accg[i][j] = mmb_wmma_glu<F16>(fb[j], fg[i], accg[i][j]);
+                        accu[i][j] = mmb_wmma_glu<F16>(fb[j], fu[i], accu[i][j]);
+                    }
+            };
+            v16s g0[TM], u0[TM], b0[TN], g1[TM], u1[TM], b1[TN];
+            ldfrag(0, g0, u0, b0);
+            ldfrag(16, g1, u1, b1); mmas(g0, u0, b0);
+            ldfrag(32, g0, u0, b0); mmas(g1, u1, b1);
+            ldfrag(48, g1, u1, b1); mmas(g0, u0, b0);
+            mmas(g1, u1, b1);
+        } else {
 #pragma unroll
         for (int kk = 0; kk < MMB_BK; kk += 16) {
             // gfx1151/ROCm 10.1 clang 24: streaming gate/up fragments clears 20 GLU spill names.
@@ -957,6 +989,7 @@ __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ W
                         accu[i][j] = mmb_wmma_glu<F16>(b[j], au[i], accu[i][j]);
                     }
             }
+        }
         }
         __syncthreads();
         if (ks + 1 < nks) store_lds();
