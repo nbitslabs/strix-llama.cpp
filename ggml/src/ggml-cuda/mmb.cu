@@ -2092,6 +2092,7 @@ static bool mmb_act_from_fused_gateup(const ggml_tensor * act, const int n_ff, c
 
 bool ggml_cuda_mmb_supported_mmid(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * dst) {
     if (!mmb_enabled(ctx)) return false;
+    if (src0->type == GGML_TYPE_IQ3_S) return false;   // EXPERIMENT: IQ3_S experts take the int8 MMQ path (Q8 activations)
     // Fused gate_up is split into gate/up views, so the SwiGLU fusion never fires and MMB pays BF16 precision with no
     // fused-kernel payoff. gemma-4-26B-A4B / gfx1151 / ROCm 10.0: KL vs master 0.19-0.31, top-1 90-93% (split-tensor
     // models 0.002-0.065, 97-99%); pp4096 +0.9%. Keep on MMQ; Q8_0 / IQ4_NL already eligible, so exempt.
