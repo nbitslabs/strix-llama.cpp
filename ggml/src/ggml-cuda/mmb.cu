@@ -641,6 +641,19 @@ hc_gate_mix_kernel(const uint8_t * __restrict__ W, const uint16_t * __restrict__
     if (tid < BM) { const int c = tid / CH, i = tid - c * CH; arow = W + (size_t)(c * E + e0 + i) * wrow_bytes; }
 #pragma unroll
     for (int i = 0; i < B_ITEMS; ++i) { const int c = tid + i * MMB_NT; const int t = t0 + (c >> 3); brow[i] = t < T ? t : -1; }
+    // The epilogue's Xn values (CH channels of all HC streams for the tile's BN tokens, 32 KB) are fetched here, coalesced
+    // (16 B per thread per item), parked in registers across the K loop and transposed through the A/B tiles once those
+    // are free: read in the epilogue they were 64 scattered 32-byte loads per lane with nothing left to overlap them
+    // (gfx1151 pp8192: the longest phase of this kernel). Same values, same arithmetic.
+    constexpr int XCH = CH * 2 / 16, XN_ITEMS = (BN * HC * XCH) / MMB_NT, XLDS = 2 * CH + 8;   // XLDS: two streams per row, padded
+    static_assert((BN * HC * XCH) % MMB_NT == 0 && HC == 4 && BN * XLDS <= BM * MMB_LDS_STRIDE && BN * XLDS <= BN * MMB_LDS_STRIDE, "Xn tile staging");
+    mmb_u4v xnr[XN_ITEMS];
+#pragma unroll
+    for (int i = 0; i < XN_ITEMS; ++i) {
+        const int idx = tid + i * MMB_NT, t = idx / (HC * XCH), rem = idx - t * (HC * XCH), c = rem / XCH, q = rem - c * XCH;
+        const int tok = t0 + t;
+        xnr[i] = tok < T ? *(const mmb_u4v *)(Xn + (size_t) tok * ((size_t) HC * E) + (size_t) c * E + e0 + q * 8) : mmb_u4v{0, 0, 0, 0};
+    }
     int weight_ks = 0;
     auto load_regs = [&](const int ks) {
         weight_ks = ks;
@@ -698,20 +711,28 @@ hc_gate_mix_kernel(const uint8_t * __restrict__ W, const uint16_t * __restrict__
         store_lds();
         __syncthreads();
     }
+    // Xn tile into LDS (the K loop ended with a barrier, the A/B tiles are free): streams 0-1 in As, 2-3 in Bs, row t at
+    // t * XLDS halfwords (144 B: the two token groups of a wave land on different banks)
+#pragma unroll
+    for (int i = 0; i < XN_ITEMS; ++i) {
+        const int idx = tid + i * MMB_NT, t = idx / (HC * XCH), rem = idx - t * (HC * XCH), c = rem / XCH, q = rem - c * XCH;
+        *(mmb_u4v *) ((c < 2 ? As : Bs) + t * XLDS + (c & 1) * CH + q * 8) = xnr[i];
+    }
+    __syncthreads();
     // epilogue: lane holds channel (lane & 15) of the wave's 16 and tokens 2e + (lane >> 4) of each 16-token fragment
     const int cm = lane & 15, cn = lane >> 4; const int ch = e0 + wm * 16 + cm;
 #pragma unroll
     for (int j = 0; j < JT; ++j) {
 #pragma unroll
         for (int e = 0; e < 8; ++e) {
-            const int t = t0 + wn * TOKW + j * 16 + 2 * e + cn;
+            const int tl = wn * TOKW + j * 16 + 2 * e + cn, t = t0 + tl;
             if (t >= T) continue;
-            const uint16_t * xr = Xn + (size_t)t * ((size_t)HC * E) + ch;
             float s = 0.f;
 #pragma unroll
             for (int c = 0; c < HC; ++c) {
                 const float g = __uint_as_float(((uint32_t) mmb_f2bf(acc[c][j][e])) << 16);   // the gate GEMM's BF16 epilogue rounding
-                const float term = gm_mul_rn(gm_bf2f(xr[(size_t)c * E]), gm_sigmoid(g));
+                const uint16_t xv = ((c < 2 ? As : Bs) + tl * XLDS + (c & 1) * CH)[wm * 16 + cm];
+                const float term = gm_mul_rn(gm_bf2f(xv), gm_sigmoid(g));
                 s = (c == 0) ? term : gm_add_rn(s, term);
             }
             const float o = scale * s + bias;
