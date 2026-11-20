@@ -18,6 +18,11 @@ namespace {
 typedef short v16s __attribute__((ext_vector_type(16)));
 typedef float v8f  __attribute__((ext_vector_type(8)));
 constexpr int MMB_BK = 64, MMB_NT = 256, MMB_LDS_STRIDE = MMB_BK + 8;
+// HPROBES (experiment branch, wrong math): split the time of the K=320 dense Q8_0 GEMM (hc gate) in mmb_tile_gemm
+#define MMB_HPROBE_NOB      0
+#define MMB_HPROBE_NOWMMA   0
+#define MMB_HPROBE_NOSTORE  0
+#define MMB_HPROBE_NODECODE 0
 
 __device__ __forceinline__ uint16_t mmb_f2bf(float f) { uint32_t u = __float_as_uint(f); u += 0x7fffu + ((u >> 16) & 1u); return (uint16_t)(u >> 16); }
 // same RNE as mmb_f2bf on both halves, the two high halves joined by one v_perm_b32 (no mov_b16 + and_or). Unguarded
@@ -193,6 +198,7 @@ __device__ __forceinline__ void mmb_tile_gemm(const uint8_t * __restrict__ Wbase
 #else
     constexpr bool STAGGER_A = false;
 #endif
+    const bool HP = (K == 320) && WTYPE == 1 && BM == 128 && BN == 128;   // the hc gate GEMM only
     int weight_ks = 0;
     auto load_regs = [&](const int ks) {
         weight_ks = ks;
@@ -220,6 +226,7 @@ __device__ __forceinline__ void mmb_tile_gemm(const uint8_t * __restrict__ Wbase
             }
         }
         if constexpr (!Q51S) {
+        if (!(HP && MMB_HPROBE_NODECODE))
 #pragma unroll
         for (int i = 0; i < A_ITEMS; ++i) {
             const int row = tid + i * MMB_NT;
@@ -241,7 +248,8 @@ __device__ __forceinline__ void mmb_tile_gemm(const uint8_t * __restrict__ Wbase
 #pragma unroll
         for (int i = 0; i < B_ITEMS; ++i) {
             const int c = tid + i * MMB_NT; const int off = (c & 7) * 8;
-            bst[i] = (brow[i] >= 0) ? *(const uint4 *)(Xh + (size_t)brow[i] * K + ks * MMB_BK + off) : make_uint4(0,0,0,0);
+            if (HP && MMB_HPROBE_NOB) bst[i] = make_uint4(0x3c003c00u + c, 0x3c003c00u ^ ks, 0x3c00u, (uint32_t) brow[i]);
+            else bst[i] = (brow[i] >= 0) ? *(const uint4 *)(Xh + (size_t)brow[i] * K + ks * MMB_BK + off) : make_uint4(0,0,0,0);
         }
     };
     auto load_tail_regs = [&](const int ks) {
@@ -284,7 +292,7 @@ __device__ __forceinline__ void mmb_tile_gemm(const uint8_t * __restrict__ Wbase
         } else if constexpr (WTYPE >= 32 && WTYPE != 32 + GGML_TYPE_Q5_1) mmb_load_quant_tile<WTYPE, BM, MMB_LDS_STRIDE>(Wbase, wrow_bytes, a_rows, weight_ks, As);
         if constexpr (Q51S) {
             mmb_dq_q51_one(a0[0], a1[0], (uint32_t *)(As + (tid >> 1) * MMB_LDS_STRIDE + (tid & 1) * 32));
-        } else {
+        } else if (!(HP && MMB_HPROBE_NODECODE)) {
 #pragma unroll
         for (int i = 0; i < A_ITEMS; ++i) { const int row = tid + i * MMB_NT; if (row < BM) {
             if constexpr (WTYPE == 0) mmb_dq_row36(a0[i], a1[i], a2[i], (uint32_t *)(As + row * MMB_LDS_STRIDE));
@@ -357,6 +365,7 @@ __device__ __forceinline__ void mmb_tile_gemm(const uint8_t * __restrict__ Wbase
                 for (int i = 0; i < TM; ++i)
 #pragma unroll
                     for (int j = 0; j < TN; ++j) { if constexpr (TAIL) { if (WAVE_GUARD ? !wact : !jact[j]) continue; }
+                        if (HP && MMB_HPROBE_NOWMMA) { acc[i][j][0] += __builtin_bit_cast(float, (uint32_t) b[j][0]) + __builtin_bit_cast(float, (uint32_t) a[i][0]); continue; }
                         if constexpr (F16) acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(b[j], a[i], acc[i][j]);
                         else               acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(b[j], a[i], acc[i][j]); }
             }
@@ -382,7 +391,8 @@ __device__ __forceinline__ void mmb_tile_gemm(const uint8_t * __restrict__ Wbase
         const int ml = store_wm * WTM + i * 16; const bool ok = ml < a_rows;
 #pragma unroll
         for (int j = 0; j < TN; ++j) {
-            if (ok && jact[j]) mmb_store_tile(acc[i][j], stg, D, Dh, store_f32, M, drow, wn * WTN + j * 16, m0 + ml, lane);
+            if (ok && jact[j] && HP && MMB_HPROBE_NOSTORE) { if (acc[i][j][0] == 1.2345e30f) D[m0] = acc[i][j][1]; __syncthreads(); __syncthreads(); }   // PROBE: keep acc live, no store
+            else if (ok && jact[j]) mmb_store_tile(acc[i][j], stg, D, Dh, store_f32, M, drow, wn * WTN + j * 16, m0 + ml, lane);
             else { __syncthreads(); __syncthreads(); }
         }
     }
