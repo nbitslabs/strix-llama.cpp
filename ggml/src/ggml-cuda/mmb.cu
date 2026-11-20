@@ -18,6 +18,11 @@ namespace {
 typedef short v16s __attribute__((ext_vector_type(16)));
 typedef float v8f  __attribute__((ext_vector_type(8)));
 constexpr int MMB_BK = 64, MMB_NT = 256, MMB_LDS_STRIDE = MMB_BK + 8;
+// IQ3_S register-operand GLU tile (experiment knob): 0 = 128 tokens, B double-buffered (37 KB LDS, 1 block/CU);
+// 1 = 64 tokens double-buffered (18 KB, 3 blocks/CU); 2 = 128 tokens single-buffered (18 KB); 3 = 64 single (9 KB)
+#define MMB_MS_IQ3S_VARIANT 0
+constexpr int  MMB_MS_IQ3S_BN = (MMB_MS_IQ3S_VARIANT == 1 || MMB_MS_IQ3S_VARIANT == 3) ? 64 : 128;
+constexpr bool MMB_MS_IQ3S_DB = MMB_MS_IQ3S_VARIANT == 0 || MMB_MS_IQ3S_VARIANT == 1;
 
 __device__ __forceinline__ uint16_t mmb_f2bf(float f) { uint32_t u = __float_as_uint(f); u += 0x7fffu + ((u >> 16) & 1u); return (uint16_t)(u >> 16); }
 // same RNE as mmb_f2bf on both halves, the two high halves joined by one v_perm_b32 (no mov_b16 + and_or). Unguarded
@@ -1034,7 +1039,7 @@ __device__ __forceinline__ mmb_v8u mmb_ms_xhalf(const mmb_v8u x) {
 // weight, mmb_ms_piece), the tokens the second (bf16 in LDS, double-buffered, one barrier per K step). Same bf16 weights and
 // ascending K order per output as mmb_tile_gemm_glu, transposed -> bit-identical; accumulator lane (n, h) holds weight
 // rows 2 v + h, token n. The up waves pass their accumulators to the gate waves through LDS for silu(gate) * up.
-template <int WTYPE>
+template <int WTYPE, int BN = 128, bool DB = true>
 __global__ void __launch_bounds__(MMB_NT, 2)
 mmb_routed_glu_ms_kernel(const uint8_t * __restrict__ Wg, const uint8_t * __restrict__ Wu, const size_t expert_bytes, const uint16_t * __restrict__ Xh,
         float * __restrict__ D, uint16_t * __restrict__ Dh, const bool store_f32,
@@ -1045,9 +1050,10 @@ mmb_routed_glu_ms_kernel(const uint8_t * __restrict__ Wg, const uint8_t * __rest
 #else
     using LBT = mmb_ms3<WTYPE>;
     static_assert(LBT::ok && mmb_glu_ms_type(WTYPE), "grid types with an mmb_ms3 decoder only");
-    constexpr int BM = 64, BN = 128, TN = BN / 16, BSZ = BN * MMB_LDS_STRIDE, B_ITEMS = BN * 8 / MMB_NT;
-    static_assert(2 * BSZ * 2 >= 4 * TN * 8 * 32 * 4, "the epilogue's fp32 exchange reuses Bs");
-    __shared__ __align__(16) uint16_t Bs[2 * BSZ];
+    constexpr int BM = 64, TN = BN / 16, BSZ = BN * MMB_LDS_STRIDE, B_ITEMS = BN * 8 / MMB_NT, NBUF = DB ? 2 : 1;
+    static_assert(BN == 64 || BN == 128, "64 or 128 tokens");
+    static_assert(NBUF * BSZ * 2 >= 4 * TN * 8 * 32 * 4, "the epilogue's fp32 exchange reuses Bs");
+    __shared__ __align__(16) uint16_t Bs[NBUF * BSZ];
     __shared__ typename LBT::grid_t lbgrid[LBT::N];
     const uint32_t dsc = desc[blockIdx.y];
     if (dsc == UINT32_MAX) return;
@@ -1109,7 +1115,7 @@ mmb_routed_glu_ms_kernel(const uint8_t * __restrict__ Wg, const uint8_t * __rest
                 w[q] = mmb_v8u{lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w};
             }
             if (ks + 1 < nks) { fetch(ks + 1); load_b(ks + 1); }
-            const uint16_t * bb = Bs + (ks & 1) * BSZ + r * MMB_LDS_STRIDE;
+            const uint16_t * bb = Bs + (DB ? (ks & 1) * BSZ : 0) + r * MMB_LDS_STRIDE;
 #pragma unroll
             for (int q = 0; q < 2; ++q) {
                 const mmb_v8u y = mmb_ms_xhalf(w[q]);
@@ -1122,14 +1128,17 @@ mmb_routed_glu_ms_kernel(const uint8_t * __restrict__ Wg, const uint8_t * __rest
                     if (FULL || j < njt) acc[j] = mmb_wmma_bf16_u(y, mmb_ms_lds16(bb + j * 16 * MMB_LDS_STRIDE + 32 * q + 16), acc[j]);
                 }
             }
-            if (ks + 1 < nks) { store_b((ks + 1) & 1); mmb_tq8_lds_barrier(); }
+            if (ks + 1 < nks) {
+                if constexpr (DB) { store_b((ks + 1) & 1); mmb_tq8_lds_barrier(); }
+                else { __syncthreads(); store_b(0); __syncthreads(); }   // single buffer: all reads of B(ks) done before the overwrite
+            }
         }
     };
     if (njt == TN) kloop(std::true_type{}); else kloop(std::false_type{});
     // up -> LDS, gate wave: silu(gate) * up in place, then row stores. xs[row group][fragment][token][XLD]: the group's
     // rows 2 v + h at + 2 v + h (XLD = 17 spreads the 16 tokens of a write over the banks)
     constexpr int XLD = 17;
-    static_assert(2 * BSZ * 2 >= 4 * TN * 16 * XLD * 4, "the epilogue's fp32 exchange reuses Bs");
+    static_assert(NBUF * BSZ * 2 >= 4 * TN * 16 * XLD * 4, "the epilogue's fp32 exchange reuses Bs");
     float * xs = (float *) Bs;
     const int xo = (rg * TN * 16 + r) * XLD + (lane >> 4);
     __syncthreads();
@@ -4144,7 +4153,8 @@ void ggml_cuda_mul_mat_id_mmb_glu(ggml_backend_cuda_context & ctx, const ggml_te
     constexpr int BN_gluk = 128;
     // gluk decodes Q4_K / Q5_K superblocks and Q5_1 only: the other routed types keep the legacy tiers
     const bool glk_this = T >= 128 && M % 2 == 0 && mmb_gluk_type(gw->type);   // the pair epilogue stores row pairs
-    const int BN_rt = glk_this ? BN_gluk : BN_sel;
+    const bool ms_iq3s = gw->type == GGML_TYPE_IQ3_S;
+    const int BN_rt = glk_this ? BN_gluk : (ms_iq3s ? MMB_MS_IQ3S_BN : BN_sel);
     const bool f16_ops = mmb_routed_f16_type(gw->type);   // F16 operands: the F32 input must exist (not a BF16-only tensor)
     GGML_ASSERT(!f16_ops || !ggml_cuda_mmb_is_bf16_only(ctx, src1));
     const uint16_t * xhp = f16_ops ? mmb_f16_activation(ctx, src1, (size_t) n_rows_x * K, stream)
@@ -4216,6 +4226,8 @@ void ggml_cuda_mul_mat_id_mmb_glu(ggml_backend_cuda_context & ctx, const ggml_te
             const dim3 gbig((M + 63) / 64, nbig_max);
             if constexpr (WT == 32 + GGML_TYPE_Q4_K) {
                 mmb_routed_glu_kernel<64, BN_sel, 32, BN_sel / 4, WT, true><<<gbig, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), M, K);
+            } else if constexpr (WT == 32 + GGML_TYPE_IQ3_S) {
+                mmb_routed_glu_ms_kernel<WT, MMB_MS_IQ3S_BN, MMB_MS_IQ3S_DB><<<gbig, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), M, K);
             } else if constexpr (mmb_glu_ms_type(WT)) {
                 static_assert(BN_sel == 128, "mmb_routed_glu_ms_kernel tiles 128 tokens");
                 mmb_routed_glu_ms_kernel<WT><<<gbig, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), M, K);
