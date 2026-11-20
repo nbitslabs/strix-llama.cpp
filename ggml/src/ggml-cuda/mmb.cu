@@ -23,6 +23,11 @@ constexpr int MMB_BK = 64, MMB_NT = 256, MMB_LDS_STRIDE = MMB_BK + 8;
 #define MMB_HPROBE_NOWMMA   0
 #define MMB_HPROBE_NOSTORE  0
 #define MMB_HPROBE_NODECODE 0
+// probes on hc_gate_mix_kernel itself (wrong math): stale weights, no activation loads, constant Xn, no WMMA
+#define MMB_GPROBE_NOW   0
+#define MMB_GPROBE_NOLO  0
+#define MMB_GPROBE_NOXN  0
+#define MMB_GPROBE_NOWMMA 0
 
 __device__ __forceinline__ uint16_t mmb_f2bf(float f) { uint32_t u = __float_as_uint(f); u += 0x7fffu + ((u >> 16) & 1u); return (uint16_t)(u >> 16); }
 // same RNE as mmb_f2bf on both halves, the two high halves joined by one v_perm_b32 (no mov_b16 + and_or). Unguarded
@@ -655,12 +660,16 @@ hc_gate_mix_kernel(const uint8_t * __restrict__ W, const uint16_t * __restrict__
     auto load_regs = [&](const int ks) {
         weight_ks = ks;
         if constexpr (WTYPE == 0) if (tid < BM) { const uint8_t * p = arow + (size_t)ks * 36; a0 = *(const uint4 *)(p); a1 = *(const uint4 *)(p + 16); a2 = *(const uint32_t *)(p + 32); }
-        if constexpr (WTYPE == 2) if (tid < BM) { const mmb_u4v * p = (const mmb_u4v *)(arow + (size_t)ks * MMB_BK * 2);
+        if constexpr (WTYPE == 2 && !MMB_GPROBE_NOW) if (tid < BM) { const mmb_u4v * p = (const mmb_u4v *)(arow + (size_t)ks * MMB_BK * 2);
 #pragma unroll
             for (int q = 0; q < 8; ++q) aw[q] = p[q]; }
+        if constexpr (WTYPE == 2 && MMB_GPROBE_NOW) if (tid < BM && ks == 0) { const mmb_u4v * p = (const mmb_u4v *)(arow);
+#pragma unroll
+            for (int q = 0; q < 8; ++q) aw[q] = p[q]; }   // PROBE: the first K slice reused for every step
 #pragma unroll
         for (int i = 0; i < B_ITEMS; ++i) { const int c = tid + i * MMB_NT; const int off = (c & 7) * 8;
-            bst[i] = (brow[i] >= 0) ? *(const mmb_u4v *)(Lo + (size_t)brow[i] * K + ks * MMB_BK + off) : mmb_u4v{0, 0, 0, 0}; }
+            if constexpr (MMB_GPROBE_NOLO) bst[i] = mmb_u4v{0x3c003c00u + (uint32_t) c, 0x3c003c00u ^ (uint32_t) ks, 0x3c00u, (uint32_t) brow[i]};
+            else bst[i] = (brow[i] >= 0) ? *(const mmb_u4v *)(Lo + (size_t)brow[i] * K + ks * MMB_BK + off) : mmb_u4v{0, 0, 0, 0}; }
     };
     auto store_lds = [&]() {
         if constexpr (WTYPE == 0) { if (tid < BM) mmb_dq_row36(a0, a1, a2, (uint32_t *)(As + tid * MMB_LDS_STRIDE)); }
@@ -702,7 +711,10 @@ hc_gate_mix_kernel(const uint8_t * __restrict__ W, const uint16_t * __restrict__
 #pragma unroll
             for (int c = 0; c < HC; ++c)
 #pragma unroll
-                for (int j = 0; j < JT; ++j) acc[c][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(b[j], a[c], acc[c][j]);
+                for (int j = 0; j < JT; ++j) {
+                    if constexpr (MMB_GPROBE_NOWMMA) acc[c][j][0] += __builtin_bit_cast(float, (uint32_t) b[j][0]) + __builtin_bit_cast(float, (uint32_t) a[c][0]);
+                    else acc[c][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(b[j], a[c], acc[c][j]);
+                }
         }
         __syncthreads();
         store_lds();
@@ -721,7 +733,7 @@ hc_gate_mix_kernel(const uint8_t * __restrict__ W, const uint16_t * __restrict__
 #pragma unroll
             for (int c = 0; c < HC; ++c) {
                 const float g = __uint_as_float(((uint32_t) mmb_f2bf(acc[c][j][e])) << 16);   // the gate GEMM's BF16 epilogue rounding
-                const float term = gm_mul_rn(gm_bf2f(xr[(size_t)c * E]), gm_sigmoid(g));
+                const float term = gm_mul_rn(MMB_GPROBE_NOXN ? gm_bf2f((uint16_t) (0x3f80u + c + (ch & 7))) : gm_bf2f(xr[(size_t)c * E]), gm_sigmoid(g));
                 s = (c == 0) ? term : gm_add_rn(s, term);
             }
             const float o = scale * s + bias;
