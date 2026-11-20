@@ -18,8 +18,10 @@ namespace {
 typedef short v16s __attribute__((ext_vector_type(16)));
 typedef float v8f  __attribute__((ext_vector_type(8)));
 constexpr int MMB_BK = 64, MMB_NT = 256, MMB_LDS_STRIDE = MMB_BK + 8;
-// hc gate mix Xn staging mode (experiment knob): 1 = global_load_lds dword DMA into LDS, 2 = two register halves
-#define MMB_HC_XN_MODE 1
+// hc gate mix experiment knobs: MMB_HC_XN_STAGE 0 = original strided epilogue reads, 1 = Xn tile staged through LDS
+// (MMB_HC_XN_MODE 1 = global_load_lds dword DMA, 2 = two register halves); the kk loop is rolled in all variants
+#define MMB_HC_XN_STAGE 0
+#define MMB_HC_XN_MODE 2
 
 __device__ __forceinline__ uint16_t mmb_f2bf(float f) { uint32_t u = __float_as_uint(f); u += 0x7fffu + ((u >> 16) & 1u); return (uint16_t)(u >> 16); }
 // same RNE as mmb_f2bf on both halves, the two high halves joined by one v_perm_b32 (no mov_b16 + and_or). Unguarded
@@ -688,7 +690,9 @@ hc_gate_mix_kernel(const uint8_t * __restrict__ W, const uint16_t * __restrict__
         // unconditional prefetch/store (the last ones are unused): a conditional def kept the staged registers out of
         // SROA (144 B/lane scratch, vmcnt(0) right after each load on gfx1151)
         load_regs(min(ks + 1, nks - 1));
-#pragma unroll
+        // rolled: unrolled, the four kk slices kept 24 operand fragments live on top of the accumulators and the staged
+        // W/Lo registers (gfx1151: 256 VGPRs, 140 spilled, 308 B/lane scratch over 4800 blocks per call)
+#pragma unroll 1
         for (int kk = 0; kk < MMB_BK; kk += 16) {
             v16s a[HC], b[JT]; const int r = lane & 15;
 #pragma unroll
@@ -708,7 +712,8 @@ hc_gate_mix_kernel(const uint8_t * __restrict__ W, const uint16_t * __restrict__
     }
     // Xn tile into LDS (the K loop ended with a barrier, the A/B tiles are free): streams 0-1 in As, 2-3 in Bs, row t at
     // t * XLDS halfwords (144 B: the two token groups of a wave land on different banks)
-    if constexpr (MMB_HC_XN_MODE == 1) {
+    if constexpr (!MMB_HC_XN_STAGE) {
+    } else if constexpr (MMB_HC_XN_MODE == 1) {
         // LDS DMA: one wave instruction moves 32 lanes x 4 B = the 128 B row (token t, streams p, p + 1) of the padded
         // layout; lane l reads stream p + (l >> 4), channels 2 (l & 15), 2 (l & 15) + 1. Rows past T read row T - 1 (never used).
         // 128 tokens x 2 stream pairs = 256 rows, 32 per wave.
@@ -750,11 +755,12 @@ hc_gate_mix_kernel(const uint8_t * __restrict__ W, const uint16_t * __restrict__
         for (int e = 0; e < 8; ++e) {
             const int tl = wn * TOKW + j * 16 + 2 * e + cn, t = t0 + tl;
             if (t >= T) continue;
+            const uint16_t * xr = Xn + (size_t)t * ((size_t)HC * E) + ch;
             float s = 0.f;
 #pragma unroll
             for (int c = 0; c < HC; ++c) {
                 const float g = __uint_as_float(((uint32_t) mmb_f2bf(acc[c][j][e])) << 16);   // the gate GEMM's BF16 epilogue rounding
-                const uint16_t xv = ((c < 2 ? As : Bs) + tl * XLDS + (c & 1) * CH)[wm * 16 + cm];
+                const uint16_t xv = MMB_HC_XN_STAGE ? ((c < 2 ? As : Bs) + tl * XLDS + (c & 1) * CH)[wm * 16 + cm] : xr[(size_t)c * E];
                 const float term = gm_mul_rn(gm_bf2f(xv), gm_sigmoid(g));
                 s = (c == 0) ? term : gm_add_rn(s, term);
             }
