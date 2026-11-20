@@ -18,6 +18,8 @@ namespace {
 typedef short v16s __attribute__((ext_vector_type(16)));
 typedef float v8f  __attribute__((ext_vector_type(8)));
 constexpr int MMB_BK = 64, MMB_NT = 256, MMB_LDS_STRIDE = MMB_BK + 8;
+// hc gate mix Xn staging mode (experiment knob): 1 = global_load_lds dword DMA into LDS, 2 = two register halves
+#define MMB_HC_XN_MODE 1
 
 __device__ __forceinline__ uint16_t mmb_f2bf(float f) { uint32_t u = __float_as_uint(f); u += 0x7fffu + ((u >> 16) & 1u); return (uint16_t)(u >> 16); }
 // same RNE as mmb_f2bf on both halves, the two high halves joined by one v_perm_b32 (no mov_b16 + and_or). Unguarded
@@ -706,19 +708,40 @@ hc_gate_mix_kernel(const uint8_t * __restrict__ W, const uint16_t * __restrict__
     }
     // Xn tile into LDS (the K loop ended with a barrier, the A/B tiles are free): streams 0-1 in As, 2-3 in Bs, row t at
     // t * XLDS halfwords (144 B: the two token groups of a wave land on different banks)
-    mmb_u4v xnr[XN_ITEMS];
+    if constexpr (MMB_HC_XN_MODE == 1) {
+        // LDS DMA: one wave instruction moves 32 lanes x 4 B = the 128 B row (token t, streams p, p + 1) of the padded
+        // layout; lane l reads stream p + (l >> 4), channels 2 (l & 15), 2 (l & 15) + 1. Rows past T read row T - 1 (never used).
+        // 128 tokens x 2 stream pairs = 256 rows, 32 per wave.
+#pragma unroll 4
+        for (int k = 0; k < (BN * 2) / (MMB_NT / 32); ++k) {
+            const int row = wave * ((BN * 2) / (MMB_NT / 32)) + k, t = row >> 1, p = (row & 1) * 2;
+            const int tok = min(t0 + t, T - 1), c = p + (lane >> 4);
+            const uint16_t * g = Xn + (size_t) tok * ((size_t) HC * E) + (size_t) c * E + e0 + 2 * (lane & 15);
+            uint16_t * l = (p < 2 ? As : Bs) + t * XLDS;
+            __builtin_amdgcn_global_load_lds((const void *) g, (__attribute__((address_space(3))) void *) l, 4, 0, 0);
+        }
+        __builtin_amdgcn_s_waitcnt(0);
+        __syncthreads();
+    } else {
+        // two halves of four 16 B items per thread, so at most 16 registers hold Xn at any time
 #pragma unroll
-    for (int i = 0; i < XN_ITEMS; ++i) {
-        const int idx = tid + i * MMB_NT, t = idx / (HC * XCH), rem = idx - t * (HC * XCH), c = rem / XCH, q = rem - c * XCH;
-        const int tok = t0 + t;
-        xnr[i] = tok < T ? *(const mmb_u4v *)(Xn + (size_t) tok * ((size_t) HC * E) + (size_t) c * E + e0 + q * 8) : mmb_u4v{0, 0, 0, 0};
-    }
+        for (int h = 0; h < 2; ++h) {
+            mmb_u4v xnr[XN_ITEMS / 2];
 #pragma unroll
-    for (int i = 0; i < XN_ITEMS; ++i) {
-        const int idx = tid + i * MMB_NT, t = idx / (HC * XCH), rem = idx - t * (HC * XCH), c = rem / XCH, q = rem - c * XCH;
-        *(mmb_u4v *) ((c < 2 ? As : Bs) + t * XLDS + (c & 1) * CH + q * 8) = xnr[i];
+            for (int i = 0; i < XN_ITEMS / 2; ++i) {
+                const int idx = tid + (h * (XN_ITEMS / 2) + i) * MMB_NT, t = idx / (HC * XCH), rem = idx - t * (HC * XCH), c = rem / XCH, q = rem - c * XCH;
+                const int tok = t0 + t;
+                xnr[i] = tok < T ? *(const mmb_u4v *)(Xn + (size_t) tok * ((size_t) HC * E) + (size_t) c * E + e0 + q * 8) : mmb_u4v{0, 0, 0, 0};
+            }
+#pragma unroll
+            for (int i = 0; i < XN_ITEMS / 2; ++i) {
+                const int idx = tid + (h * (XN_ITEMS / 2) + i) * MMB_NT, t = idx / (HC * XCH), rem = idx - t * (HC * XCH), c = rem / XCH, q = rem - c * XCH;
+                *(mmb_u4v *) ((c < 2 ? As : Bs) + t * XLDS + (c & 1) * CH + q * 8) = xnr[i];
+            }
+            __builtin_amdgcn_sched_barrier(0);
+        }
+        __syncthreads();
     }
-    __syncthreads();
     // epilogue: lane holds channel (lane & 15) of the wave's 16 and tokens 2e + (lane >> 4) of each 16-token fragment
     const int cm = lane & 15, cn = lane >> 4; const int ch = e0 + wm * 16 + cm;
 #pragma unroll
