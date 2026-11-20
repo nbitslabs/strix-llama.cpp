@@ -641,19 +641,12 @@ hc_gate_mix_kernel(const uint8_t * __restrict__ W, const uint16_t * __restrict__
     if (tid < BM) { const int c = tid / CH, i = tid - c * CH; arow = W + (size_t)(c * E + e0 + i) * wrow_bytes; }
 #pragma unroll
     for (int i = 0; i < B_ITEMS; ++i) { const int c = tid + i * MMB_NT; const int t = t0 + (c >> 3); brow[i] = t < T ? t : -1; }
-    // The epilogue's Xn values (CH channels of all HC streams for the tile's BN tokens, 32 KB) are fetched here, coalesced
-    // (16 B per thread per item), parked in registers across the K loop and transposed through the A/B tiles once those
-    // are free: read in the epilogue they were 64 scattered 32-byte loads per lane with nothing left to overlap them
+    // The epilogue's Xn values (CH channels of all HC streams for the tile's BN tokens, 32 KB) are fetched after the K
+    // loop as 8 coalesced 16-byte loads per thread issued together and transposed through the then-free A/B tiles: read
+    // per lane in the epilogue they were 64 scattered 32-byte loads, serialized, with nothing left to overlap them
     // (gfx1151 pp8192: the longest phase of this kernel). Same values, same arithmetic.
     constexpr int XCH = CH * 2 / 16, XN_ITEMS = (BN * HC * XCH) / MMB_NT, XLDS = 2 * CH + 8;   // XLDS: two streams per row, padded
     static_assert((BN * HC * XCH) % MMB_NT == 0 && HC == 4 && BN * XLDS <= BM * MMB_LDS_STRIDE && BN * XLDS <= BN * MMB_LDS_STRIDE, "Xn tile staging");
-    mmb_u4v xnr[XN_ITEMS];
-#pragma unroll
-    for (int i = 0; i < XN_ITEMS; ++i) {
-        const int idx = tid + i * MMB_NT, t = idx / (HC * XCH), rem = idx - t * (HC * XCH), c = rem / XCH, q = rem - c * XCH;
-        const int tok = t0 + t;
-        xnr[i] = tok < T ? *(const mmb_u4v *)(Xn + (size_t) tok * ((size_t) HC * E) + (size_t) c * E + e0 + q * 8) : mmb_u4v{0, 0, 0, 0};
-    }
     int weight_ks = 0;
     auto load_regs = [&](const int ks) {
         weight_ks = ks;
@@ -713,6 +706,13 @@ hc_gate_mix_kernel(const uint8_t * __restrict__ W, const uint16_t * __restrict__
     }
     // Xn tile into LDS (the K loop ended with a barrier, the A/B tiles are free): streams 0-1 in As, 2-3 in Bs, row t at
     // t * XLDS halfwords (144 B: the two token groups of a wave land on different banks)
+    mmb_u4v xnr[XN_ITEMS];
+#pragma unroll
+    for (int i = 0; i < XN_ITEMS; ++i) {
+        const int idx = tid + i * MMB_NT, t = idx / (HC * XCH), rem = idx - t * (HC * XCH), c = rem / XCH, q = rem - c * XCH;
+        const int tok = t0 + t;
+        xnr[i] = tok < T ? *(const mmb_u4v *)(Xn + (size_t) tok * ((size_t) HC * E) + (size_t) c * E + e0 + q * 8) : mmb_u4v{0, 0, 0, 0};
+    }
 #pragma unroll
     for (int i = 0; i < XN_ITEMS; ++i) {
         const int idx = tid + i * MMB_NT, t = idx / (HC * XCH), rem = idx - t * (HC * XCH), c = rem / XCH, q = rem - c * XCH;
