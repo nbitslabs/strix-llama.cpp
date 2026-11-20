@@ -1181,6 +1181,163 @@ mmb_routed_glu_ms_kernel(const uint8_t * __restrict__ Wg, const uint8_t * __rest
 #endif
 }
 
+// IQ4_NL routed down GEMM, 128 rows x 64 tokens on register operands: wave w owns output rows 16 w .. +15, each lane
+// decodes its 16 weights of a 32-K half (one IQ4_NL block = one half; piece pc = the low or high nibbles) straight into
+// the first WMMA operand, the activations are double-buffered in LDS with one barrier per K step, no weight tile. Same
+// fp32 decode as mmb_decode_slice<IQ4_NL> ((float) d * kvalues, RNE bf16) and ascending K per output -> bit-identical
+// to mmb_routed_kernel<128,64,32,32> (transposed operands, see mmb_wmma_bf16_u).
+template <int WTYPE>
+__global__ void __launch_bounds__(MMB_NT, 2)
+mmb_routed_ms_kernel(const uint8_t * __restrict__ W, const size_t expert_bytes, const uint16_t * __restrict__ Xh, float * __restrict__ D,
+        uint16_t * __restrict__ Dh, const bool store_f32,
+        const int32_t * __restrict__ ids_src, const int32_t * __restrict__ ids_dst, const int32_t * __restrict__ bounds,
+        const uint32_t * __restrict__ desc, const int M, const int K) {
+#if defined(__HIP_DEVICE_COMPILE__) && !defined(RDNA3)
+    NO_DEVICE_CODE;
+#else
+    static_assert(WTYPE == 32 + GGML_TYPE_IQ4_NL, "IQ4_NL only");
+    constexpr int BM = 128, BN = 64, TN = BN / 16, BSZ = BN * MMB_LDS_STRIDE, B_ITEMS = BN * 8 / MMB_NT;
+    constexpr int XLD = 17;
+    static_assert(2 * BSZ * 2 >= 4 * TN * 16 * XLD * 4, "the epilogue's fp32 staging (four waves per pass) reuses Bs");
+    __shared__ __align__(16) uint16_t Bs[2 * BSZ];
+    const uint32_t dsc = desc[blockIdx.y];
+    if (dsc == UINT32_MAX) return;
+    const int e = dsc & 0xffff, jt = dsc >> 16;
+    const int r0 = bounds[e] + jt * BN, cnt = min(bounds[e + 1] - r0, BN);
+    const int m0 = blockIdx.x * BM;
+    const size_t wrow_bytes = mmb_row_bytes<WTYPE>(K);
+    const int tid = threadIdx.x, lane = tid & 31, wave = __builtin_amdgcn_readfirstlane(tid >> 5);
+    const int r = lane & 15, pc = mmb_ms_piece(lane);
+    // rows past M read row M - 1 and tokens past cnt the last token's activations: both only reach outputs never stored
+    const uint8_t * wrow = W + (size_t) e * expert_bytes + (size_t) min(m0 + wave * 16 + r, M - 1) * wrow_bytes;
+
+    uint32_t f[2][5];   // [32-K half] the block's 16 qs bytes and d
+    auto fetch = [&](const int ks) {
+#pragma unroll
+        for (int q = 0; q < 2; ++q) {
+            const block_iq4_nl * x = (const block_iq4_nl *) wrow + 2 * ks + q;
+            const uint16_t * qs = (const uint16_t *) x->qs;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) f[q][i] = qs[2 * i] | ((uint32_t) qs[2 * i + 1] << 16);
+            f[q][4] = *(const uint16_t *) &x->d;
+        }
+    };
+    auto decode = [&](const uint32_t (&ff)[5], uint4 & w0, uint4 & w1) {
+        const float d = mmb_h2f((uint16_t) ff[4]);
+        uint32_t o[8];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const uint32_t b = ff[i] >> (4 * pc);   // byte j of this word holds weight 4 i + j (low nibble) / + 16 (high nibble)
+            const float v0 = d * kvalues_iq4nl[(b      ) & 0xf], v1 = d * kvalues_iq4nl[(b >>  8) & 0xf];
+            const float v2 = d * kvalues_iq4nl[(b >> 16) & 0xf], v3 = d * kvalues_iq4nl[(b >> 24) & 0xf];
+            o[2 * i] = mmb_pack2(v0, v1); o[2 * i + 1] = mmb_pack2(v2, v3);
+        }
+        w0 = make_uint4(o[0], o[1], o[2], o[3]); w1 = make_uint4(o[4], o[5], o[6], o[7]);
+    };
+    const uint16_t * bsrc[B_ITEMS];
+    bool bzero[B_ITEMS];
+    uint4 bst[B_ITEMS];
+#pragma unroll
+    for (int i = 0; i < B_ITEMS; ++i) {
+        const int c = tid + i * MMB_NT, sr = ids_src[r0 + min(c >> 3, cnt - 1)];
+        bzero[i] = sr < 0;
+        bsrc[i] = Xh + (size_t) max(sr, 0) * K + (c & 7) * 8;
+    }
+    auto load_b = [&](const int ks) {
+#pragma unroll
+        for (int i = 0; i < B_ITEMS; ++i) {
+            const uint4 v = *(const uint4 *) (bsrc[i] + ks * MMB_BK);
+            bst[i] = bzero[i] ? make_uint4(0, 0, 0, 0) : v;
+        }
+    };
+    auto store_b = [&](const int buf) {
+#pragma unroll
+        for (int i = 0; i < B_ITEMS; ++i) {
+            const int c = tid + i * MMB_NT;
+            *(uint4 *) (Bs + buf * BSZ + (c >> 3) * MMB_LDS_STRIDE + (c & 7) * 8) = bst[i];
+        }
+    };
+
+    v8f acc[TN];
+#pragma unroll
+    for (int j = 0; j < TN; ++j) acc[j] = v8f{0, 0, 0, 0, 0, 0, 0, 0};
+    const int njt = (cnt + 15) >> 4;
+    const int nks = K / MMB_BK;
+    fetch(0); load_b(0); store_b(0);
+    __syncthreads();
+    auto kloop = [&](auto full) {
+        constexpr bool FULL = decltype(full)::value;
+        for (int ks = 0; ks < nks; ++ks) {
+            mmb_v8u w[2];
+#pragma unroll
+            for (int q = 0; q < 2; ++q) {
+                uint4 lo, hi; decode(f[q], lo, hi);
+                w[q] = mmb_v8u{lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w};
+            }
+            if (ks + 1 < nks) { fetch(ks + 1); load_b(ks + 1); }
+            const uint16_t * bb = Bs + (ks & 1) * BSZ + r * MMB_LDS_STRIDE;
+#pragma unroll
+            for (int q = 0; q < 2; ++q) {
+                const mmb_v8u y = mmb_ms_xhalf(w[q]);
+#pragma unroll
+                for (int j = 0; j < TN; ++j) {
+                    if (FULL || j < njt) acc[j] = mmb_wmma_bf16_u(w[q], mmb_ms_lds16(bb + j * 16 * MMB_LDS_STRIDE + 32 * q), acc[j]);
+                }
+#pragma unroll
+                for (int j = 0; j < TN; ++j) {
+                    if (FULL || j < njt) acc[j] = mmb_wmma_bf16_u(y, mmb_ms_lds16(bb + j * 16 * MMB_LDS_STRIDE + 32 * q + 16), acc[j]);
+                }
+            }
+            if (ks + 1 < nks) { store_b((ks + 1) & 1); mmb_tq8_lds_barrier(); }
+        }
+    };
+    if (njt == TN) kloop(std::true_type{}); else kloop(std::false_type{});
+    // two passes of four waves stage their 64 rows as fp32 in Bs (xs[row group][fragment][token][XLD], rows 2 v + h),
+    // then every thread stores 8 consecutive rows of one token
+    float * xs = (float *) Bs;
+#pragma unroll
+    for (int pass = 0; pass < 2; ++pass) {
+        __syncthreads();
+        if ((wave >> 2) == pass) {
+            const int xo = ((wave & 3) * TN * 16 + r) * XLD + (lane >> 4);
+#pragma unroll
+            for (int j = 0; j < TN; ++j)
+#pragma unroll
+                for (int v = 0; v < 8; ++v) xs[xo + j * 16 * XLD + 2 * v] = acc[j][v];
+        }
+        __syncthreads();
+#pragma unroll
+        for (int i = 0; i < BN * 8 / MMB_NT; ++i) {
+            const int it = tid + i * MMB_NT, tok = it >> 3, s = it & 7;
+            const int mb = m0 + pass * 64 + 8 * s;
+            if (tok >= cnt || mb >= M) continue;
+            const int dr = ids_dst[r0 + tok];
+            if (dr < 0) continue;
+            const float * src = xs + ((s >> 1) * TN * 16 + tok) * XLD + (s & 1) * 8;
+            float vv[8];
+#pragma unroll
+            for (int k = 0; k < 8; ++k) vv[k] = src[k];
+            const size_t base = (size_t) dr * M + mb;
+            const bool full = mb + 8 <= M;
+            if (store_f32) {
+                if (full && (M & 3) == 0) { *(float4 *) (D + base) = make_float4(vv[0], vv[1], vv[2], vv[3]); *(float4 *) (D + base + 4) = make_float4(vv[4], vv[5], vv[6], vv[7]); }
+                else {
+#pragma unroll
+                    for (int k = 0; k < 8; ++k) { if (mb + k < M) D[base + k] = vv[k]; }
+                }
+            }
+            if (Dh) {
+                if (full && (M & 7) == 0) { *(uint4 *) (Dh + base) = make_uint4(mmb_pack2(vv[0], vv[1]), mmb_pack2(vv[2], vv[3]), mmb_pack2(vv[4], vv[5]), mmb_pack2(vv[6], vv[7])); }
+                else {
+#pragma unroll
+                    for (int k = 0; k < 8; ++k) { if (mb + k < M) Dh[base + k] = mmb_f2bf(vv[k]); }
+                }
+            }
+        }
+    }
+#endif
+}
+
 // F32 x F32 -> F32 GEMM on WMMA: operands split into F16 hi + lo at tile load; TWO: Xhi*Whi + Xlo*Whi, !TWO adds Xhi*Wlo, !XSPLIT keeps only Xhi*Whi.
 __device__ __forceinline__ void mmb_split2(float x, uint16_t & hi, uint16_t & lo) {
     hi = __builtin_bit_cast(uint16_t, (_Float16) x); lo = __builtin_bit_cast(uint16_t, (_Float16) (x - (float) __builtin_bit_cast(_Float16, hi)));
@@ -4106,6 +4263,10 @@ void ggml_cuda_mul_mat_id_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor
             const dim3 gb((M + 127) / 128, nbig_max), gs((M + 127) / 128, nsmall_max);
             mmb_tier_fork fork(ctx, 2);
             mmb_routed_kernel<128, BN_SMALL, 16, 32, WT><<<gs, MMB_NT, 0, fork.small()>>>(W, eb, xhp, D, Dh, store_f32, ids_src1_p, ids_dst_p, bounds_p, desc_small.get(), M, K); // 8x2 = full 16-wave coverage (was 8x1 = 8/16 idle)
+            if constexpr (WT == 32 + GGML_TYPE_IQ4_NL) {   // register-operand big tier (no weight tile, one barrier per K step)
+                static_assert(BN_BIG == 64, "mmb_routed_ms_kernel tiles 64 tokens");
+                mmb_routed_ms_kernel<WT><<<gb, MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src1_p, ids_dst_p, bounds_p, desc_big.get(), M, K);
+            } else
             mmb_routed_kernel<128, BN_BIG, 32, 32, WT><<<gb, MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src1_p, ids_dst_p, bounds_p, desc_big.get(), M, K); // WAVES_M 4x WAVES_N 2, TM=2 TN=2 = full 128x64 coverage (was <32,16> = 32/64 tokens, half the tile lost)
         }
     });
