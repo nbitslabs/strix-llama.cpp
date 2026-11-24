@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <random>
 #include <regex>
 #include <string>
 #include <thread>
@@ -905,6 +906,56 @@ static void test_attention(testing & t) {
     ggml_free(ctx);
 }
 
+struct server_trace_lens_test {
+    static void run(testing & t) {
+        server_moe_trace trace;
+        trace.init(4, 64, 4);
+        auto & L = trace.lens;
+        L.n_embd = 64;
+        L.hc = 4;
+        L.hc_lr = 8;
+        L.eps = 1e-6f;
+        std::mt19937 rng(1234);
+        std::uniform_real_distribution<float> random(-0.5f, 0.5f);
+        L.norm.resize(L.n_embd*L.hc);
+        L.down.resize(L.n_embd*L.hc*L.hc_lr);
+        L.up.resize(L.down.size());
+        std::vector<float> input(5*L.n_embd*L.hc);
+        for (auto * values : {&L.norm, &L.down, &L.up, &input}) {
+            for (float & v : *values) {
+                v = random(rng);
+            }
+        }
+        std::vector<const float *> xs;
+        for (size_t c = 0; c < 5; ++c) {
+            xs.push_back(input.data() + c*L.n_embd*L.hc);
+        }
+        auto compare = [&]() {
+            std::vector<float> batch, ref;
+            trace.lens_hidden_batch(xs, batch);
+            t.assert_true("batch graph allocated", L.mix != nullptr);
+            float error = 0.0f, magnitude = 0.0f;
+            for (size_t c = 0; c < xs.size(); ++c) {
+                trace.lens_hidden(xs[c], ref);
+                for (size_t i = 0; i < ref.size(); ++i) {
+                    const float value = batch[c*L.n_embd + i];
+                    t.assert_true("finite lens output", std::isfinite(value));
+                    error = std::max(error, std::abs(value - ref[i]));
+                    magnitude = std::max(magnitude, std::abs(ref[i]));
+                }
+            }
+            t.assert_true("batch matches scalar", error <= 1e-5f*magnitude);
+        };
+        compare();
+        const auto mix = L.mix;
+        xs.resize(2);
+        compare();
+        t.assert_true("reuse mix", L.mix == mix);
+        xs.resize(7, input.data());
+        compare();
+    }
+};
+
 static void test_checkpoints(testing & t) {
     std::vector<int32_t> blocks;
     int32_t top_k = 0;
@@ -980,6 +1031,7 @@ int main(int argc, char ** argv) {
 
     t.test("attention", test_attention);
     t.test("checkpoints", test_checkpoints);
+    t.test("lens_hidden_batch", server_trace_lens_test::run);
     t.test("server_tokens", test_server_tokens);
     t.test("utf8",          test_utf8);
     t.test("sse",           test_sse);

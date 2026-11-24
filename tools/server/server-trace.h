@@ -31,6 +31,8 @@
 
 struct server_trace_head; // CPU copy of the output head for checkpoints, defined in server-trace.cpp
 
+struct server_trace_lens_mix;
+
 struct server_moe_trace {
     int32_t n_layer   = 0;
     int64_t n_embd    = 0;
@@ -55,6 +57,7 @@ struct server_moe_trace {
         struct ggml_tensor * output = nullptr;
         std::unordered_map<llama_token, std::vector<float>> rows;
         std::shared_ptr<server_trace_head> head;
+        std::shared_ptr<server_trace_lens_mix> mix;
     };
     lens_weights lens;
 
@@ -119,6 +122,9 @@ struct server_moe_trace {
     static bool eval_cb(struct ggml_tensor * t, bool ask, void * user_data);
 
 private:
+    friend struct server_trace_lens_test;
+    bool lens_prepare_mix();
+    void lens_hidden_batch(const std::vector<const float *> & xs, std::vector<float> & out);
     bool lens_prepare_head(std::string & err);
     void capture(struct ggml_tensor * t, int kind, int32_t il);
     void capture_resid(struct ggml_tensor * t, int32_t idx);

@@ -550,6 +550,105 @@ void server_moe_trace::lens_hidden(const float * x, std::vector<float> & out) co
     }
 }
 
+struct server_trace_lens_mix {
+    ggml_context * ctx = nullptr;
+    ggml_backend_t backend = nullptr;
+    ggml_backend_buffer_t buffer = nullptr;
+    ggml_tensor * norm = nullptr;
+    ggml_tensor * down = nullptr;
+    ggml_tensor * up = nullptr;
+    ggml_tensor * input = nullptr;
+    ggml_tensor * hidden = nullptr;
+    ggml_cgraph * graph = nullptr;
+
+    ~server_trace_lens_mix() {
+        ggml_backend_buffer_free(buffer);
+        ggml_backend_free(backend);
+        ggml_free(ctx);
+    }
+};
+
+bool server_moe_trace::lens_prepare_mix() {
+    if (lens.mix) {
+        return true;
+    }
+    const int64_t n = lens.n_embd, hc = lens.hc, lr = lens.hc_lr;
+    if (n <= 0 || hc <= 0 || lr <= 0 || n > INT64_MAX/hc) {
+        return false;
+    }
+    const int64_t hd = n*hc;
+    if (hd > INT64_MAX/lr || lens.norm.size() != (size_t) hd ||
+        lens.down.size() != (size_t) (hd*lr) || lens.up.size() != (size_t) (hd*lr)) {
+        return false;
+    }
+    auto M = std::make_shared<server_trace_lens_mix>();
+    M->backend = ggml_backend_cpu_init();
+    M->ctx = ggml_init({32*ggml_tensor_overhead() + ggml_graph_overhead_custom(32, false), nullptr, true});
+    if (!M->backend || !M->ctx) {
+        return false;
+    }
+    ggml_backend_cpu_set_n_threads(M->backend, (int) std::max(1u, std::min(16u, std::thread::hardware_concurrency())));
+    const int64_t nc = std::max<int64_t>(1, (int64_t) n_layer + 1);
+    auto * ctx = M->ctx;
+    M->norm = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, hc);
+    M->down = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hd, lr);
+    M->up = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, lr, hd);
+    M->input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hd, nc);
+    auto * xn = ggml_mul(ctx, ggml_rms_norm(ctx, ggml_reshape_3d(ctx, M->input, n, hc, nc), lens.eps), M->norm);
+    xn = ggml_reshape_2d(ctx, xn, hd, nc);
+    auto * lo = ggml_silu(ctx, ggml_scale(ctx, ggml_mul_mat(ctx, M->down, xn), 1.0f/hc));
+    auto * g = ggml_sigmoid(ctx, ggml_mul_mat(ctx, M->up, lo));
+    auto * y = ggml_reshape_3d(ctx, ggml_mul(ctx, xn, g), n, hc, nc);
+    y = ggml_sum_rows(ctx, ggml_cont(ctx, ggml_permute(ctx, y, 1, 0, 2, 3)));
+    M->hidden = ggml_scale(ctx, ggml_reshape_2d(ctx, y, n, nc), 1.0f/hc);
+    M->graph = ggml_new_graph_custom(ctx, 32, false);
+    ggml_build_forward_expand(M->graph, M->hidden);
+    M->buffer = ggml_backend_alloc_ctx_tensors(ctx, M->backend);
+    if (!M->buffer) {
+        return false;
+    }
+    ggml_backend_tensor_set(M->norm, lens.norm.data(), 0, ggml_nbytes(M->norm));
+    ggml_backend_tensor_set(M->down, lens.down.data(), 0, ggml_nbytes(M->down));
+    ggml_backend_tensor_set(M->up, lens.up.data(), 0, ggml_nbytes(M->up));
+    lens.mix = std::move(M);
+    return true;
+}
+
+void server_moe_trace::lens_hidden_batch(const std::vector<const float *> & xs, std::vector<float> & out) {
+    out.resize(xs.size()*lens.n_embd);
+    if (xs.empty()) {
+        return;
+    }
+    if (lens_prepare_mix()) {
+        auto & M = *lens.mix;
+        const size_t hd = M.input->ne[0], nc = M.input->ne[1];
+        // Nonzero padding avoids 0/0 in RMSNorm when epsilon is zero.
+        std::vector<float> input(hd*nc, lens.eps == 0.0f ? 1.0f : 0.0f);
+        bool success = true;
+        for (size_t start = 0; start < xs.size(); start += nc) {
+            const size_t count = std::min(nc, xs.size() - start);
+            std::fill(input.begin(), input.end(), lens.eps == 0.0f ? 1.0f : 0.0f);
+            for (size_t c = 0; c < count; ++c) {
+                std::copy_n(xs[start + c], hd, input.data() + c*hd);
+            }
+            ggml_backend_tensor_set(M.input, input.data(), 0, ggml_nbytes(M.input));
+            if (ggml_backend_graph_compute(M.backend, M.graph) != GGML_STATUS_SUCCESS) {
+                success = false;
+                break;
+            }
+            ggml_backend_tensor_get(M.hidden, out.data() + start*lens.n_embd, 0, count*lens.n_embd*sizeof(float));
+        }
+        if (success) {
+            return;
+        }
+    }
+    std::vector<float> h;
+    for (size_t c = 0; c < xs.size(); ++c) {
+        lens_hidden(xs[c], h);
+        std::copy(h.begin(), h.end(), out.data() + c*lens.n_embd);
+    }
+}
+
 json server_moe_trace::block_push_json(int32_t col, const std::vector<llama_token> & tokens, const std::vector<float> & logits) {
     json ids = json::array();
     for (llama_token t : tokens) {
@@ -565,14 +664,22 @@ json server_moe_trace::block_push_json(int32_t col, const std::vector<llama_toke
     // lens logit per residual (hc_init, then after every block), per token; null where a residual is missing
     std::vector<std::vector<double>> lg(n_layer + 1);
     std::vector<bool> ok(n_layer + 1, false);
-    std::vector<float> h;
+    std::vector<const float *> xs;
+    std::vector<int32_t> residuals;
     for (int32_t r = 0; r <= n_layer; ++r) {
         const auto & R = resid[r];
         const float * x = R.rows == lens.hc*lens.n_embd ? trace_resid_col(R, col) : nullptr;
         if (!x) {
             continue;
         }
-        lens_hidden(x, h);
+        xs.push_back(x);
+        residuals.push_back(r);
+    }
+    std::vector<float> hidden;
+    lens_hidden_batch(xs, hidden);
+    for (size_t c = 0; c < xs.size(); ++c) {
+        const int32_t r = residuals[c];
+        const float * h = hidden.data() + c*lens.n_embd;
         lg[r].resize(tokens.size());
         for (size_t t = 0; t < tokens.size(); ++t) {
             const auto & w = lens_row(tokens[t]);
@@ -682,6 +789,18 @@ json server_moe_trace::checkpoints_json(int32_t col, llama_token tok, const std:
     std::vector<float> h, logits(nv), rows;
     std::vector<int32_t> ids(nv);
     const int64_t nk = std::min<int64_t>(top_k, nv);
+    std::vector<const float *> xs;
+    for (int32_t il : blocks) {
+        const auto & R = resid.at(il + 1);
+        const float * x = R.rows == lens.hc*lens.n_embd ? trace_resid_col(R, col) : nullptr;
+        const float * hin = il == n_layer - 1 && head_in.rows == lens.n_embd ? trace_resid_col(head_in, col) : nullptr;
+        if (x && !hin) {
+            xs.push_back(x);
+        }
+    }
+    std::vector<float> hidden;
+    lens_hidden_batch(xs, hidden);
+    size_t mixed = 0;
     for (int32_t il : blocks) {
         const auto & R = resid.at(il + 1);
         const float * x = R.rows == lens.hc*lens.n_embd ? trace_resid_col(R, col) : nullptr;
@@ -696,7 +815,8 @@ json server_moe_trace::checkpoints_json(int32_t col, llama_token tok, const std:
         if (hin) {
             h.assign(hin, hin + lens.n_embd);
         } else {
-            lens_hidden(x, h);
+            const float * mix = hidden.data() + mixed++*lens.n_embd;
+            h.assign(mix, mix + lens.n_embd);
         }
         if (H.graph) {
             ggml_backend_tensor_set(H.hidden, h.data(), 0, h.size()*sizeof(float));
