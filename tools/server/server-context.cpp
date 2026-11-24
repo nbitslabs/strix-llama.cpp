@@ -2472,6 +2472,17 @@ private:
 
         if (incomplete) {
             slot.has_next_token = true;
+            // A traced request promises one trace entry per generated token: a token whose text leaves an incomplete
+            // UTF-8 sequence is still recorded (and, when streaming, sent as a chunk with empty content) so its entry is
+            // not lost; the completing token then carries the whole character's text as before. Untraced requests keep
+            // the upstream behaviour (nothing until the character completes).
+            if (slot.task->params.trace_any()) {
+                result.text_to_send = "";
+                slot.add_token(result);
+                if (slot.task->params.stream) {
+                    send_partial_response(slot, result, false);
+                }
+            }
         }
 
         // if context shifting is disabled, make sure that we don't run out of context
