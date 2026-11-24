@@ -1204,6 +1204,11 @@ json server_task_result_cmpl_partial::to_json_oaicompat_chat() {
     for (const auto & diff : oaicompat_msg_diffs) {
         add_delta(server_chat_msg_diff_to_json_oaicompat(diff));
     }
+    if (deltas.empty() && !trace_output.is_null()) {
+        // a traced token with no text of its own (it left an incomplete UTF-8 sequence) still gets its chunk,
+        // so the stream carries one trace entry per generated token
+        add_delta({{"content", ""}});
+    }
 
     if (!deltas.empty()) {
         auto & last_json = deltas[deltas.size() - 1];
