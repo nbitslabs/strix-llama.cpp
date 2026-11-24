@@ -14,7 +14,8 @@
 // well, and each token reports ||l_last[il] - l_last[il-1]|| / ||l_last[il-1]|| over all streams at its column.
 // With "block_push": true the same residuals go through a logit lens on the CPU (the model's own final hc mixer, then
 // the output rows of the sampled token and its top candidates), and each token reports the per-block logit change.
-// With "checkpoints": {"after_blocks": [...], "top_k": 8}, selected residuals use the same lens over the full vocabulary.
+// With "checkpoints": {"after_blocks": [...], "top_k": 8}, selected residuals use the same lens over the full vocabulary;
+// the row after the last block uses the engine's own head input (result_norm), so it reproduces the engine's distribution.
 // A same-type CPU copy of the output head and a reusable matmul graph give top probabilities, sampled-token rank and entropy.
 // A generated token's entry is the column its logits came from, so the trace also works under speculative
 // decoding, where one verify batch yields several accepted tokens.
@@ -36,6 +37,8 @@ struct server_moe_trace {
     int64_t n_stream  = 1;     // hyper-connection streams of the wide residual (n_embd_out / n_embd)
     bool    installed = false;
     bool    want_block_update = false; // capture the residuals too (more data per layer, slower while on)
+    bool    want_head_in      = false; // capture the head input (result_norm) for checkpoints' last-block row
+    std::vector<char> resid_wanted;    // per resid index; empty = every residual (block_update / block_push)
 
     // logit lens for block_push: the final hc mixer weights (dequantized once) and the output rows asked for so far
     struct lens_weights {
@@ -73,10 +76,14 @@ struct server_moe_trace {
 
     std::vector<layer_capture> layers;
     std::vector<resid_capture> resid;     // [0] = hc_init, [il + 1] = l_last-<il>
+    resid_capture head_in;                // [n_embd] per column: the final mixer output the engine's head consumed (result_norm)
     int32_t ubatch_base   = 0;            // batch column of the current ubatch's first token (from hc_init)
     int32_t ubatch_n_tok  = 0;
 
     void init(int32_t n_layer, int64_t n_embd, int64_t n_stream);
+    // restrict the residual capture to hc_init + the listed blocks (nullptr = every residual); hc_init stays because it
+    // carries the ubatch column bookkeeping
+    void resid_filter(const std::vector<int32_t> * blocks);
 
     // install/remove the eval callback on the target context
     void install(llama_context * ctx);
@@ -104,6 +111,7 @@ private:
     bool lens_prepare_head(std::string & err);
     void capture(struct ggml_tensor * t, int kind, int32_t il);
     void capture_resid(struct ggml_tensor * t, int32_t idx);
+    void capture_head_in(struct ggml_tensor * t);
     const std::vector<float> & lens_row(llama_token tok);
     // the lens hidden state (final hc mixer output, [n_embd]) of one wide residual [hc][n_embd]
     void lens_hidden(const float * x, std::vector<float> & out) const;

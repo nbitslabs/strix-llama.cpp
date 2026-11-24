@@ -23,6 +23,7 @@ enum trace_kind {
     TRACE_KIND_EXPERTS,
     TRACE_KIND_WEIGHTS,
     TRACE_KIND_SHARED,
+    TRACE_KIND_HEADIN,
     TRACE_KIND_RESID,
 };
 
@@ -54,6 +55,10 @@ static int trace_classify(const char * name, int32_t & il) {
     if (trace_match_layer(name, "l_last", il)) {
         il += 1; // resid index
         return TRACE_KIND_RESID;
+    }
+    if (strcmp(name, "result_norm") == 0) {
+        il = -1;
+        return TRACE_KIND_HEADIN;
     }
     if (strcmp(name, "hc_init") == 0) {
         il = 0;
@@ -97,6 +102,7 @@ void server_moe_trace::begin_batch() {
     for (auto & r : resid) {
         r = resid_capture();
     }
+    head_in = resid_capture();
     ubatch_base  = 0;
     ubatch_n_tok = 0;
 }
@@ -109,8 +115,15 @@ bool server_moe_trace::eval_cb(struct ggml_tensor * t, bool ask, void * user_dat
     if (kind == TRACE_KIND_RESID && il == -2) {
         il = self->n_layer;
     }
-    const bool wanted = kind == TRACE_KIND_RESID ? (self->want_block_update && il >= 0 && il <= self->n_layer)
-                                                 : (kind != TRACE_KIND_NONE && il < self->n_layer);
+    bool wanted;
+    if (kind == TRACE_KIND_RESID) {
+        wanted = self->want_block_update && il >= 0 && il <= self->n_layer &&
+                 (self->resid_wanted.empty() || self->resid_wanted[il]);
+    } else if (kind == TRACE_KIND_HEADIN) {
+        wanted = self->want_head_in;
+    } else {
+        wanted = kind != TRACE_KIND_NONE && il < self->n_layer;
+    }
 
     if (ask) {
         return wanted;
@@ -118,6 +131,8 @@ bool server_moe_trace::eval_cb(struct ggml_tensor * t, bool ask, void * user_dat
     if (wanted) {
         if (kind == TRACE_KIND_RESID) {
             self->capture_resid(t, il);
+        } else if (kind == TRACE_KIND_HEADIN) {
+            self->capture_head_in(t);
         } else {
             self->capture(t, kind, il);
         }
@@ -227,6 +242,47 @@ void server_moe_trace::capture_resid(struct ggml_tensor * t, int32_t idx) {
             for (int64_t i = 0; i < n0; ++i) {
                 R.data.push_back(to_f32(buf.data() + i*t->nb[0] + j*nb_str + tk*nb_tok));
             }
+        }
+    }
+}
+
+void server_moe_trace::resid_filter(const std::vector<int32_t> * blocks) {
+    resid_wanted.clear();
+    if (!blocks) {
+        return;
+    }
+    resid_wanted.assign(resid.size(), 0);
+    resid_wanted[0] = 1;
+    for (int32_t il : *blocks) {
+        if (il + 1 >= 0 && il + 1 < (int32_t) resid.size()) {
+            resid_wanted[il + 1] = 1;
+        }
+    }
+}
+
+// the head input [n_embd, n_tokens] (result_norm): same column bookkeeping as the residuals, which hc_init maintains
+void server_moe_trace::capture_head_in(struct ggml_tensor * t) {
+    if (t->ne[0] != n_embd || t->ne[2] != 1 || t->ne[3] != 1) {
+        return;
+    }
+    const int64_t nt = t->ne[1];
+    const int32_t base = ubatch_base + (nt < ubatch_n_tok ? ubatch_n_tok - (int32_t) nt : 0);
+    const int64_t t_first = nt > 16 ? nt - 1 : 0;
+    std::vector<uint8_t> buf(ggml_nbytes(t));
+    ggml_backend_tensor_get(t, buf.data(), 0, buf.size());
+    head_in.rows = n_embd;
+    for (int64_t tk = t_first; tk < nt; ++tk) {
+        head_in.cols.push_back(base + (int32_t) tk);
+        for (int64_t i = 0; i < n_embd; ++i) {
+            const uint8_t * p = buf.data() + i*t->nb[0] + tk*t->nb[1];
+            float v = 0.0f;
+            switch (t->type) {
+                case GGML_TYPE_F32:  v = *(const float *) p; break;
+                case GGML_TYPE_F16:  v = ggml_fp16_to_fp32(*(const ggml_fp16_t *) p); break;
+                case GGML_TYPE_BF16: v = ggml_bf16_to_fp32(*(const ggml_bf16_t *) p); break;
+                default: break;
+            }
+            head_in.data.push_back(v);
         }
     }
 }
@@ -568,7 +624,13 @@ json server_moe_trace::checkpoints_json(int32_t col, llama_token tok, const std:
             }
             continue;
         }
-        lens_hidden(x, h);
+        // the last block's row takes the engine's own head input when it was captured, so it reproduces the engine
+        const float * hin = il == n_layer - 1 && head_in.rows == lens.n_embd ? trace_resid_col(head_in, col) : nullptr;
+        if (hin) {
+            h.assign(hin, hin + lens.n_embd);
+        } else {
+            lens_hidden(x, h);
+        }
         if (H.graph) {
             ggml_backend_tensor_set(H.hidden, h.data(), 0, h.size()*sizeof(float));
             if (ggml_backend_graph_compute(H.backend, H.graph) != GGML_STATUS_SUCCESS) {

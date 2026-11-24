@@ -2194,6 +2194,8 @@ private:
             moe_trace.init(llama_model_n_layer(model_tgt), llama_model_n_embd(model_tgt),
                            llama_model_n_embd_out(model_tgt) / std::max(1, llama_model_n_embd(model_tgt)));
             moe_trace.want_block_update = task.params.trace_block_update || task.params.trace_block_push || !task.params.trace_checkpoints.empty(); // the lens reads the same residuals
+            moe_trace.resid_filter(task.params.trace_block_update || task.params.trace_block_push ? nullptr : &task.params.trace_checkpoints);
+            moe_trace.want_head_in = !task.params.trace_checkpoints.empty();
             moe_trace.install(ctx_tgt);
         } else if (moe_trace.installed) {
             moe_trace.remove(ctx_tgt);
@@ -2596,7 +2598,7 @@ private:
 
     void trace_checkpoints(completion_token_output & result, int idx, const task_params & params) {
         result.trace["checkpoints"] = moe_trace.checkpoints_json(idx, result.tok, params.trace_checkpoints, params.trace_checkpoints_top_k);
-        result.trace["checkpoints_def"] = "p = softmax(out_scale * output_head(final_hc_mixer(resid[il+1])), temperature 1, full vocabulary); top is descending probability, final_prob is the sampled token probability, final_rank is 1 + count of strictly greater logits, entropy is -sum p ln p in nats; missing residuals are null";
+        result.trace["checkpoints_def"] = "p = softmax(out_scale * output_head(final_hc_mixer(resid[il+1])), temperature 1, full vocabulary); top is descending probability, final_prob is the sampled token probability, final_rank is 1 + count of strictly greater logits, entropy is -sum p ln p in nats; missing residuals are null; the last block's row is computed from the engine's own head input (result_norm)";
     }
 
     void populate_token_probs(const server_slot & slot, completion_token_output & result, bool post_sampling, bool special, int idx) const {
