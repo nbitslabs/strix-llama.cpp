@@ -2,11 +2,13 @@
 
 #include "ggml-backend.h"
 #include "ggml-alloc.h"
+#include "ggml-backend.h"
 #include "ggml-cpu.h"
 
 #include <algorithm>
 #include <numeric>
 #include <stdexcept>
+#include <thread>
 
 #include <cmath>
 #include <cstdlib>
@@ -482,7 +484,8 @@ struct server_trace_head {
     ggml_context * ctx = nullptr;
     ggml_backend_t backend = nullptr;
     ggml_backend_buffer_t buffer = nullptr;
-    ggml_tensor * output = nullptr;
+    ggml_tensor * output = nullptr; // the model's tensor (device path) or a host copy owned by ctx/buffer (CPU path)
+    bool owns_output = false;
     ggml_tensor * hidden = nullptr;
     ggml_tensor * logits = nullptr;
     ggml_cgraph * graph = nullptr;
@@ -499,20 +502,36 @@ bool server_moe_trace::lens_prepare_head(std::string & err) {
         return true;
     }
     auto H = std::make_shared<server_trace_head>();
-    const auto * out = lens.output;
+    auto * out = lens.output;
     if (!ggml_is_contiguous(out) || out->ne[2] != 1 || out->ne[3] != 1 ||
         (out->type != GGML_TYPE_F32 && !ggml_get_type_traits(out->type)->to_float)) {
         err = "unsupported output head layout or type";
         return false;
     }
-    H->backend = ggml_backend_cpu_init();
+    // Run the head on the device that holds the model's output tensor, with the model's own tensor and the backend's
+    // own mat-vec kernel: no host copy, and the same activation quantization the engine uses for its final logits,
+    // so the block-after-the-last-layer row reproduces the engine's distribution. A CPU backend with a host copy is
+    // the fallback (models on the CPU, or a device whose backend cannot be instantiated).
+    ggml_backend_dev_t dev = out->buffer ? ggml_backend_buft_get_device(ggml_backend_buffer_get_type(out->buffer)) : nullptr;
+    if (dev && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+        H->backend = ggml_backend_dev_init(dev, nullptr);
+    }
+    const bool on_device = H->backend != nullptr;
+    if (!on_device) {
+        H->backend = ggml_backend_cpu_init();
+        if (H->backend) {
+            ggml_backend_cpu_set_n_threads(H->backend, (int) std::max(1u, std::min(16u, std::thread::hardware_concurrency())));
+        }
+    }
     H->ctx = ggml_init({4*ggml_tensor_overhead() + ggml_graph_overhead_custom(8, false), nullptr, true});
     if (!H->backend || !H->ctx) {
-        err = "cannot allocate CPU backend or graph context";
+        err = "cannot allocate the head's backend or graph context";
         return false;
     }
-    H->output = ggml_dup_tensor(H->ctx, out);
-    if (ggml_get_type_traits_cpu(out->type)->vec_dot) {
+    // the device path uses the model tensor itself; the CPU path works on a same-type host copy
+    H->output = on_device ? out : ggml_dup_tensor(H->ctx, out);
+    H->owns_output = !on_device;
+    if (on_device || ggml_get_type_traits_cpu(out->type)->vec_dot) {
         H->hidden = ggml_new_tensor_2d(H->ctx, GGML_TYPE_F32, lens.n_embd, 1);
         H->logits = ggml_mul_mat(H->ctx, H->output, H->hidden);
         H->graph = ggml_new_graph_custom(H->ctx, 8, false);
@@ -520,10 +539,12 @@ bool server_moe_trace::lens_prepare_head(std::string & err) {
     }
     H->buffer = ggml_backend_alloc_ctx_tensors(H->ctx, H->backend);
     if (!H->buffer) {
-        err = "cannot allocate CPU output head buffer";
+        err = "cannot allocate the head's buffers";
         return false;
     }
-    ggml_backend_tensor_get(out, H->output->data, 0, ggml_nbytes(out));
+    if (H->owns_output) {
+        ggml_backend_tensor_get(out, H->output->data, 0, ggml_nbytes(out));
+    }
     lens.head = std::move(H);
     return true;
 }
