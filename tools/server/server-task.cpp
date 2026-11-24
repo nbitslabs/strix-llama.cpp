@@ -1121,6 +1121,9 @@ json server_task_result_cmpl_partial::to_json_non_oaicompat() {
     if (!trace_output.is_null()) {
         res["trace"] = trace_output;
     }
+    if (!prompt_tokens.is_null()) {
+        res["prompt_tokens"] = prompt_tokens;
+    }
     return res;
 }
 
@@ -1161,6 +1164,9 @@ json server_task_result_cmpl_partial::to_json_oaicompat() {
 
     if (!trace_output.is_null()) {
         res["trace"] = trace_output;
+    }
+    if (!prompt_tokens.is_null()) {
+        res["prompt_tokens"] = prompt_tokens;
     }
     return res;
 }
@@ -1217,6 +1223,9 @@ json server_task_result_cmpl_partial::to_json_oaicompat_chat() {
         }
         if (!trace_output.is_null()) {
             last_json["trace"] = trace_output;
+        }
+        if (!prompt_tokens.is_null()) {
+            last_json["prompt_tokens"] = prompt_tokens;
         }
     }
 

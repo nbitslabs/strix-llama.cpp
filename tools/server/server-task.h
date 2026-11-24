@@ -517,6 +517,7 @@ struct server_task_result_cmpl_partial : server_task_result {
     bool audio_commit_drained = false; // realtime: non-final commit has fully decoded
     completion_token_output prob_output;
     json trace_output; // streaming traced request: the trace entry of the token in this chunk
+    json prompt_tokens; // streaming "trace": {"attention"}: the prompt tokens, on the first chunk that carries trace data
     server_slot_stats stats;
     result_prompt_progress progress;
 

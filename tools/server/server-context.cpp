@@ -2598,6 +2598,22 @@ private:
             "reconstruction error; token_ids[0] is the sampled token, the rest the logprobs set or else the top 5 by final logit";
     }
 
+    // the prompt exactly as the model consumed it (after the chat template), so the attention rows over kv cells
+    // 0..n_pos-1 align with real tokens: len(prompt_tokens) == n_pos of the first generated token
+    json trace_prompt_tokens(const server_slot & slot) const {
+        const auto & toks = slot.task->tokens;
+        json out = json::array();
+        for (size_t i = 0; i < toks.size(); ++i) {
+            const llama_token id = toks[i];
+            std::string piece = common_token_to_piece(ctx_tgt, id, true);
+            if (validate_utf8(piece) != piece.size()) {
+                piece = tokens_to_output_formatted_string(ctx_tgt, id); // byte tokens as the probabilities output renders them
+            }
+            out.push_back({{"id", id}, {"piece", piece}});
+        }
+        return out;
+    }
+
     void trace_attention(completion_token_output & result, int idx, int batch_idx) {
         const int64_t n_pos = (int64_t) batch.tokens.at(batch_idx).pos[0] + 1;
         result.trace["attention"] = moe_trace.attention_json(idx, n_pos);
@@ -2728,6 +2744,9 @@ private:
 
         if (slot.task->params.trace_any() && !tkn.trace.is_null()) {
             res->trace_output = tkn.trace;
+            if (slot.task->params.trace_attention && slot.stats.n_gen == 1) {
+                res->prompt_tokens = trace_prompt_tokens(slot); // once, on the first chunk that carries trace data
+            }
         }
 
         // populate timings if this is final response or timings_per_token is enabled
@@ -2825,18 +2844,7 @@ private:
         }
 
         if (slot.task->params.trace_attention) {
-            // the prompt exactly as the model consumed it (after the chat template), so the attention rows over kv cells
-            // 0..n_pos-1 align with real tokens: len(prompt_tokens) == n_pos of the first generated token
-            const auto & toks = slot.task->tokens;
-            res->prompt_tokens = json::array();
-            for (size_t i = 0; i < toks.size(); ++i) {
-                const llama_token id = toks[i];
-                std::string piece = common_token_to_piece(ctx_tgt, id, true);
-                if (validate_utf8(piece) != piece.size()) {
-                    piece = tokens_to_output_formatted_string(ctx_tgt, id); // byte tokens as the probabilities output renders them
-                }
-                res->prompt_tokens.push_back({{"id", id}, {"piece", piece}});
-            }
+            res->prompt_tokens = trace_prompt_tokens(slot);
         }
 
         res->generation_params = slot.task->params; // copy the parameters
