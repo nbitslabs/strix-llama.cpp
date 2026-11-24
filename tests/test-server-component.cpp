@@ -4,6 +4,9 @@
 #include "../tools/server/server-common.h"
 #include "../tools/server/server-decision.h"
 #include "../tools/server/server-schema.h"
+#include "../tools/server/server-trace.h"
+#include "ggml-alloc.h"
+#include "ggml-cpu.h"
 
 #include <algorithm>
 #include <cmath>
@@ -856,6 +859,67 @@ static void test_pcm_f32_to_s16(testing & t) {
     t.assert_true ("empty",          pcm_f32_to_s16(nullptr, 0).empty());
 }
 
+static void test_checkpoints(testing & t) {
+    std::vector<int32_t> blocks;
+    int32_t top_k = 0;
+    parse_checkpoints(json::parse(R"({"after_blocks":[0,2]})"), blocks, top_k);
+    t.assert_true("blocks", blocks == std::vector<int32_t>({0, 2}));
+    t.assert_equal("default top_k", 8, top_k);
+    for (const char * text : {"null", "false", "[]", "{}", R"({"after_blocks":[]})",
+            R"({"after_blocks":[-1]})", R"({"after_blocks":[0,0]})", R"({"after_blocks":[2,1]})",
+            R"({"after_blocks":[1.0]})", R"({"after_blocks":[true]})", R"({"after_blocks":[18446744073709551615]})",
+            R"({"after_blocks":[0],"top_k":0})", R"({"after_blocks":[0],"top_k":257})",
+            R"({"after_blocks":[0],"top_k":null})", R"({"after_blocks":[0],"top_k":1.5})",
+            R"({"after_blocks":[0],"unknown":1})"}) {
+        bool rejected = false;
+        try {
+            parse_checkpoints(json::parse(text), blocks, top_k);
+        } catch (const std::invalid_argument & e) {
+            rejected = std::string(e.what()).find("checkpoints:") == 0;
+        }
+        t.assert_true(text, rejected);
+    }
+
+    ggml_context * ctx = ggml_init({ggml_tensor_overhead(), nullptr, true});
+    ggml_tensor * output = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2, 3);
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_cpu_buffer_type());
+    // The lens hidden is [0.5, 0.5], so these rows give probabilities [0.5, 0.25, 0.25].
+    const float weights[] = {2.0f*std::log(2.0f), 0, 0, 0, 0, 0};
+    ggml_backend_tensor_set(output, weights, 0, sizeof(weights));
+    {
+        server_moe_trace trace;
+        trace.init(2, 2, 1);
+        trace.lens.ready = true;
+        trace.lens.n_embd = 2;
+        trace.lens.hc = 1;
+        trace.lens.hc_lr = 1;
+        trace.lens.eps = 0;
+        trace.lens.norm = {1, 1};
+        trace.lens.down = {0, 0};
+        trace.lens.up = {0, 0};
+        trace.lens.output = output;
+        std::string err;
+        t.assert_true("prepare head", trace.lens_prepare(nullptr, err, true));
+        const auto head = trace.lens.head;
+        t.assert_true("reuse head", trace.lens_prepare(nullptr, err, true) && trace.lens.head == head);
+        trace.resid[1].rows = 2;
+        trace.resid[1].cols = {4};
+        trace.resid[1].data = {1, 1};
+        const json out = trace.checkpoints_json(4, 2, {0, 1}, 2);
+        t.assert_equal("top id", 0, out["top"][0][0]["id"].get<int>());
+        t.assert_true("top probability", std::abs(out["top"][0][0]["prob"].get<double>() - 0.5) < 1e-6);
+        t.assert_true("full vocab denominator", std::abs(out["final_prob"][0].get<double>() - 0.25) < 1e-6);
+        t.assert_equal("strict rank with tie", 2, out["final_rank"][0].get<int>());
+        t.assert_true("entropy nats", std::abs(out["entropy"][0].get<double>() - 1.5*std::log(2.0)) < 1e-6);
+        for (const char * key : {"top", "final_prob", "final_rank", "entropy"}) {
+            t.assert_true("missing residual", out[key][1].is_null());
+            t.assert_true("missing column", trace.checkpoints_json(3, 2, {0}, 2)[key][0].is_null());
+        }
+    }
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+}
+
 int main(int argc, char ** argv) {
     testing t;
 
@@ -868,6 +932,7 @@ int main(int argc, char ** argv) {
         t.set_filter(argv[1]);
     }
 
+    t.test("checkpoints", test_checkpoints);
     t.test("server_tokens", test_server_tokens);
     t.test("utf8",          test_utf8);
     t.test("sse",           test_sse);

@@ -1,6 +1,12 @@
 #include "server-trace.h"
 
 #include "ggml-backend.h"
+#include "ggml-alloc.h"
+#include "ggml-cpu.h"
+
+#include <algorithm>
+#include <numeric>
+#include <stdexcept>
 
 #include <cmath>
 #include <cstdlib>
@@ -313,9 +319,9 @@ static bool trace_tensor_f32(const ggml_tensor * t, int64_t r0, int64_t nr, std:
     return true;
 }
 
-bool server_moe_trace::lens_prepare(const llama_model * model, std::string & err) {
+bool server_moe_trace::lens_prepare(const llama_model * model, std::string & err, bool checkpoints) {
     if (lens.ready) {
-        return true;
+        return !checkpoints || lens_prepare_head(err);
     }
     auto find = [&](const char * name) -> ggml_tensor * {
         for (const auto & [n, t] : llama_internal_get_tensor_map(model)) {
@@ -364,7 +370,7 @@ bool server_moe_trace::lens_prepare(const llama_model * model, std::string & err
     L.output = out;
     L.ready  = true;
     lens = std::move(L);
-    return true;
+    return !checkpoints || lens_prepare_head(err);
 }
 
 const std::vector<float> & server_moe_trace::lens_row(llama_token tok) {
@@ -468,5 +474,127 @@ json server_moe_trace::block_push_json(int32_t col, const std::vector<llama_toke
     out["base"]  = base;
     out["push"]  = push;
     out["logit"] = fin;
+    return out;
+}
+
+// Keep the quantized head and graph alive with the lens; no vocabulary-sized f32 weight cache is needed.
+struct server_trace_head {
+    ggml_context * ctx = nullptr;
+    ggml_backend_t backend = nullptr;
+    ggml_backend_buffer_t buffer = nullptr;
+    ggml_tensor * output = nullptr;
+    ggml_tensor * hidden = nullptr;
+    ggml_tensor * logits = nullptr;
+    ggml_cgraph * graph = nullptr;
+
+    ~server_trace_head() {
+        ggml_backend_buffer_free(buffer);
+        ggml_backend_free(backend);
+        ggml_free(ctx);
+    }
+};
+
+bool server_moe_trace::lens_prepare_head(std::string & err) {
+    if (lens.head) {
+        return true;
+    }
+    auto H = std::make_shared<server_trace_head>();
+    const auto * out = lens.output;
+    if (!ggml_is_contiguous(out) || out->ne[2] != 1 || out->ne[3] != 1 ||
+        (out->type != GGML_TYPE_F32 && !ggml_get_type_traits(out->type)->to_float)) {
+        err = "unsupported output head layout or type";
+        return false;
+    }
+    H->backend = ggml_backend_cpu_init();
+    H->ctx = ggml_init({4*ggml_tensor_overhead() + ggml_graph_overhead_custom(8, false), nullptr, true});
+    if (!H->backend || !H->ctx) {
+        err = "cannot allocate CPU backend or graph context";
+        return false;
+    }
+    H->output = ggml_dup_tensor(H->ctx, out);
+    if (ggml_get_type_traits_cpu(out->type)->vec_dot) {
+        H->hidden = ggml_new_tensor_2d(H->ctx, GGML_TYPE_F32, lens.n_embd, 1);
+        H->logits = ggml_mul_mat(H->ctx, H->output, H->hidden);
+        H->graph = ggml_new_graph_custom(H->ctx, 8, false);
+        ggml_build_forward_expand(H->graph, H->logits);
+    }
+    H->buffer = ggml_backend_alloc_ctx_tensors(H->ctx, H->backend);
+    if (!H->buffer) {
+        err = "cannot allocate CPU output head buffer";
+        return false;
+    }
+    ggml_backend_tensor_get(out, H->output->data, 0, ggml_nbytes(out));
+    lens.head = std::move(H);
+    return true;
+}
+
+json server_moe_trace::checkpoints_json(int32_t col, llama_token tok, const std::vector<int32_t> & blocks, int32_t top_k) {
+    json out = {{"blocks", blocks}, {"top", json::array()}, {"final_prob", json::array()},
+                {"final_rank", json::array()}, {"entropy", json::array()}};
+    GGML_ASSERT(lens.head);
+    auto & H = *lens.head;
+    const int64_t nv = H.output->ne[1];
+    GGML_ASSERT(tok >= 0 && tok < nv);
+    std::vector<float> h, logits(nv), rows;
+    std::vector<int32_t> ids(nv);
+    const int64_t nk = std::min<int64_t>(top_k, nv);
+    for (int32_t il : blocks) {
+        const auto & R = resid.at(il + 1);
+        const float * x = R.rows == lens.hc*lens.n_embd ? trace_resid_col(R, col) : nullptr;
+        if (!x) {
+            for (const char * key : {"top", "final_prob", "final_rank", "entropy"}) {
+                out[key].push_back(nullptr);
+            }
+            continue;
+        }
+        lens_hidden(x, h);
+        if (H.graph) {
+            ggml_backend_tensor_set(H.hidden, h.data(), 0, h.size()*sizeof(float));
+            if (ggml_backend_graph_compute(H.backend, H.graph) != GGML_STATUS_SUCCESS) {
+                throw std::runtime_error("checkpoints: CPU output head computation failed");
+            }
+            ggml_backend_tensor_get(H.logits, logits.data(), 0, logits.size()*sizeof(float));
+        } else {
+            // Types without a CPU vec_dot use bounded row chunks, so fallback never expands the whole head to f32.
+            for (int64_t r0 = 0; r0 < nv; r0 += 32) {
+                const int64_t nr = std::min<int64_t>(32, nv - r0);
+                if (!trace_tensor_f32(H.output, r0, nr, rows)) {
+                    throw std::runtime_error("checkpoints: cannot dequantize output rows");
+                }
+                for (int64_t r = 0; r < nr; ++r) {
+                    double acc = 0.0;
+                    for (int64_t i = 0; i < lens.n_embd; ++i) {
+                        acc += (double) rows[r*lens.n_embd + i]*h[i];
+                    }
+                    logits[r0 + r] = (float) acc;
+                }
+            }
+        }
+        for (float & v : logits) {
+            v *= lens.out_scale;
+        }
+        const double max_logit = *std::max_element(logits.begin(), logits.end());
+        double sum = 0.0, weighted = 0.0;
+        int64_t rank = 1;
+        for (float v : logits) {
+            const double d = (double) v - max_logit;
+            const double e = std::exp(d);
+            sum += e;
+            weighted += e*d;
+            rank += v > logits[tok];
+        }
+        std::iota(ids.begin(), ids.end(), 0);
+        std::partial_sort(ids.begin(), ids.begin() + nk, ids.end(), [&](int32_t a, int32_t b) {
+            return logits[a] != logits[b] ? logits[a] > logits[b] : a < b;
+        });
+        json top = json::array();
+        for (int64_t k = 0; k < nk; ++k) {
+            top.push_back({{"id", ids[k]}, {"prob", std::exp((double) logits[ids[k]] - max_logit)/sum}});
+        }
+        out["top"].push_back(std::move(top));
+        out["final_prob"].push_back(std::exp((double) logits[tok] - max_logit)/sum);
+        out["final_rank"].push_back(rank);
+        out["entropy"].push_back(std::log(sum) - weighted/sum);
+    }
     return out;
 }

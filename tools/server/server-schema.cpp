@@ -199,6 +199,11 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
             ->set_desc("Also return, per generated token and layer, the relative L2 change of the residual stream across the block (slower while on)"))
         ->add_subfield((new field_bool("block_push", params.trace_block_push))
             ->set_desc("Also return, per generated token, the logit-lens change each block makes to the sampled token and its top candidates (the logprobs set, else the top 5)"))
+        ->add_subfield((new field_json("checkpoints"))
+            ->set_desc("Full-vocabulary logit lens after selected blocks: {after_blocks: [0, ...], top_k: 8}; top_k is 1..256")
+            ->set_handler([&](field_eval_context & ctx, const json & data) {
+                parse_checkpoints(data.at("checkpoints"), ctx.params.trace_checkpoints, ctx.params.trace_checkpoints_top_k);
+            }))
         ->set_desc("Opt-in per-token model internals; absent or all false leaves the response unchanged"));
 
     add((new field_json("intervene"))
@@ -573,6 +578,10 @@ task_params eval_llama_cmpl_schema(
     ctx.vocab          = vocab;
     ctx.logit_bias_eog = &logit_bias_eog;
 
+    // field_json treats null as absent, but checkpoints has no null form.
+    if (data.contains("trace") && data.at("trace").is_object() && data.at("trace").contains("checkpoints") && data.at("trace").at("checkpoints").is_null()) {
+        throw std::invalid_argument("checkpoints: must be an object");
+    }
     auto schema = make_llama_cmpl_schema(params_base, params);
 
     // eval all fields in the schema

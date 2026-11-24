@@ -83,7 +83,9 @@ struct task_params {
     bool trace_experts      = false; // opt-in per-token MoE router trace (request field "trace": {"experts": true})
     bool trace_block_update = false; // per-block residual update size ("trace": {"block_update": true})
     bool trace_block_push   = false; // per-block logit-lens push of the sampled and top tokens ("trace": {"block_push": true})
-    bool trace_any() const { return trace_experts || trace_block_update || trace_block_push; }
+    std::vector<int32_t> trace_checkpoints; // residuals after these blocks; empty = off
+    int32_t trace_checkpoints_top_k = 8;
+    bool trace_any() const { return trace_experts || trace_block_update || trace_block_push || !trace_checkpoints.empty(); }
     std::vector<llama_intervene_item> intervene; // research knock-outs ("intervene"), normalised; empty = none
     int32_t intervene_from_pos = 0;
     bool intervene_any() const { return !intervene.empty(); }
@@ -725,3 +727,6 @@ struct server_task_result_router : server_task_result {
 // "intervene" request field <-> knock-out items (throws std::invalid_argument with an "intervene: ..." message)
 void parse_intervene(const json & v, std::vector<llama_intervene_item> & items, int32_t & from_pos);
 json intervene_to_json(const std::vector<llama_intervene_item> & items, int32_t from_pos);
+
+// "trace": {"checkpoints": ...} -> ascending blocks and top_k (throws std::invalid_argument with a "checkpoints: ..." message)
+void parse_checkpoints(const json & v, std::vector<int32_t> & blocks, int32_t & top_k);

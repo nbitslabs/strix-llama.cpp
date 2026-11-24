@@ -1261,6 +1261,8 @@ private:
     int64_t t_last_load_progress_ms = 0;
 
     void destroy() {
+        moe_trace.lens = {}; // release the host head before the model can be reloaded
+
         spec.reset();
 
         smpl_spf.reset();
@@ -2182,16 +2184,16 @@ private:
                 send_error(task, "trace needs a single slot (-np 1): the capture is per context, not per slot", ERROR_TYPE_NOT_SUPPORTED);
                 return false;
             }
-            if (task.params.trace_block_push) {
+            if (task.params.trace_block_push || !task.params.trace_checkpoints.empty()) {
                 std::string err;
-                if (!moe_trace.lens_prepare(model_tgt, err)) {
-                    send_error(task, err, ERROR_TYPE_NOT_SUPPORTED);
+                if (!moe_trace.lens_prepare(model_tgt, err, !task.params.trace_checkpoints.empty())) {
+                    send_error(task, task.params.trace_checkpoints.empty() ? err : "checkpoints: " + err, ERROR_TYPE_NOT_SUPPORTED);
                     return false;
                 }
             }
             moe_trace.init(llama_model_n_layer(model_tgt), llama_model_n_embd(model_tgt),
                            llama_model_n_embd_out(model_tgt) / std::max(1, llama_model_n_embd(model_tgt)));
-            moe_trace.want_block_update = task.params.trace_block_update || task.params.trace_block_push; // the lens reads the same residuals
+            moe_trace.want_block_update = task.params.trace_block_update || task.params.trace_block_push || !task.params.trace_checkpoints.empty(); // the lens reads the same residuals
             moe_trace.install(ctx_tgt);
         } else if (moe_trace.installed) {
             moe_trace.remove(ctx_tgt);
@@ -2590,6 +2592,11 @@ private:
             "lens(l_last[il]) - lens(l_last[il-1]) (block 0 against hc_init), computed on the CPU in f32/f64 from the captured "
             "residuals and dequantized output rows; logit[t] = the engine's final logit, so base + sum(push) - logit is the lens "
             "reconstruction error; token_ids[0] is the sampled token, the rest the logprobs set or else the top 5 by final logit";
+    }
+
+    void trace_checkpoints(completion_token_output & result, int idx, const task_params & params) {
+        result.trace["checkpoints"] = moe_trace.checkpoints_json(idx, result.tok, params.trace_checkpoints, params.trace_checkpoints_top_k);
+        result.trace["checkpoints_def"] = "p = softmax(out_scale * output_head(final_hc_mixer(resid[il+1])), temperature 1, full vocabulary); top is descending probability, final_prob is the sampled token probability, final_rank is 1 + count of strictly greater logits, entropy is -sum p ln p in nats; missing residuals are null";
     }
 
     void populate_token_probs(const server_slot & slot, completion_token_output & result, bool post_sampling, bool special, int idx) const {
@@ -5274,6 +5281,9 @@ private:
             if (slot.task->params.trace_block_push) {
                 trace_block_push(result, tok_idx);
             }
+            if (!slot.task->params.trace_checkpoints.empty()) {
+                trace_checkpoints(result, tok_idx, slot.task->params);
+            }
 
             if (!process_token(result, slot)) {
                 // release slot because of stop condition
@@ -5427,6 +5437,9 @@ private:
 
                 if (slot.task->params.trace_block_push) {
                     trace_block_push(result, spec_i_batch[i]);
+                }
+                if (!slot.task->params.trace_checkpoints.empty()) {
+                    trace_checkpoints(result, spec_i_batch[i], slot.task->params);
                 }
 
                 slot.stats.n_gen += 1;
@@ -6034,6 +6047,11 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     params,
                     meta->logit_bias_eog,
                     data);
+            for (int32_t il : task.params.trace_checkpoints) {
+                if (il >= llama_model_n_layer(ctx_server.model_tgt)) {
+                    throw std::invalid_argument("checkpoints: after_blocks entry out of range for this model");
+                }
+            }
             if (task.params.intervene_any()) {
                 validate_intervene(ctx_server.model_tgt, task.params.intervene);
             }

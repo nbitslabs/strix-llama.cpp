@@ -14,6 +14,8 @@
 // well, and each token reports ||l_last[il] - l_last[il-1]|| / ||l_last[il-1]|| over all streams at its column.
 // With "block_push": true the same residuals go through a logit lens on the CPU (the model's own final hc mixer, then
 // the output rows of the sampled token and its top candidates), and each token reports the per-block logit change.
+// With "checkpoints": {"after_blocks": [...], "top_k": 8}, selected residuals use the same lens over the full vocabulary.
+// A same-type CPU copy of the output head and a reusable matmul graph give top probabilities, sampled-token rank and entropy.
 // A generated token's entry is the column its logits came from, so the trace also works under speculative
 // decoding, where one verify batch yields several accepted tokens.
 
@@ -22,8 +24,11 @@
 #include "llama.h"
 #include "ggml.h"
 
+#include <memory>
 #include <unordered_map>
 #include <vector>
+
+struct server_trace_head; // CPU copy of the output head for checkpoints, defined in server-trace.cpp
 
 struct server_moe_trace {
     int32_t n_layer   = 0;
@@ -45,6 +50,7 @@ struct server_moe_trace {
         std::vector<float> up;   // [hc*n_embd][hc_lr]
         struct ggml_tensor * output = nullptr;
         std::unordered_map<llama_token, std::vector<float>> rows;
+        std::shared_ptr<server_trace_head> head;
     };
     lens_weights lens;
 
@@ -84,7 +90,9 @@ struct server_moe_trace {
     json token_json(int32_t col, llama_token tok, bool experts, bool block_update) const;
 
     // load the final mixer weights of the model (once); false with an error message when the model has none
-    bool lens_prepare(const llama_model * model, std::string & err);
+    bool lens_prepare(const llama_model * model, std::string & err, bool checkpoints = false);
+
+    json checkpoints_json(int32_t col, llama_token tok, const std::vector<int32_t> & blocks, int32_t top_k);
 
     // {"token_ids": [...], "base": [...], "push": [[n_layer] per token], "logit": [...]} for the residuals at col;
     // tokens[0] is the sampled token, logits[t] the engine's final logit of tokens[t] (NaN when not available)
@@ -93,6 +101,7 @@ struct server_moe_trace {
     static bool eval_cb(struct ggml_tensor * t, bool ask, void * user_data);
 
 private:
+    bool lens_prepare_head(std::string & err);
     void capture(struct ggml_tensor * t, int kind, int32_t il);
     void capture_resid(struct ggml_tensor * t, int32_t idx);
     const std::vector<float> & lens_row(llama_token tok);

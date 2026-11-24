@@ -30,6 +30,10 @@ json task_params::format_logit_bias(const std::vector<llama_logit_bias> & logit_
 }
 
 json task_params::to_json(bool only_metrics) const {
+    json trace = {{"experts", trace_experts}, {"block_update", trace_block_update}, {"block_push", trace_block_push}};
+    if (!trace_checkpoints.empty()) {
+        trace["checkpoints"] = {{"after_blocks", trace_checkpoints}, {"top_k", trace_checkpoints_top_k}};
+    }
     std::vector<std::string> samplers;
     samplers.reserve(sampling.samplers.size());
     for (const auto & sampler : sampling.samplers) {
@@ -83,7 +87,7 @@ json task_params::to_json(bool only_metrics) const {
             {"speculative.types",         common_speculative_type_name_str(speculative.types)},
             {"timings_per_token",         timings_per_token},
             {"post_sampling_probs",       post_sampling_probs},
-            {"trace",                     json{{"experts", trace_experts}, {"block_update", trace_block_update}, {"block_push", trace_block_push}}},
+            {"trace",                     trace},
             {"backend_sampling",          sampling.backend_sampling},
             {"lora",                      lora},
         };
@@ -143,7 +147,7 @@ json task_params::to_json(bool only_metrics) const {
         {"speculative.types",         common_speculative_type_name_str(speculative.types)},
         {"timings_per_token",         timings_per_token},
         {"post_sampling_probs",       post_sampling_probs},
-        {"trace",                     json{{"experts", trace_experts}, {"block_update", trace_block_update}, {"block_push", trace_block_push}}},
+        {"trace",                     trace},
         {"backend_sampling",          sampling.backend_sampling},
         {"lora",                      lora},
     };
@@ -1879,4 +1883,40 @@ void parse_intervene(const json & v, std::vector<llama_intervene_item> & items, 
             }
         }
     }
+}
+
+void parse_checkpoints(const json & v, std::vector<int32_t> & blocks, int32_t & top_k) {
+    auto fail = [](const std::string & msg) {
+        throw std::invalid_argument("checkpoints: " + msg);
+    };
+    if (!v.is_object()) {
+        fail("must be an object");
+    }
+    for (const auto & it : v.items()) {
+        if (it.key() != "after_blocks" && it.key() != "top_k") {
+            fail("unknown key " + it.key());
+        }
+    }
+    auto get_int = [&](const json & x, int32_t lo, int32_t hi) -> int32_t {
+        if (!x.is_number_integer() || x.get<uint64_t>() > (uint64_t) hi) {
+            fail("expected an integer in [" + std::to_string(lo) + ", " + std::to_string(hi) + "]");
+        }
+        const int64_t n = x.get<int64_t>();
+        if (n < lo || n > hi) {
+            fail("expected an integer in [" + std::to_string(lo) + ", " + std::to_string(hi) + "]");
+        }
+        return (int32_t) n;
+    };
+    if (!v.contains("after_blocks") || !v.at("after_blocks").is_array() || v.at("after_blocks").empty()) {
+        fail("after_blocks must be a non-empty array");
+    }
+    blocks.clear();
+    for (const auto & b : v.at("after_blocks")) {
+        const int32_t il = get_int(b, 0, INT32_MAX);
+        if (!blocks.empty() && il <= blocks.back()) {
+            fail("after_blocks must be strictly ascending");
+        }
+        blocks.push_back(il);
+    }
+    top_k = v.contains("top_k") ? get_int(v.at("top_k"), 1, 256) : 8;
 }
