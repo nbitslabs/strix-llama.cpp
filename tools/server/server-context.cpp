@@ -2824,6 +2824,21 @@ private:
             res->intervene_applied = intervene_to_json(slot.task->params.intervene, slot.task->params.intervene_from_pos);
         }
 
+        if (slot.task->params.trace_attention) {
+            // the prompt exactly as the model consumed it (after the chat template), so the attention rows over kv cells
+            // 0..n_pos-1 align with real tokens: len(prompt_tokens) == n_pos of the first generated token
+            const auto & toks = slot.task->tokens;
+            res->prompt_tokens = json::array();
+            for (size_t i = 0; i < toks.size(); ++i) {
+                const llama_token id = toks[i];
+                std::string piece = common_token_to_piece(ctx_tgt, id, true);
+                if (validate_utf8(piece) != piece.size()) {
+                    piece = tokens_to_output_formatted_string(ctx_tgt, id); // byte tokens as the probabilities output renders them
+                }
+                res->prompt_tokens.push_back({{"id", id}, {"piece", piece}});
+            }
+        }
+
         res->generation_params = slot.task->params; // copy the parameters
 
         queue_results.send(std::move(res));

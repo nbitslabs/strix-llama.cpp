@@ -365,6 +365,9 @@ json server_task_result_cmpl_final::to_json_non_oaicompat() {
     if (!intervene_applied.is_null()) {
         res["intervene_applied"] = intervene_applied;
     }
+    if (!prompt_tokens.is_null()) {
+        res["prompt_tokens"] = prompt_tokens;
+    }
     return response_fields.empty() ? res : json_get_nested_values(response_fields, res);
 }
 
@@ -431,6 +434,9 @@ json server_task_result_cmpl_final::to_json_oaicompat() {
     if (!intervene_applied.is_null()) {
         res["intervene_applied"] = intervene_applied;
     }
+    if (!prompt_tokens.is_null()) {
+        res["prompt_tokens"] = prompt_tokens;
+    }
     return res;
 }
 
@@ -484,6 +490,9 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat() {
     }
     if (!intervene_applied.is_null()) {
         res["intervene_applied"] = intervene_applied;
+    }
+    if (!prompt_tokens.is_null()) {
+        res["prompt_tokens"] = prompt_tokens;
     }
     return res;
 }

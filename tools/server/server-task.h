@@ -443,6 +443,7 @@ struct server_task_result_cmpl_final : server_task_result {
     bool post_sampling_probs;
     std::vector<completion_token_output> probs_output;
     json trace_output; // non-streaming traced request: array with one entry per generated token
+    json prompt_tokens; // "trace": {"attention"}: the prompt as the model consumed it, [{"id", "piece"}], once per response
     json intervene_applied; // the knock-outs this request ran with (null without "intervene")
     std::vector<std::string>  response_fields;
 
