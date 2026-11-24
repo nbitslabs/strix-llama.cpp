@@ -2120,6 +2120,10 @@ bool llama_context::adapters_lora_are_same(llama_adapter_lora ** adapters, size_
     return true;
 }
 
+void llama_context::set_trace_attention(bool enable) {
+    trace_attn = enable;
+}
+
 bool llama_context::set_intervention(const llama_intervene_item * items, size_t n_items, llama_pos from_pos) {
     if (n_items == 0 || items == nullptr) {
         intv.reset();
@@ -3567,6 +3571,7 @@ llm_graph_params llama_context::graph_params(
         /*.samplers    =*/ sampling.samplers,
         /*.mtp_draft   =*/ mtp_draft.get(),
         /*.intv        =*/ intv,
+        /*.trace_attn  =*/ trace_attn,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
@@ -5639,6 +5644,10 @@ int32_t llama_set_adapters_lora(
     ctx->set_adapters_lora(adapters, n_adapters, scales);
 
     return 0;
+}
+
+void llama_set_trace_attention(llama_context * ctx, bool enable) {
+    ctx->set_trace_attention(enable);
 }
 
 int32_t llama_set_intervention(

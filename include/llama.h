@@ -820,6 +820,10 @@ extern "C" {
                           size_t   n_items,
                        llama_pos   from_pos);
 
+    // Enable attention-weight side nodes for the eval callback (off by default).
+    // Changing this flag rebuilds the graph; model outputs are unchanged.
+    LLAMA_API void llama_set_trace_attention(struct llama_context * ctx, bool enable);
+
     //
     // Memory
     //

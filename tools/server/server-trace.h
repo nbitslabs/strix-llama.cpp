@@ -37,6 +37,7 @@ struct server_moe_trace {
     int64_t n_stream  = 1;     // hyper-connection streams of the wide residual (n_embd_out / n_embd)
     bool    installed = false;
     bool    want_block_update = false; // capture the residuals too (more data per layer, slower while on)
+    bool    want_attention    = false;
     bool    want_head_in      = false; // capture the head input (result_norm) for checkpoints' last-block row
     std::vector<char> resid_wanted;    // per resid index; empty = every residual (block_update / block_push)
 
@@ -74,6 +75,14 @@ struct server_moe_trace {
         std::vector<float>   data;        // [cols.size()][rows]
     };
 
+    struct attention_capture {
+        int64_t n_head = 0;
+        int64_t n_kv = 0;
+        std::vector<int32_t> cols;
+        std::vector<std::vector<float>> data; // [column][head][kv cell]; KV extent can change between ubatches
+    };
+    std::vector<attention_capture> attention;
+
     std::vector<layer_capture> layers;
     std::vector<resid_capture> resid;     // [0] = hc_init, [il + 1] = l_last-<il>
     resid_capture head_in;                // [n_embd] per column: the final mixer output the engine's head consumed (result_norm)
@@ -99,6 +108,8 @@ struct server_moe_trace {
     // load the final mixer weights of the model (once); false with an error message when the model has none
     bool lens_prepare(const llama_model * model, std::string & err, bool checkpoints = false);
 
+    json attention_json(int32_t col, int64_t n_pos) const;
+
     json checkpoints_json(int32_t col, llama_token tok, const std::vector<int32_t> & blocks, int32_t top_k);
 
     // {"token_ids": [...], "base": [...], "push": [[n_layer] per token], "logit": [...]} for the residuals at col;
@@ -111,6 +122,7 @@ private:
     bool lens_prepare_head(std::string & err);
     void capture(struct ggml_tensor * t, int kind, int32_t il);
     void capture_resid(struct ggml_tensor * t, int32_t idx);
+    void capture_attention(struct ggml_tensor * t, int32_t il);
     void capture_head_in(struct ggml_tensor * t);
     const std::vector<float> & lens_row(llama_token tok);
     // the lens hidden state (final hc mixer output, [n_embd]) of one wide residual [hc][n_embd]

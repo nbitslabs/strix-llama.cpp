@@ -2196,6 +2196,8 @@ private:
             moe_trace.want_block_update = task.params.trace_block_update || task.params.trace_block_push || !task.params.trace_checkpoints.empty(); // the lens reads the same residuals
             moe_trace.resid_filter(task.params.trace_block_update || task.params.trace_block_push ? nullptr : &task.params.trace_checkpoints);
             moe_trace.want_head_in = !task.params.trace_checkpoints.empty();
+            moe_trace.want_attention = task.params.trace_attention;
+            llama_set_trace_attention(ctx_tgt, task.params.trace_attention);
             moe_trace.install(ctx_tgt);
         } else if (moe_trace.installed) {
             moe_trace.remove(ctx_tgt);
@@ -2594,6 +2596,12 @@ private:
             "lens(l_last[il]) - lens(l_last[il-1]) (block 0 against hc_init), computed on the CPU in f32/f64 from the captured "
             "residuals and dequantized output rows; logit[t] = the engine's final logit, so base + sum(push) - logit is the lens "
             "reconstruction error; token_ids[0] is the sampled token, the rest the logprobs set or else the top 5 by final logit";
+    }
+
+    void trace_attention(completion_token_output & result, int idx, int batch_idx) {
+        const int64_t n_pos = (int64_t) batch.tokens.at(batch_idx).pos[0] + 1;
+        result.trace["attention"] = moe_trace.attention_json(idx, n_pos);
+        result.trace["attention_def"] = "softmax(q.K^T * kq_scale + mask) of the query token over kv cells 0..n_pos-1 per head; full-attention blocks only; cells equal token positions for a single sequence that was not shifted or defragmented";
     }
 
     void trace_checkpoints(completion_token_output & result, int idx, const task_params & params) {
@@ -5286,6 +5294,9 @@ private:
             if (!slot.task->params.trace_checkpoints.empty()) {
                 trace_checkpoints(result, tok_idx, slot.task->params);
             }
+            if (slot.task->params.trace_attention) {
+                trace_attention(result, tok_idx, off + tok_idx);
+            }
 
             if (!process_token(result, slot)) {
                 // release slot because of stop condition
@@ -5442,6 +5453,9 @@ private:
                 }
                 if (!slot.task->params.trace_checkpoints.empty()) {
                     trace_checkpoints(result, spec_i_batch[i], slot.task->params);
+                }
+                if (slot.task->params.trace_attention) {
+                    trace_attention(result, spec_i_batch[i], spec_i_batch[i]);
                 }
 
                 slot.stats.n_gen += 1;

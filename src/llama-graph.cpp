@@ -1689,6 +1689,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     vsub             (params.vsub),
     intv             (params.intv.get()),
     intv_ref         (params.intv),
+    trace_attn       (params.trace_attn),
     ctx0             (res->get_ctx()),
     gf               (res->get_gf()) {
         res->set_params(params);
@@ -3274,6 +3275,55 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     v = ggml_permute(ctx0, v, 0, 2, 1, 3);
 
     ggml_tensor * cur;
+
+    // Rows-gathered KV layouts are not supported by the dense trace side nodes.
+    if (trace_attn && il >= 0 && kv_rows == nullptr) {
+        const int64_t n_tail = std::min<int64_t>(q->ne[1], 8);
+        const int64_t first = q->ne[1] - n_tail;
+        auto tail = [&](ggml_tensor * t) {
+            return ggml_view_4d(ctx0, t, t->ne[0], n_tail, t->ne[2], t->ne[3], t->nb[1], t->nb[2], t->nb[3], first*t->nb[1]);
+        };
+        ggml_tensor * mask = kq_mask ? ggml_cont(ctx0, tail(kq_mask)) : nullptr;
+        if (top_k && !mask) {
+            // Reconstruct the maskless selected-key path; top_k_mask ignores invalid picks, including -1.
+            const int64_t n_raw = std::min<int64_t>(n_kv_raw, k->ne[1]);
+            mask = ggml_fill(ctx0, ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, k->ne[1], n_tail, 1, q->ne[3]), 0.0f);
+            if (n_raw < k->ne[1]) {
+                ggml_tensor * selected = ggml_view_4d(ctx0, mask, k->ne[1] - n_raw, n_tail, 1, q->ne[3], mask->nb[1], mask->nb[2], mask->nb[3], n_raw*mask->nb[0]);
+                selected = ggml_top_k_mask(ctx0, selected, tail(top_k), nullptr, nullptr, nullptr);
+                if (n_raw > 0) {
+                    ggml_tensor * prefix = ggml_view_4d(ctx0, mask, n_raw, n_tail, 1, q->ne[3], mask->nb[1], mask->nb[2], mask->nb[3], 0);
+                    selected = ggml_concat(ctx0, prefix, selected, 0);
+                }
+                mask = selected;
+            }
+        }
+        ggml_tensor * attn = ggml_mul_mat(ctx0, k, tail(q));
+        ggml_prec_set_acc(attn, GGML_PREC_BF16);
+        if (model.arch == LLM_ARCH_GROK) {
+            attn = ggml_tanh(ctx0, ggml_scale(ctx0, attn, hparams.f_attn_out_scale / hparams.f_attn_logit_softcapping));
+            attn = ggml_scale(ctx0, attn, hparams.f_attn_logit_softcapping);
+        }
+        if (hparams.attn_soft_cap) {
+            attn = ggml_scale(ctx0, attn, 1.0f / hparams.f_attn_logit_softcapping);
+            attn = ggml_tanh(ctx0, attn);
+            attn = ggml_scale(ctx0, attn, hparams.f_attn_logit_softcapping);
+        }
+        if (kq_b) {
+            attn = ggml_add(ctx0, attn, kq_b->ne[1] == 1 ? kq_b : tail(kq_b));
+        }
+        if (sinks && !ggml_is_vector(sinks)) {
+            const int64_t n_kv = attn->ne[0];
+            attn = ggml_add(ctx0, ggml_scale(ctx0, attn, kq_scale), ggml_cast(ctx0, mask, GGML_TYPE_F32));
+            attn = ggml_soft_max(ctx0, ggml_concat(ctx0, attn, ggml_cont(ctx0, tail(sinks)), 0));
+            attn = ggml_cont(ctx0, ggml_view_4d(ctx0, attn, n_kv, n_tail, attn->ne[2], attn->ne[3], attn->nb[1], attn->nb[2], attn->nb[3], 0));
+        } else {
+            attn = ggml_soft_max_ext(ctx0, attn, mask, kq_scale, hparams.f_max_alibi_bias);
+            ggml_soft_max_add_sinks(attn, sinks);
+        }
+        cb(attn, "attn_weights", il);
+        ggml_build_forward_expand(gf, attn);
+    }
 
     const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr && (!sinks || ggml_is_vector(sinks));
     GGML_ASSERT(use_flash_attn || kv_rows == nullptr);

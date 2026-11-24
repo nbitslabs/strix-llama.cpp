@@ -30,7 +30,7 @@ json task_params::format_logit_bias(const std::vector<llama_logit_bias> & logit_
 }
 
 json task_params::to_json(bool only_metrics) const {
-    json trace = {{"experts", trace_experts}, {"block_update", trace_block_update}, {"block_push", trace_block_push}};
+    json trace = {{"attention", trace_attention}, {"experts", trace_experts}, {"block_update", trace_block_update}, {"block_push", trace_block_push}};
     if (!trace_checkpoints.empty()) {
         trace["checkpoints"] = {{"after_blocks", trace_checkpoints}, {"top_k", trace_checkpoints_top_k}};
     }
@@ -1804,17 +1804,18 @@ json intervene_to_json(const std::vector<llama_intervene_item> & items, int32_t 
     };
 }
 
+[[noreturn]] static void intervene_fail(const std::string & msg) {
+    throw std::invalid_argument("intervene: " + msg);
+}
+
 void parse_intervene(const json & v, std::vector<llama_intervene_item> & items, int32_t & from_pos) {
-    auto fail = [](const std::string & msg) {
-        throw std::invalid_argument("intervene: " + msg);
-    };
     auto get_int = [&](const json & o, const char * key, const char * where) -> int32_t {
         if (!o.contains(key) || !o.at(key).is_number_integer()) {
-            fail(std::string(where) + " needs an integer \"" + key + "\"");
+            intervene_fail(std::string(where) + " needs an integer \"" + key + "\"");
         }
         const int64_t x = o.at(key).get<int64_t>();
         if (x < 0 || x > INT32_MAX) {
-            fail(std::string(where) + " \"" + key + "\" out of range");
+            intervene_fail(std::string(where) + " \"" + key + "\" out of range");
         }
         return (int32_t) x;
     };
@@ -1825,29 +1826,29 @@ void parse_intervene(const json & v, std::vector<llama_intervene_item> & items, 
                 known = known || k == key;
             }
             if (!known) {
-                fail(std::string("unknown key \"") + k + "\" in " + where);
+                intervene_fail(std::string("unknown key \"") + k + "\" in " + where);
             }
         }
     };
 
     if (!v.is_object()) {
-        fail("must be an object");
+        intervene_fail("must be an object");
     }
     check_keys(v, {"experts", "blocks", "from_pos"}, "intervene"); // "directions" is not implemented: rejected here
     items.clear();
     from_pos = v.contains("from_pos") ? get_int(v, "from_pos", "intervene") : 0;
     if (v.contains("experts")) {
         if (!v.at("experts").is_array()) {
-            fail("\"experts\" must be an array");
+            intervene_fail("\"experts\" must be an array");
         }
         for (const auto & e : v.at("experts")) {
             if (!e.is_object()) {
-                fail("each experts entry must be an object");
+                intervene_fail("each experts entry must be an object");
             }
             check_keys(e, {"block", "expert", "mode"}, "an experts entry");
             const std::string mode = e.contains("mode") && e.at("mode").is_string() ? e.at("mode").get<std::string>() : "";
             if (mode != "zero" && mode != "mask") {
-                fail("experts mode must be \"zero\" or \"mask\"");
+                intervene_fail("experts mode must be \"zero\" or \"mask\"");
             }
             items.push_back({ get_int(e, "block", "an experts entry"), get_int(e, "expert", "an experts entry"),
                               mode == "zero" ? LLAMA_INTERVENE_EXPERT_ZERO : LLAMA_INTERVENE_EXPERT_MASK });
@@ -1855,15 +1856,15 @@ void parse_intervene(const json & v, std::vector<llama_intervene_item> & items, 
     }
     if (v.contains("blocks")) {
         if (!v.at("blocks").is_array()) {
-            fail("\"blocks\" must be an array");
+            intervene_fail("\"blocks\" must be an array");
         }
         for (const auto & b : v.at("blocks")) {
             if (!b.is_object()) {
-                fail("each blocks entry must be an object");
+                intervene_fail("each blocks entry must be an object");
             }
             check_keys(b, {"block", "mode"}, "a blocks entry");
             if (!b.contains("mode") || b.at("mode") != "skip") {
-                fail("blocks mode must be \"skip\"");
+                intervene_fail("blocks mode must be \"skip\"");
             }
             items.push_back({ get_int(b, "block", "a blocks entry"), -1, LLAMA_INTERVENE_BLOCK_SKIP });
         }
@@ -1879,42 +1880,43 @@ void parse_intervene(const json & v, std::vector<llama_intervene_item> & items, 
         for (size_t j = i + 1; j < items.size(); ++j) {
             if (items[i].mode != LLAMA_INTERVENE_BLOCK_SKIP && items[j].mode != LLAMA_INTERVENE_BLOCK_SKIP &&
                 items[i].block == items[j].block && items[i].expert == items[j].expert) {
-                fail("expert " + std::to_string(items[i].expert) + " of block " + std::to_string(items[i].block) + " is both zeroed and masked");
+                intervene_fail("expert " + std::to_string(items[i].expert) + " of block " + std::to_string(items[i].block) + " is both zeroed and masked");
             }
         }
     }
 }
 
+[[noreturn]] static void checkpoints_fail(const std::string & msg) {
+    throw std::invalid_argument("checkpoints: " + msg);
+}
+
 void parse_checkpoints(const json & v, std::vector<int32_t> & blocks, int32_t & top_k) {
-    auto fail = [](const std::string & msg) {
-        throw std::invalid_argument("checkpoints: " + msg);
-    };
     if (!v.is_object()) {
-        fail("must be an object");
+        checkpoints_fail("must be an object");
     }
     for (const auto & it : v.items()) {
         if (it.key() != "after_blocks" && it.key() != "top_k") {
-            fail("unknown key " + it.key());
+            checkpoints_fail("unknown key " + it.key());
         }
     }
     auto get_int = [&](const json & x, int32_t lo, int32_t hi) -> int32_t {
         if (!x.is_number_integer() || x.get<uint64_t>() > (uint64_t) hi) {
-            fail("expected an integer in [" + std::to_string(lo) + ", " + std::to_string(hi) + "]");
+            checkpoints_fail("expected an integer in [" + std::to_string(lo) + ", " + std::to_string(hi) + "]");
         }
         const int64_t n = x.get<int64_t>();
         if (n < lo || n > hi) {
-            fail("expected an integer in [" + std::to_string(lo) + ", " + std::to_string(hi) + "]");
+            checkpoints_fail("expected an integer in [" + std::to_string(lo) + ", " + std::to_string(hi) + "]");
         }
         return (int32_t) n;
     };
     if (!v.contains("after_blocks") || !v.at("after_blocks").is_array() || v.at("after_blocks").empty()) {
-        fail("after_blocks must be a non-empty array");
+        checkpoints_fail("after_blocks must be a non-empty array");
     }
     blocks.clear();
     for (const auto & b : v.at("after_blocks")) {
         const int32_t il = get_int(b, 0, INT32_MAX);
         if (!blocks.empty() && il <= blocks.back()) {
-            fail("after_blocks must be strictly ascending");
+            checkpoints_fail("after_blocks must be strictly ascending");
         }
         blocks.push_back(il);
     }

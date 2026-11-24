@@ -859,6 +859,52 @@ static void test_pcm_f32_to_s16(testing & t) {
     t.assert_true ("empty",          pcm_f32_to_s16(nullptr, 0).empty());
 }
 
+static void test_attention(testing & t) {
+    common_params params_base;
+    const auto eval = [&](const json & data) {
+        return server_schema::eval_llama_cmpl_schema(nullptr, params_base, {}, data);
+    };
+    t.assert_true("off by default", !eval(json::object()).trace_any());
+    for (const char * text : {R"({"trace":{"attention":true}})", R"({"trace_attention":true})"}) {
+        const auto params = eval(json::parse(text));
+        t.assert_true("attention enabled", params.trace_attention && params.trace_any());
+        t.assert_true("round trip", params.to_json(false)["trace"]["attention"].get<bool>());
+    }
+    t.assert_true("nested overrides flat", !eval(json::parse(R"({"trace_attention":true,"trace":{"attention":false}})")).trace_attention);
+    for (const char * text : {R"({"trace":{"attention":1}})", R"({"trace_attention":"true"})"}) {
+        bool rejected = false;
+        try {
+            eval(json::parse(text));
+        } catch (const std::exception &) {
+            rejected = true;
+        }
+        t.assert_true("reject non-boolean", rejected);
+    }
+
+    server_moe_trace trace;
+    trace.init(3, 2, 1);
+    trace.want_attention = true;
+    trace.ubatch_base = 4;
+    trace.ubatch_n_tok = 3;
+    ggml_context * ctx = ggml_init({4*ggml_tensor_overhead(), nullptr, true});
+    ggml_tensor * weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 4, 2, 2);
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_cpu_buffer_type());
+    for (int i = 0; i < 16; ++i) {
+        ((float *) weights->data)[i] = (float) i/16;
+    }
+    ggml_set_name(weights, "attn_weights-1");
+    t.assert_true("wanted", server_moe_trace::eval_cb(weights, true, &trace));
+    server_moe_trace::eval_cb(weights, false, &trace);
+    const json out = trace.attention_json(5, 3);
+    t.assert_true("full-attention blocks", out["blocks"] == json::array({1}));
+    t.assert_true("head strides and trim", out["heads"][0] == json::array({json::array({0.0f, 1.0f/16, 2.0f/16}), json::array({8.0f/16, 9.0f/16, 10.0f/16})}));
+    t.assert_true("missing column", trace.attention_json(4, 3)["heads"][0].is_null());
+    trace.begin_batch();
+    t.assert_true("reset", trace.attention_json(5, 3)["blocks"].empty());
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+}
+
 static void test_checkpoints(testing & t) {
     std::vector<int32_t> blocks;
     int32_t top_k = 0;
@@ -932,6 +978,7 @@ int main(int argc, char ** argv) {
         t.set_filter(argv[1]);
     }
 
+    t.test("attention", test_attention);
     t.test("checkpoints", test_checkpoints);
     t.test("server_tokens", test_server_tokens);
     t.test("utf8",          test_utf8);

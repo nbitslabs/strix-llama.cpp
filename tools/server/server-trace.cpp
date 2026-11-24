@@ -23,6 +23,7 @@ enum trace_kind {
     TRACE_KIND_EXPERTS,
     TRACE_KIND_WEIGHTS,
     TRACE_KIND_SHARED,
+    TRACE_KIND_ATTENTION,
     TRACE_KIND_HEADIN,
     TRACE_KIND_RESID,
 };
@@ -43,6 +44,9 @@ static bool trace_match_layer(const char * name, const char * prefix, int32_t & 
 }
 
 static int trace_classify(const char * name, int32_t & il) {
+    if (trace_match_layer(name, "attn_weights", il)) {
+        return TRACE_KIND_ATTENTION;
+    }
     if (trace_match_layer(name, "ffn_moe_topk", il)) {
         return TRACE_KIND_EXPERTS;
     }
@@ -76,6 +80,7 @@ void server_moe_trace::init(int32_t n_layer_, int64_t n_embd_, int64_t n_stream_
     n_embd   = n_embd_;
     n_stream = n_stream_ > 0 ? n_stream_ : 1;
     layers.assign(n_layer, layer_capture());
+    attention.assign(n_layer, attention_capture());
     resid.assign(n_layer + 1, resid_capture());
 }
 
@@ -87,6 +92,7 @@ void server_moe_trace::install(llama_context * ctx) {
 }
 
 void server_moe_trace::remove(llama_context * ctx) {
+    llama_set_trace_attention(ctx, false);
     if (installed) {
         llama_set_eval_callback(ctx, nullptr, nullptr);
         installed = false;
@@ -101,6 +107,9 @@ void server_moe_trace::begin_batch() {
     }
     for (auto & r : resid) {
         r = resid_capture();
+    }
+    for (auto & a : attention) {
+        a = attention_capture();
     }
     head_in = resid_capture();
     ubatch_base  = 0;
@@ -117,8 +126,10 @@ bool server_moe_trace::eval_cb(struct ggml_tensor * t, bool ask, void * user_dat
     }
     bool wanted;
     if (kind == TRACE_KIND_RESID) {
-        wanted = self->want_block_update && il >= 0 && il <= self->n_layer &&
+        wanted = (self->want_block_update || (self->want_attention && il == 0)) && il >= 0 && il <= self->n_layer &&
                  (self->resid_wanted.empty() || self->resid_wanted[il]);
+    } else if (kind == TRACE_KIND_ATTENTION) {
+        wanted = self->want_attention && il >= 0 && il < self->n_layer;
     } else if (kind == TRACE_KIND_HEADIN) {
         wanted = self->want_head_in;
     } else {
@@ -131,6 +142,8 @@ bool server_moe_trace::eval_cb(struct ggml_tensor * t, bool ask, void * user_dat
     if (wanted) {
         if (kind == TRACE_KIND_RESID) {
             self->capture_resid(t, il);
+        } else if (kind == TRACE_KIND_ATTENTION) {
+            self->capture_attention(t, il);
         } else if (kind == TRACE_KIND_HEADIN) {
             self->capture_head_in(t);
         } else {
@@ -285,6 +298,60 @@ void server_moe_trace::capture_head_in(struct ggml_tensor * t) {
             head_in.data.push_back(v);
         }
     }
+}
+
+void server_moe_trace::capture_attention(struct ggml_tensor * t, int32_t il) {
+    if (t->type != GGML_TYPE_F32 || t->ne[3] != 1) {
+        return;
+    }
+    auto & a = attention[il];
+    a.n_kv = t->ne[0];
+    a.n_head = t->ne[2];
+    const int64_t nt = t->ne[1];
+    const int32_t base = ubatch_base + ubatch_n_tok - (int32_t) nt;
+    std::vector<uint8_t> buf(ggml_nbytes(t));
+    ggml_backend_tensor_get(t, buf.data(), 0, buf.size());
+    for (int64_t j = 0; j < nt; ++j) {
+        a.cols.push_back(base + (int32_t) j);
+        a.data.emplace_back();
+        a.data.back().reserve(a.n_head*a.n_kv);
+        for (int64_t h = 0; h < a.n_head; ++h) {
+            for (int64_t p = 0; p < a.n_kv; ++p) {
+                float v;
+                memcpy(&v, buf.data() + p*t->nb[0] + j*t->nb[1] + h*t->nb[2], sizeof(v));
+                a.data.back().push_back(v);
+            }
+        }
+    }
+}
+
+json server_moe_trace::attention_json(int32_t col, int64_t n_pos) const {
+    json out = {{"blocks", json::array()}, {"heads", json::array()}};
+    for (int32_t il = 0; il < n_layer; ++il) {
+        const auto & a = attention[il];
+        if (!a.n_head) {
+            continue;
+        }
+        out["blocks"].push_back(il);
+        auto it = std::find(a.cols.begin(), a.cols.end(), col);
+        if (it == a.cols.end() || n_pos < 0) {
+            out["heads"].push_back(nullptr);
+            continue;
+        }
+        const auto & data = a.data[it - a.cols.begin()];
+        const int64_t n_kv = data.size()/a.n_head;
+        if (n_pos > n_kv) {
+            out["heads"].push_back(nullptr);
+            continue;
+        }
+        json heads = json::array();
+        for (int64_t h = 0; h < a.n_head; ++h) {
+            const float * row = data.data() + h*n_kv;
+            heads.push_back(std::vector<float>(row, row + n_pos));
+        }
+        out["heads"].push_back(std::move(heads));
+    }
+    return out;
 }
 
 static const float * trace_resid_col(const server_moe_trace::resid_capture & R, int32_t col) {
