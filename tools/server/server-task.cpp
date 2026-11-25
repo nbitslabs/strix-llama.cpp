@@ -31,6 +31,9 @@ json task_params::format_logit_bias(const std::vector<llama_logit_bias> & logit_
 
 json task_params::to_json(bool only_metrics) const {
     json trace = {{"attention", trace_attention}, {"experts", trace_experts}, {"block_update", trace_block_update}, {"block_push", trace_block_push}};
+    if (trace_gdn) {
+        trace["gdn"] = {{"top_k", trace_gdn_top_k}, {"max_pos", trace_gdn_max_pos}};
+    }
     if (!trace_checkpoints.empty()) {
         trace["checkpoints"] = {{"after_blocks", trace_checkpoints}, {"top_k", trace_checkpoints_top_k}};
     }
@@ -1944,4 +1947,30 @@ void parse_checkpoints(const json & v, std::vector<int32_t> & blocks, int32_t & 
         blocks.push_back(il);
     }
     top_k = v.contains("top_k") ? get_int(v.at("top_k"), 1, 256) : 8;
+}
+
+void parse_gdn(const json & v, bool & enabled, int32_t & top_k, int32_t & max_pos) {
+    enabled = false;
+    top_k = 8;
+    max_pos = 1024;
+    if (v.is_boolean()) {
+        enabled = v.get<bool>();
+        return;
+    }
+    if (!v.is_object()) {
+        throw std::invalid_argument("gdn: expected a boolean or object");
+    }
+    for (const auto & item : v.items()) {
+        if (item.key() != "top_k" && item.key() != "max_pos") {
+            throw std::invalid_argument("gdn: unknown key " + item.key());
+        }
+        const auto & x = item.value();
+        if (!x.is_number_integer() || x.get<double>() <= 0) {
+            throw std::invalid_argument("gdn: expected a positive integer for " + item.key());
+        }
+        const uint64_t cap = item.key() == "top_k" ? 256 : 16384;
+        const int32_t value = (int32_t) std::min<uint64_t>(x.get<uint64_t>(), cap);
+        (item.key() == "top_k" ? top_k : max_pos) = value;
+    }
+    enabled = true;
 }

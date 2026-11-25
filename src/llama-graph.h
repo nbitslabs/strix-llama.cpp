@@ -889,6 +889,7 @@ struct llm_graph_params {
 
     std::shared_ptr<const llama_intervention> intv; // knock-outs, nullptr = none (llama_set_intervention)
     bool trace_attn = false;
+    bool trace_gdn = false;
 
     static bool samplers_equal(
           const std::map<llama_seq_id, llama_sampler *> & lhs,
@@ -994,6 +995,7 @@ struct llm_graph_params {
             cvec  == other.cvec  &&
             intv  == other.intv  &&
             trace_attn == other.trace_attn &&
+            trace_gdn == other.trace_gdn &&
             loras == other.loras &&
             cross == other.cross;
     }
@@ -1192,6 +1194,7 @@ struct llm_graph_context {
     const llama_intervention * intv; // nullptr = no knock-outs: nothing below adds a node
     std::shared_ptr<const llama_intervention> intv_ref;
     const bool trace_attn;
+    const bool trace_gdn;
     mutable llm_graph_input_intervene * inp_intv = nullptr;
 
     ggml_context * ctx0 = nullptr;

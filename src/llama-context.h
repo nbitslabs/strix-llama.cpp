@@ -155,6 +155,7 @@ struct llama_context {
                 int32_t   il_end);
 
     void set_trace_attention(bool enable);
+    void set_trace_gdn(bool enable);
 
     bool set_intervention(const llama_intervene_item * items, size_t n_items, llama_pos from_pos);
 
@@ -357,6 +358,7 @@ private:
     llama_adapter_loras_ptr loras;
 
     bool trace_attn = false;
+    bool trace_gdn = false;
     std::shared_ptr<const llama_intervention> intv; // research knock-outs, nullptr = none (the normal graph)
 
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably

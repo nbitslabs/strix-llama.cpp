@@ -29,6 +29,12 @@
 #include <unordered_map>
 #include <vector>
 
+// Position-major k/v and gates, head-major query/read. Shared by capture and synthetic tests.
+std::vector<float> server_trace_gdn_sweep(int s, int h, int kh, int n, const ggml_fp16_t * k, const float * beta, const float * a, const float * q);
+std::vector<float> server_trace_gdn_forward(int s, int h, int kh, int n, const ggml_fp16_t * k, const ggml_fp16_t * v, const float * beta, const float * a, const float * q);
+std::vector<float> server_trace_gdn_norm(int s, int h, const float * read, const float * norm, bool shared, const float * z, float eps);
+void server_trace_gdn_shares(int s, int h, int n, int out_dim, const ggml_fp16_t * v, const float * weights, const float * read, const float * factors, const ggml_fp16_t * out_weight, const float * output, std::vector<double> & shares, std::vector<double> & heads);
+
 struct server_trace_head; // CPU copy of the output head for checkpoints, defined in server-trace.cpp
 
 struct server_trace_lens_mix;
@@ -40,6 +46,8 @@ struct server_moe_trace {
     bool    installed = false;
     bool    want_block_update = false; // capture the residuals too (more data per layer, slower while on)
     bool    want_attention    = false;
+    bool    want_gdn = false;
+    int32_t gdn_max_pos = 1024;
     bool    want_head_in      = false; // capture the head input (result_norm) for checkpoints' last-block row
     std::vector<char> resid_wanted;    // per resid index; empty = every residual (block_update / block_push)
 
@@ -86,13 +94,32 @@ struct server_moe_trace {
     };
     std::vector<attention_capture> attention;
 
+    struct gdn_layer {
+        int32_t il = 0;
+        int s = 0, h = 0, kh = 0, out_dim = 0;
+        float eps = 0;
+        bool over_cap = false;
+        std::vector<float> norm;
+        std::vector<ggml_fp16_t> out_weight;
+        std::vector<ggml_fp16_t> k, v;
+        std::vector<float> beta, a;
+        std::vector<unsigned char> present;
+        std::unordered_map<int32_t, std::vector<float>> q, read, z, y, output;
+    };
+    std::vector<gdn_layer> gdn;
+    std::vector<bool> gdn_layers;
+    std::vector<llama_pos> col_pos;
+    bool gdn_prepare(const llama_model * model, std::string & err);
+    json gdn_json(int32_t col, int64_t n_pos, int32_t top_k);
+
+
     std::vector<layer_capture> layers;
     std::vector<resid_capture> resid;     // [0] = hc_init, [il + 1] = l_last-<il>
     resid_capture head_in;                // [n_embd] per column: the final mixer output the engine's head consumed (result_norm)
     int32_t ubatch_base   = 0;            // batch column of the current ubatch's first token (from hc_init)
     int32_t ubatch_n_tok  = 0;
 
-    void init(int32_t n_layer, int64_t n_embd, int64_t n_stream);
+    void init(int32_t n_layer, int64_t n_embd, int64_t n_stream, const std::vector<bool> & recurrent = {});
     // restrict the residual capture to hc_init + the listed blocks (nullptr = every residual); hc_init stays because it
     // carries the ubatch column bookkeeping
     void resid_filter(const std::vector<int32_t> * blocks);
@@ -103,6 +130,7 @@ struct server_moe_trace {
 
     // drop the captures of the previous batch; call before every decode of the target context
     void begin_batch();
+    void begin_batch(const std::vector<llama_pos> & positions);
 
     // {"token_id": tok, "moe": [per layer {"experts", "weights", "shared"} or null], "block_update": [per layer f or null]}
     // col is the token's column in the decoded batch; experts selects the moe part, block_update the residual part
@@ -129,6 +157,7 @@ private:
     void capture(struct ggml_tensor * t, int kind, int32_t il);
     void capture_resid(struct ggml_tensor * t, int32_t idx);
     void capture_attention(struct ggml_tensor * t, int32_t il);
+    void capture_gdn(struct ggml_tensor * t, int kind, int32_t il);
     void capture_head_in(struct ggml_tensor * t);
     const std::vector<float> & lens_row(llama_token tok);
     // the lens hidden state (final hc mixer output, [n_embd]) of one wide residual [hc][n_embd]

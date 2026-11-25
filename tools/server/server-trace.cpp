@@ -26,6 +26,15 @@ enum trace_kind {
     TRACE_KIND_ATTENTION,
     TRACE_KIND_HEADIN,
     TRACE_KIND_RESID,
+    TRACE_KIND_GDN_Q,
+    TRACE_KIND_GDN_K,
+    TRACE_KIND_GDN_V,
+    TRACE_KIND_GDN_BETA,
+    TRACE_KIND_GDN_GATE,
+    TRACE_KIND_GDN_Z,
+    TRACE_KIND_GDN_READ,
+    TRACE_KIND_GDN_Y,
+    TRACE_KIND_GDN_OUT,
 };
 
 // tensors are named "<prefix>-<il>" by the graph builder
@@ -44,6 +53,13 @@ static bool trace_match_layer(const char * name, const char * prefix, int32_t & 
 }
 
 static int trace_classify(const char * name, int32_t & il) {
+    const char * names[] = {"q_conv_predelta", "k_conv_predelta", "v_conv_predelta", "beta_sigmoid", "gate", "z", "attn_output", "final_output", "linear_attn_out"};
+    const char * copies[] = {"q_conv_trace", "k_conv_trace", "v_conv_trace", "beta_trace", "gate_trace", "z_trace", "attn_output_trace", "final_output_trace", "linear_attn_out_trace"};
+    for (int i = 0; i < 9; ++i) {
+        if (trace_match_layer(name, names[i], il) || trace_match_layer(name, copies[i], il)) {
+            return TRACE_KIND_GDN_Q + i;
+        }
+    }
     if (trace_match_layer(name, "attn_weights", il)) {
         return TRACE_KIND_ATTENTION;
     }
@@ -75,7 +91,8 @@ static int trace_classify(const char * name, int32_t & il) {
     return TRACE_KIND_NONE;
 }
 
-void server_moe_trace::init(int32_t n_layer_, int64_t n_embd_, int64_t n_stream_) {
+void server_moe_trace::init(int32_t n_layer_, int64_t n_embd_, int64_t n_stream_, const std::vector<bool> & recurrent) {
+    gdn_layers = recurrent;
     n_layer  = n_layer_;
     n_embd   = n_embd_;
     n_stream = n_stream_ > 0 ? n_stream_ : 1;
@@ -85,6 +102,10 @@ void server_moe_trace::init(int32_t n_layer_, int64_t n_embd_, int64_t n_stream_
 }
 
 void server_moe_trace::install(llama_context * ctx) {
+    for (auto & l : gdn) {
+        l.k.clear(); l.v.clear(); l.beta.clear(); l.a.clear(); l.present.clear();
+        l.over_cap = false;
+    }
     if (!installed) {
         llama_set_eval_callback(ctx, eval_cb, this);
         installed = true;
@@ -93,6 +114,8 @@ void server_moe_trace::install(llama_context * ctx) {
 
 void server_moe_trace::remove(llama_context * ctx) {
     llama_set_trace_attention(ctx, false);
+    llama_set_trace_gdn(ctx, false);
+    want_gdn = false;
     if (installed) {
         llama_set_eval_callback(ctx, nullptr, nullptr);
         installed = false;
@@ -101,7 +124,16 @@ void server_moe_trace::remove(llama_context * ctx) {
     lens.rows.clear(); // the dequantized output rows are per request; the mixer weights stay
 }
 
+void server_moe_trace::begin_batch(const std::vector<llama_pos> & positions) {
+    begin_batch();
+    col_pos = positions;
+}
+
 void server_moe_trace::begin_batch() {
+    col_pos.clear();
+    for (auto & l : gdn) {
+        l.q.clear(); l.read.clear(); l.z.clear(); l.y.clear(); l.output.clear();
+    }
     for (auto & l : layers) {
         l = layer_capture();
     }
@@ -126,8 +158,10 @@ bool server_moe_trace::eval_cb(struct ggml_tensor * t, bool ask, void * user_dat
     }
     bool wanted;
     if (kind == TRACE_KIND_RESID) {
-        wanted = (self->want_block_update || (self->want_attention && il == 0)) && il >= 0 && il <= self->n_layer &&
+        wanted = (self->want_block_update || ((self->want_attention || self->want_gdn) && il == 0)) && il >= 0 && il <= self->n_layer &&
                  (self->resid_wanted.empty() || self->resid_wanted[il]);
+    } else if (kind >= TRACE_KIND_GDN_Q && kind <= TRACE_KIND_GDN_OUT) {
+        wanted = self->want_gdn && il >= 0 && il < (int32_t) self->gdn_layers.size() && self->gdn_layers[il];
     } else if (kind == TRACE_KIND_ATTENTION) {
         wanted = self->want_attention && il >= 0 && il < self->n_layer;
     } else if (kind == TRACE_KIND_HEADIN) {
@@ -142,6 +176,8 @@ bool server_moe_trace::eval_cb(struct ggml_tensor * t, bool ask, void * user_dat
     if (wanted) {
         if (kind == TRACE_KIND_RESID) {
             self->capture_resid(t, il);
+        } else if (kind >= TRACE_KIND_GDN_Q && kind <= TRACE_KIND_GDN_OUT) {
+            self->capture_gdn(t, kind, il);
         } else if (kind == TRACE_KIND_ATTENTION) {
             self->capture_attention(t, il);
         } else if (kind == TRACE_KIND_HEADIN) {
@@ -865,6 +901,304 @@ json server_moe_trace::checkpoints_json(int32_t col, llama_token tok, const std:
         out["final_prob"].push_back(std::exp((double) logits[tok] - max_logit)/sum);
         out["final_rank"].push_back(rank);
         out["entropy"].push_back(std::log(sum) - weighted/sum);
+    }
+    return out;
+}
+
+std::vector<float> server_trace_gdn_sweep(int s, int h, int kh, int n, const ggml_fp16_t * k, const float * beta, const float * a, const float * q) {
+    std::vector<float> weights(n*h);
+    const float scale = 1.0f/std::sqrt((float) s);
+    for (int head = 0; head < h; ++head) {
+        std::vector<float> r(q + (head%kh)*s, q + (head%kh + 1)*s);
+        for (int i = n - 1; i >= 0; --i) {
+            const auto * key = k + (i*kh + head%kh)*s;
+            float dot = 0;
+            for (int d = 0; d < s; ++d) {
+                dot += ggml_fp16_to_fp32(key[d])*r[d];
+            }
+            weights[i*h + head] = beta[i*h + head]*dot*scale;
+            for (int d = 0; d < s; ++d) {
+                r[d] = a[i*h + head]*(r[d] - beta[i*h + head]*ggml_fp16_to_fp32(key[d])*dot);
+            }
+        }
+    }
+    return weights;
+}
+
+std::vector<float> server_trace_gdn_forward(int s, int h, int kh, int n, const ggml_fp16_t * k, const ggml_fp16_t * v, const float * beta, const float * a, const float * q) {
+    std::vector<float> out(s*h, 0);
+    for (int head = 0; head < h; ++head) {
+        std::vector<float> state(s*s, 0);
+        for (int i = 0; i < n; ++i) {
+            const auto * key = k + (i*kh + head%kh)*s;
+            for (float & x : state) { x *= a[i*h + head]; }
+            for (int d = 0; d < s; ++d) {
+                float dot = 0;
+                for (int j = 0; j < s; ++j) { dot += state[d*s + j]*ggml_fp16_to_fp32(key[j]); }
+                const float delta = beta[i*h + head]*(ggml_fp16_to_fp32(v[(i*h + head)*s + d]) - dot);
+                for (int j = 0; j < s; ++j) { state[d*s + j] += ggml_fp16_to_fp32(key[j])*delta; }
+            }
+        }
+        for (int d = 0; d < s; ++d) {
+            for (int j = 0; j < s; ++j) { out[head*s + d] += state[d*s + j]*q[(head%kh)*s + j]; }
+            out[head*s + d] /= std::sqrt((float) s);
+        }
+    }
+    return out;
+}
+
+std::vector<float> server_trace_gdn_norm(int s, int h, const float * read, const float * norm, bool shared, const float * z, float eps) {
+    std::vector<float> factors(s*h);
+    for (int head = 0; head < h; ++head) {
+        float ss = 0;
+        for (int d = 0; d < s; ++d) { ss += read[head*s + d]*read[head*s + d]; }
+        const float rms = std::sqrt(ss/s + eps);
+        for (int d = 0; d < s; ++d) {
+            const int j = head*s + d;
+            // qwen4exp uses sigmoid here; SiLU belongs to the preceding convolution.
+            factors[j] = norm[shared ? d : j]/((1.0f + std::exp(-z[j]))*rms);
+        }
+    }
+    return factors;
+}
+
+void server_trace_gdn_shares(int s, int h, int n, int out_dim, const ggml_fp16_t * v, const float * weights, const float * read, const float * factors, const ggml_fp16_t * out_weight, const float * output, std::vector<double> & shares, std::vector<double> & heads) {
+    const int width = s*h;
+    std::vector<float> g(width, 0);
+    double out_norm = 0;
+    for (int row = 0; row < out_dim; ++row) {
+        out_norm += (double) output[row]*output[row];
+        for (int j = 0; j < width; ++j) { g[j] += ggml_fp16_to_fp32(out_weight[row*width + j])*output[row]; }
+    }
+    shares.assign(n, 0);
+    heads.assign(n*h, 0);
+    for (int head = 0; head < h; ++head) {
+        double read_norm = 0;
+        for (int d = 0; d < s; ++d) { read_norm += (double) read[head*s + d]*read[head*s + d]; }
+        for (int i = 0; i < n; ++i) {
+            double dot = 0, projected = 0;
+            for (int d = 0; d < s; ++d) {
+                const int j = head*s + d;
+                const double c = (double) weights[i*h + head]*ggml_fp16_to_fp32(v[i*width + j]);
+                dot += c*read[j];
+                projected += c*factors[j]*g[j];
+            }
+            heads[i*h + head] = read_norm > 0 ? dot/read_norm : 0;
+            shares[i] += out_norm > 0 ? projected/out_norm : 0;
+        }
+    }
+}
+
+bool server_moe_trace::gdn_prepare(const llama_model * model, std::string & err) {
+    if (!gdn.empty()) { return true; }
+    char arch[128] = {}, text[128] = {};
+    llama_model_meta_val_str(model, "general.architecture", arch, sizeof(arch));
+    if (strcmp(arch, "qwen4exp") != 0) {
+        err = "gdn: only qwen4exp is supported";
+        return false;
+    }
+    auto find = [&](const std::string & name) -> ggml_tensor * {
+        for (const auto & item : llama_internal_get_tensor_map(model)) {
+            if (item.first == name) { return item.second; }
+        }
+        return nullptr;
+    };
+    auto meta_int = [&](const char * suffix) {
+        if (llama_model_meta_val_str(model, (std::string(arch) + suffix).c_str(), text, sizeof(text)) <= 0) { return 0; }
+        return atoi(text);
+    };
+    const int s = meta_int(".ssm.state_size"), h = meta_int(".ssm.time_step_rank"), kh = meta_int(".ssm.group_count");
+    if (s <= 0 || h <= 0 || kh <= 0 || h%kh != 0 || s > 4096 || h > 256 || (int64_t) s*h*16384 > INT32_MAX) {
+        err = "gdn: invalid state/head dimensions";
+        return false;
+    }
+    if (llama_model_meta_val_str(model, (std::string(arch) + ".attention.layer_norm_rms_epsilon").c_str(), text, sizeof(text)) <= 0) {
+        err = "gdn: missing RMS epsilon";
+        return false;
+    }
+    const float eps = strtof(text, nullptr);
+    if (!std::isfinite(eps) || eps <= 0) { err = "gdn: invalid RMS epsilon"; return false; }
+    std::vector<gdn_layer> prepared;
+    for (int il = 0; il < llama_model_n_layer(model); ++il) {
+        if (!llama_model_layer_is_recurrent(model, il)) { continue; }
+        gdn_layer l;
+        l.il = il; l.s = s; l.h = h; l.kh = kh; l.eps = eps;
+        const std::string prefix = "blk." + std::to_string(il);
+        auto * norm = find(prefix + ".ssm_norm.weight");
+        auto * out = find(prefix + ".ssm_out.weight");
+        if (!norm || !out || (ggml_nelements(norm) != s && ggml_nelements(norm) != s*h) || out->ne[0] != s*h ||
+                out->ne[1] != llama_model_n_embd(model) || !trace_tensor_f32(norm, 0, ggml_nrows(norm), l.norm)) {
+            err = "gdn: unavailable or unsupported norm/output weights at block " + std::to_string(il);
+            return false;
+        }
+        if (out->ne[1] <= 0 || out->ne[1] > INT32_MAX/(s*h)) {
+            err = "gdn: output dimensions are too large";
+            return false;
+        }
+        l.out_dim = out->ne[1];
+        float out_scale = 1.0f;
+        if (auto * scale = find(prefix + ".ssm_out.scale")) {
+            std::vector<float> scalar;
+            if (ggml_nelements(scale) != 1 || !trace_tensor_f32(scale, 0, 1, scalar)) {
+                err = "gdn: unsupported output scale";
+                return false;
+            }
+            out_scale = scalar[0];
+        }
+        l.out_weight.resize((size_t) s*h*l.out_dim);
+        std::vector<float> row;
+        for (int r = 0; r < l.out_dim; ++r) {
+            if (!trace_tensor_f32(out, r, 1, row)) {
+                err = "gdn: output weight cannot be dequantized at block " + std::to_string(il);
+                return false;
+            }
+            for (float & x : row) { x *= out_scale; }
+            ggml_fp32_to_fp16_row(row.data(), l.out_weight.data() + (size_t) r*s*h, s*h);
+        }
+        prepared.push_back(std::move(l));
+    }
+    if (prepared.empty()) { err = "gdn: model has no recurrent blocks"; return false; }
+    gdn = std::move(prepared);
+    return true;
+}
+
+void server_moe_trace::capture_gdn(ggml_tensor * t, int kind, int32_t il) {
+    auto it = std::find_if(gdn.begin(), gdn.end(), [&](const gdn_layer & l) { return l.il == il; });
+    if (it == gdn.end() || t->ne[3] != 1 || (t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_F16 && t->type != GGML_TYPE_BF16)) { return; }
+    auto & l = *it;
+    const bool headed = kind <= TRACE_KIND_GDN_BETA || kind == TRACE_KIND_GDN_READ;
+    const int64_t nt = headed ? t->ne[2] : t->ne[1];
+    const int64_t width = headed ? t->ne[0]*t->ne[1] : t->ne[0];
+    const int expected = kind == TRACE_KIND_GDN_Q || kind == TRACE_KIND_GDN_K ? l.s*l.kh :
+        kind == TRACE_KIND_GDN_BETA || kind == TRACE_KIND_GDN_GATE ? l.h : kind == TRACE_KIND_GDN_OUT ? l.out_dim : l.s*l.h;
+    if (width != expected || (!headed && t->ne[2] != 1)) { return; }
+    const int32_t base = ubatch_base + ubatch_n_tok - (int32_t) nt;
+    std::vector<uint8_t> buf(ggml_nbytes(t));
+    ggml_backend_tensor_get(t, buf.data(), 0, buf.size());
+    for (int j = 0; j < nt; ++j) {
+        const int col = base + j;
+        if (col < 0 || col >= (int) col_pos.size() || col_pos[col] < 0) { continue; }
+        const int pos = col_pos[col];
+        if (pos >= gdn_max_pos) { l.over_cap = true; continue; }
+        std::vector<float> row(width);
+        for (int d = 0; d < width; ++d) {
+            const size_t offset = headed ? (d%t->ne[0])*t->nb[0] + (d/t->ne[0])*t->nb[1] + j*t->nb[2] : d*t->nb[0] + j*t->nb[1];
+            const auto * p = buf.data() + offset;
+            if (t->type == GGML_TYPE_F32) { memcpy(&row[d], p, sizeof(float)); }
+            else if (t->type == GGML_TYPE_F16) { ggml_fp16_t x; memcpy(&x, p, sizeof(x)); row[d] = ggml_fp16_to_fp32(x); }
+            else { ggml_bf16_t x; memcpy(&x, p, sizeof(x)); row[d] = ggml_bf16_to_fp32(x); }
+        }
+        if (kind == TRACE_KIND_GDN_Q) { l.q[col] = std::move(row); }
+        else if (kind == TRACE_KIND_GDN_READ) { l.read[col] = std::move(row); }
+        else if (kind == TRACE_KIND_GDN_Z) { l.z[col] = std::move(row); }
+        else if (kind == TRACE_KIND_GDN_Y) { l.y[col] = std::move(row); }
+        else if (kind == TRACE_KIND_GDN_OUT) { l.output[col] = std::move(row); }
+        else {
+            l.present.resize(std::max(l.present.size(), (size_t) pos + 1), 0);
+            if (kind == TRACE_KIND_GDN_K || kind == TRACE_KIND_GDN_V) {
+                auto & dst = kind == TRACE_KIND_GDN_K ? l.k : l.v;
+                dst.resize(std::max(dst.size(), (pos + 1)*row.size()));
+                ggml_fp32_to_fp16_row(row.data(), dst.data() + pos*width, width);
+                l.present[pos] |= kind == TRACE_KIND_GDN_K ? 1 : 2;
+            } else {
+                auto & dst = kind == TRACE_KIND_GDN_BETA ? l.beta : l.a;
+                dst.resize(std::max(dst.size(), (pos + 1)*row.size()));
+                for (int d = 0; d < width; ++d) { dst[pos*width + d] = kind == TRACE_KIND_GDN_GATE ? std::exp(row[d]) : row[d]; }
+                l.present[pos] |= kind == TRACE_KIND_GDN_BETA ? 4 : 8;
+            }
+        }
+    }
+}
+
+static double trace_gdn_round(double x) {
+    if (!std::isfinite(x) || x == 0) { return 0; }
+    char text[32];
+    snprintf(text, sizeof(text), "%.6g", x);
+    return strtod(text, nullptr);
+}
+
+static double trace_gdn_error(const float * a, const float * b, int n) {
+    double diff = 0, norm = 0;
+    for (int j = 0; j < n; ++j) { diff += ((double) a[j] - b[j])*(a[j] - b[j]); norm += (double) b[j]*b[j]; }
+    return std::sqrt(diff/std::max(norm, 1e-30));
+}
+
+json server_moe_trace::gdn_json(int32_t col, int64_t n_pos, int32_t top_k) {
+    static const bool selfcheck = [] { const char * e = getenv("LLAMA_TRACE_GDN_SELFCHECK"); return e && strcmp(e, "1") == 0; }();
+    struct result { json share, heads, gates, fade; std::string note; double a = 0, b = 0, c = 0, y = 0, sum = 0; };
+    std::vector<result> results(gdn.size());
+    auto compute = [&](size_t index) {
+        const auto & l = gdn[index];
+        auto & out = results[index];
+        if (n_pos > gdn_max_pos || l.over_cap) {
+            out.note = "gdn skipped: n_pos " + std::to_string(n_pos) + " exceeds max_pos " + std::to_string(gdn_max_pos);
+            return;
+        }
+        if (n_pos <= 0 || n_pos > (int64_t) l.present.size() ||
+                std::any_of(l.present.begin(), l.present.begin() + n_pos, [](unsigned char mask) { return mask != 15; }) ||
+                !l.q.count(col) || !l.read.count(col) || !l.z.count(col) || !l.y.count(col) || !l.output.count(col)) {
+            out.note = "gdn skipped: missing captured positions or current column";
+            return;
+        }
+        const int n = (int) n_pos, width = l.s*l.h;
+        const auto & read = l.read.at(col);
+        const auto & output = l.output.at(col);
+        const auto weights = server_trace_gdn_sweep(l.s, l.h, l.kh, n, l.k.data(), l.beta.data(), l.a.data(), l.q.at(col).data());
+        const auto factors = server_trace_gdn_norm(l.s, l.h, read.data(), l.norm.data(), l.norm.size() == (size_t) l.s, l.z.at(col).data(), l.eps);
+        std::vector<double> shares, heads;
+        server_trace_gdn_shares(l.s, l.h, n, l.out_dim, l.v.data(), weights.data(), read.data(), factors.data(), l.out_weight.data(), output.data(), shares, heads);
+        out.sum = std::abs(std::accumulate(shares.begin(), shares.end(), 0.0) - 1.0);
+        out.share = json::array(); out.heads = json::array(); out.gates = json::array(); out.fade = json::array();
+        for (double share : shares) { out.share.push_back(trace_gdn_round(share)); }
+        std::vector<double> fades(n, 0);
+        for (int head = 0; head < l.h; ++head) {
+            std::vector<int> order(n);
+            std::iota(order.begin(), order.end(), 0);
+            std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return std::abs(heads[a*l.h + head]) > std::abs(heads[b*l.h + head]); });
+            json top = json::array();
+            for (int j = 0; j < std::min(n, top_k); ++j) { top.push_back(json::array({order[j], trace_gdn_round(heads[order[j]*l.h + head])})); }
+            out.heads.push_back(std::move(top));
+            out.gates.push_back(json::array({trace_gdn_round(l.beta[(n - 1)*l.h + head]), trace_gdn_round(l.a[(n - 1)*l.h + head])}));
+            double fade = 1;
+            for (int i = n - 1; i >= 0; --i) { fades[i] += fade/l.h; fade *= l.a[i*l.h + head]; }
+        }
+        for (double fade : fades) { out.fade.push_back(trace_gdn_round(fade)); }
+        if (selfcheck) {
+            const auto forward = server_trace_gdn_forward(l.s, l.h, l.kh, n, l.k.data(), l.v.data(), l.beta.data(), l.a.data(), l.q.at(col).data());
+            std::vector<float> summed(width, 0), y(width), projected(l.out_dim, 0);
+            for (int i = 0; i < n; ++i) {
+                for (int j = 0; j < width; ++j) { summed[j] += weights[i*l.h + j/l.s]*ggml_fp16_to_fp32(l.v[i*width + j]); }
+            }
+            for (int head = 0; head < l.h; ++head) {
+                out.a = std::max(out.a, trace_gdn_error(summed.data() + head*l.s, forward.data() + head*l.s, l.s));
+                out.b = std::max(out.b, trace_gdn_error(forward.data() + head*l.s, read.data() + head*l.s, l.s));
+            }
+            for (int j = 0; j < width; ++j) { y[j] = read[j]*factors[j]; }
+            for (int r = 0; r < l.out_dim; ++r) {
+                for (int j = 0; j < width; ++j) { projected[r] += ggml_fp16_to_fp32(l.out_weight[r*width + j])*y[j]; }
+            }
+            out.c = trace_gdn_error(projected.data(), output.data(), l.out_dim);
+            out.y = trace_gdn_error(y.data(), l.y.at(col).data(), width);
+        }
+    };
+    const size_t count = std::min<size_t>(16, gdn.size());
+    std::vector<std::thread> workers;
+    for (size_t worker = 0; worker < count; ++worker) {
+        workers.emplace_back([&, worker] { for (size_t i = worker; i < gdn.size(); i += count) { compute(i); } });
+    }
+    for (auto & worker : workers) { worker.join(); }
+    json out = {{"blocks", json::array()}, {"share", json::array()}, {"heads", json::array()}, {"gates", json::array()}, {"fade", json::array()}};
+    double a = 0, b = 0, c = 0, y = 0, sum = 0;
+    for (size_t i = 0; i < gdn.size(); ++i) {
+        auto & r = results[i];
+        out["blocks"].push_back(gdn[i].il);
+        out["share"].push_back(std::move(r.share)); out["heads"].push_back(std::move(r.heads));
+        out["gates"].push_back(std::move(r.gates)); out["fade"].push_back(std::move(r.fade));
+        if (!r.note.empty()) { out["note"] = r.note; }
+        a = std::max(a, r.a); b = std::max(b, r.b); c = std::max(c, r.c); y = std::max(y, r.y); sum = std::max(sum, r.sum);
+    }
+    if (selfcheck) {
+        LOG_INF("gdn selfcheck pos=%lld max_a=%.6g max_b=%.6g max_c=%.6g max_sum=%.6g max_y=%.6g\n", (long long) n_pos - 1, a, b, c, sum, y);
     }
     return out;
 }

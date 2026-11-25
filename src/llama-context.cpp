@@ -2120,6 +2120,10 @@ bool llama_context::adapters_lora_are_same(llama_adapter_lora ** adapters, size_
     return true;
 }
 
+void llama_context::set_trace_gdn(bool enable) {
+    trace_gdn = enable;
+}
+
 void llama_context::set_trace_attention(bool enable) {
     trace_attn = enable;
 }
@@ -3572,6 +3576,7 @@ llm_graph_params llama_context::graph_params(
         /*.mtp_draft   =*/ mtp_draft.get(),
         /*.intv        =*/ intv,
         /*.trace_attn  =*/ trace_attn,
+        /*.trace_gdn   =*/ trace_gdn,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
@@ -5644,6 +5649,14 @@ int32_t llama_set_adapters_lora(
     ctx->set_adapters_lora(adapters, n_adapters, scales);
 
     return 0;
+}
+
+void llama_set_trace_gdn(llama_context * ctx, bool enable) {
+    ctx->set_trace_gdn(enable);
+}
+
+bool llama_model_layer_is_recurrent(const llama_model * model, int32_t il) {
+    return model && il >= 0 && il < (int32_t) model->hparams.n_layer() && model->hparams.is_recr(il);
 }
 
 void llama_set_trace_attention(llama_context * ctx, bool enable) {

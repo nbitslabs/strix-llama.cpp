@@ -823,6 +823,8 @@ extern "C" {
     // Enable attention-weight side nodes for the eval callback (off by default).
     // Changing this flag rebuilds the graph; model outputs are unchanged.
     LLAMA_API void llama_set_trace_attention(struct llama_context * ctx, bool enable);
+    LLAMA_API void llama_set_trace_gdn(struct llama_context * ctx, bool enable);
+    LLAMA_API bool llama_model_layer_is_recurrent(const struct llama_model * model, int32_t il);
 
     //
     // Memory

@@ -1017,6 +1017,64 @@ static void test_checkpoints(testing & t) {
     ggml_free(ctx);
 }
 
+static void test_gdn(testing & t) {
+    bool enabled = false;
+    int32_t top = 0, cap = 0;
+    parse_gdn(json::parse("true"), enabled, top, cap);
+    t.assert_true("gdn defaults", enabled && top == 8 && cap == 1024);
+    parse_gdn(json::parse(R"({"top_k":3,"max_pos":64})"), enabled, top, cap);
+    t.assert_true("gdn options", enabled && top == 3 && cap == 64);
+    parse_gdn(json::parse(R"({"top_k":999,"max_pos":99999})"), enabled, top, cap);
+    t.assert_true("gdn clamp", enabled && top == 256 && cap == 16384);
+    for (const char * value : {R"("x")", R"({"top_k":-1})", R"({"max_pos":1.5})", "null", R"({"top_k":0})"}) {
+        bool rejected = false;
+        try { parse_gdn(json::parse(value), enabled, top, cap); }
+        catch (const std::invalid_argument & e) { rejected = std::string(e.what()).find("gdn") != std::string::npos; }
+        t.assert_true(value, rejected);
+    }
+    common_params params;
+    const auto parsed = server_schema::eval_llama_cmpl_schema(nullptr, params, {}, json::parse(R"({"cache_prompt":true,"trace":{"gdn":true}})"));
+    t.assert_true("gdn schema disables cache", parsed.trace_any() && parsed.trace_gdn && !parsed.cache_prompt);
+
+    constexpr int S = 4, H = 2, KH = 1, N = 6, D = 3, W = S*H;
+    std::mt19937 rng(73);
+    std::uniform_real_distribution<float> random(-0.8f, 0.8f), gate(0.1f, 0.9f);
+    std::vector<ggml_fp16_t> k(N*KH*S), v(N*W), matrix(D*W);
+    std::vector<float> beta(N*H), a(N*H), q(KH*S), norm(S), z(W);
+    for (int i = 0; i < N; ++i) {
+        float key[S], ss = 0;
+        for (float & x : key) { x = random(rng); ss += x*x; }
+        for (int j = 0; j < S; ++j) { k[i*S + j] = ggml_fp32_to_fp16(key[j]/std::sqrt(ss)); }
+    }
+    for (auto & x : v) { x = ggml_fp32_to_fp16(random(rng)); }
+    for (auto & x : matrix) { x = ggml_fp32_to_fp16(random(rng)); }
+    for (auto & x : beta) { x = gate(rng); }
+    for (auto & x : a) { x = gate(rng); }
+    for (auto & x : q) { x = random(rng); }
+    for (auto & x : norm) { x = gate(rng); }
+    for (auto & x : z) { x = random(rng); }
+    const auto read = server_trace_gdn_forward(S, H, KH, N, k.data(), v.data(), beta.data(), a.data(), q.data());
+    const auto weights = server_trace_gdn_sweep(S, H, KH, N, k.data(), beta.data(), a.data(), q.data());
+    const auto factors = server_trace_gdn_norm(S, H, read.data(), norm.data(), true, z.data(), 1e-6f);
+    std::vector<float> output(D, 0);
+    for (int j = 0; j < W; ++j) {
+        double sum = 0;
+        for (int i = 0; i < N; ++i) { sum += weights[i*H + j/S]*ggml_fp16_to_fp32(v[i*W + j]); }
+        t.assert_true("gdn forward versus sweep", std::abs(sum - read[j]) < 1e-5);
+        for (int r = 0; r < D; ++r) { output[r] += ggml_fp16_to_fp32(matrix[r*W + j])*read[j]*factors[j]; }
+    }
+    std::vector<double> shares, heads;
+    server_trace_gdn_shares(S, H, N, D, v.data(), weights.data(), read.data(), factors.data(), matrix.data(), output.data(), shares, heads);
+    double total = 0;
+    for (double x : shares) { total += x; }
+    t.assert_true("gdn projected shares sum to one", std::abs(total - 1) < 1e-5);
+    for (int head = 0; head < H; ++head) {
+        total = 0;
+        for (int i = 0; i < N; ++i) { total += heads[i*H + head]; }
+        t.assert_true("gdn head shares sum to one", std::abs(total - 1) < 1e-5);
+    }
+}
+
 int main(int argc, char ** argv) {
     testing t;
 
@@ -1029,6 +1087,7 @@ int main(int argc, char ** argv) {
         t.set_filter(argv[1]);
     }
 
+    t.test("gdn", test_gdn);
     t.test("attention", test_attention);
     t.test("checkpoints", test_checkpoints);
     t.test("lens_hidden_batch", server_trace_lens_test::run);

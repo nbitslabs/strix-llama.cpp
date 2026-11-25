@@ -1690,6 +1690,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     intv             (params.intv.get()),
     intv_ref         (params.intv),
     trace_attn       (params.trace_attn),
+    trace_gdn        (params.trace_gdn),
     ctx0             (res->get_ctx()),
     gf               (res->get_gf()) {
         res->set_params(params);

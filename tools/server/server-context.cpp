@@ -1262,6 +1262,7 @@ private:
 
     void destroy() {
         moe_trace.lens = {}; // release the host head before the model can be reloaded
+        moe_trace.gdn.clear(); // attribution weights belong to this model
 
         spec.reset();
 
@@ -2191,11 +2192,32 @@ private:
                     return false;
                 }
             }
+            std::vector<bool> recurrent;
+            if (task.params.trace_gdn) {
+                const auto adapters = task.params.lora.empty() ? params_base.lora_adapters : construct_lora_list(task.params.lora);
+                if (std::any_of(adapters.begin(), adapters.end(), [](const common_adapter_lora_info & adapter) { return adapter.scale != 0; })) {
+                    send_error(task, "gdn: attribution of LoRA output weights is not supported", ERROR_TYPE_NOT_SUPPORTED);
+                    return false;
+                }
+                std::string err;
+                if (!moe_trace.gdn_prepare(model_tgt, err)) {
+                    send_error(task, err, ERROR_TYPE_NOT_SUPPORTED);
+                    return false;
+                }
+                recurrent.resize(llama_model_n_layer(model_tgt));
+                for (int32_t il = 0; il < (int32_t) recurrent.size(); ++il) {
+                    recurrent[il] = llama_model_layer_is_recurrent(model_tgt, il);
+                }
+                task.params.cache_prompt = false;
+            }
             moe_trace.init(llama_model_n_layer(model_tgt), llama_model_n_embd(model_tgt),
-                           llama_model_n_embd_out(model_tgt) / std::max(1, llama_model_n_embd(model_tgt)));
+                           llama_model_n_embd_out(model_tgt) / std::max(1, llama_model_n_embd(model_tgt)), recurrent);
             moe_trace.want_block_update = task.params.trace_block_update || task.params.trace_block_push || !task.params.trace_checkpoints.empty(); // the lens reads the same residuals
             moe_trace.resid_filter(task.params.trace_block_update || task.params.trace_block_push ? nullptr : &task.params.trace_checkpoints);
             moe_trace.want_head_in = !task.params.trace_checkpoints.empty();
+            moe_trace.want_gdn = task.params.trace_gdn;
+            moe_trace.gdn_max_pos = task.params.trace_gdn_max_pos;
+            llama_set_trace_gdn(ctx_tgt, task.params.trace_gdn);
             moe_trace.want_attention = task.params.trace_attention;
             llama_set_trace_attention(ctx_tgt, task.params.trace_attention);
             moe_trace.install(ctx_tgt);
@@ -2631,6 +2653,12 @@ private:
         result.trace["attention_def"] = "softmax(q.K^T * kq_scale + mask) of the query token over kv cells 0..n_pos-1 per head; full-attention blocks only; cells equal token positions for a single sequence that was not shifted or defragmented";
     }
 
+    void trace_gdn(completion_token_output & result, int idx, int batch_idx, const task_params & params) {
+        const int64_t n_pos = (int64_t) batch.tokens.at(batch_idx).pos[0] + 1;
+        result.trace["gdn"] = moe_trace.gdn_json(idx, n_pos, params.trace_gdn_top_k);
+        result.trace["gdn_def"] = "S_t = a_t S_(t-1); delta_t = beta_t (v_t - S_t^T k_t); S_t += k_t delta_t^T; o_t = S_t^T q_t/sqrt(S). w_i = beta_i k_i^T [prod_(j=i+1..t) a_j (I - beta_j k_j k_j^T)] q_t/sqrt(S), c_i = w_i v_i. Shares are POST out-projection: s_i = <W_out y_i, O>/|O|^2, y_i = c_i * wnorm * sigmoid(z)/rms per head, rms = sqrt(mean(o_h^2) + eps); sum_(i<=t) s_i = 1 for zero initial state, up to capture/weight rounding. Per-head share = <c_i,o_h>/|o_h|^2; top_k by absolute share. q/k/v come from causal conv1d(kernel 4) + SiLU (+ L2 norm for q,k), so position i blends raw projections of tokens i-3..i. a = exp(-exp(A_log)*softplus(alpha + dt_bias)); beta = sigmoid(...). fade_i = mean_h prod_(j>i) a_j ignores erasures. Prompt cache forced off; max_pos = " + std::to_string(params.trace_gdn_max_pos);
+    }
+
     void trace_checkpoints(completion_token_output & result, int idx, const task_params & params) {
         result.trace["checkpoints"] = moe_trace.checkpoints_json(idx, result.tok, params.trace_checkpoints, params.trace_checkpoints_top_k);
         result.trace["checkpoints_def"] = "p = softmax(out_scale * output_head(final_hc_mixer(resid[il+1])), temperature 1, full vocabulary); top is descending probability, final_prob is the sampled token probability, final_rank is 1 + count of strictly greater logits, entropy is -sum p ln p in nats; missing residuals are null; the last block's row is computed from the engine's own head input (result_norm)";
@@ -2755,7 +2783,7 @@ private:
 
         if (slot.task->params.trace_any() && !tkn.trace.is_null()) {
             res->trace_output = tkn.trace;
-            if (slot.task->params.trace_attention && slot.stats.n_gen == 1) {
+            if ((slot.task->params.trace_attention || slot.task->params.trace_gdn) && slot.stats.n_gen == 1) {
                 res->prompt_tokens = trace_prompt_tokens(slot); // once, on the first chunk that carries trace data
             }
         }
@@ -2854,7 +2882,7 @@ private:
             res->intervene_applied = intervene_to_json(slot.task->params.intervene, slot.task->params.intervene_from_pos);
         }
 
-        if (slot.task->params.trace_attention) {
+        if (slot.task->params.trace_attention || slot.task->params.trace_gdn) {
             res->prompt_tokens = trace_prompt_tokens(slot);
         }
 
@@ -5104,7 +5132,16 @@ private:
         int ret = 0;
         queue_tasks.yield_to_queue([&]() {
             if (moe_trace.installed) {
-                moe_trace.begin_batch();
+                if (moe_trace.want_gdn) {
+                    std::vector<llama_pos> positions;
+                    positions.reserve(batch.view.size());
+                    for (int i = off; i < off + batch.view.size(); ++i) {
+                        positions.push_back(batch.tokens[i].pos[0]);
+                    }
+                    moe_trace.begin_batch(positions);
+                } else {
+                    moe_trace.begin_batch();
+                }
             }
             ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
             if (ret == 0 && has_output) {
@@ -5331,6 +5368,9 @@ private:
             if (slot.task->params.trace_attention) {
                 trace_attention(result, tok_idx, off + tok_idx);
             }
+            if (slot.task->params.trace_gdn) {
+                trace_gdn(result, tok_idx, off + tok_idx, slot.task->params);
+            }
 
             if (!process_token(result, slot)) {
                 // release slot because of stop condition
@@ -5490,6 +5530,9 @@ private:
                 }
                 if (slot.task->params.trace_attention) {
                     trace_attention(result, spec_i_batch[i], spec_i_batch[i]);
+                }
+                if (slot.task->params.trace_gdn) {
+                    trace_gdn(result, spec_i_batch[i] - off, spec_i_batch[i], slot.task->params);
                 }
 
                 slot.stats.n_gen += 1;

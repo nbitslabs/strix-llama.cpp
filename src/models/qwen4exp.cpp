@@ -2168,6 +2168,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
 
     ggml_tensor * gate = ggml_mul(ctx0, alpha_softplus, model.layers[il].ssm_a);  // -A_log.exp() * softplus
     cb(gate, "gate", il);
+    ggml_tensor * gate_trace = gate;
 
     gate = ggml_reshape_4d(ctx0, gate, 1, num_v_heads, n_seq_tokens, n_seqs);
 
@@ -2252,6 +2253,28 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     cb(cur, "linear_attn_out", il);
     if (final_output->type == GGML_TYPE_F16) {
         res->add_fused_node({LLM_FUSED_OP_GDN_NORM_F16, cur->op == GGML_OP_MUL ? cur->src[0] : cur, il});
+    }
+
+    if (trace_gdn) {
+        auto capture = [&](ggml_tensor * t, const char * name) {
+            if (t->view_src) {
+                t = ggml_cont(ctx0, t);
+                cb(t, name, il);
+            }
+            ggml_set_output(t);
+            ggml_build_forward_expand(gf, t);
+        };
+        capture(q_conv, "q_conv_trace");
+        capture(k_conv, "k_conv_trace");
+        capture(v_conv, "v_conv_trace");
+        capture(beta, "beta_trace");
+        capture(gate_trace, "gate_trace");
+        capture(z, "z_trace");
+        // The read is a view of the GDN op; mark the producer too to disable decode fusion.
+        ggml_set_output(output->view_src ? output->view_src : output);
+        capture(output, "attn_output_trace");
+        capture(final_output, "final_output_trace");
+        capture(cur, "linear_attn_out_trace");
     }
 
     cur = ggml_reshape_2d(ctx0, cur, n_embd, n_seq_tokens * n_seqs);

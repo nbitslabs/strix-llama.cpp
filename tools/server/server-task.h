@@ -80,13 +80,16 @@ struct task_params {
     bool include_usage   = false;
     bool cache_prompt    = true; // remember the prompt to avoid reprocessing all prompt
     bool return_tokens   = false;
+    bool trace_gdn = false;
+    int32_t trace_gdn_top_k = 8;
+    int32_t trace_gdn_max_pos = 1024;
     bool trace_attention    = false; // per-head full-attention weights of the query that predicts each token
     bool trace_experts      = false; // opt-in per-token MoE router trace (request field "trace": {"experts": true})
     bool trace_block_update = false; // per-block residual update size ("trace": {"block_update": true})
     bool trace_block_push   = false; // per-block logit-lens push of the sampled and top tokens ("trace": {"block_push": true})
     std::vector<int32_t> trace_checkpoints; // residuals after these blocks; empty = off
     int32_t trace_checkpoints_top_k = 8;
-    bool trace_any() const { return trace_attention || trace_experts || trace_block_update || trace_block_push || !trace_checkpoints.empty(); }
+    bool trace_any() const { return trace_gdn || trace_attention || trace_experts || trace_block_update || trace_block_push || !trace_checkpoints.empty(); }
     std::vector<llama_intervene_item> intervene; // research knock-outs ("intervene"), normalised; empty = none
     int32_t intervene_from_pos = 0;
     bool intervene_any() const { return !intervene.empty(); }
@@ -355,7 +358,7 @@ struct server_task {
     // embedding and rerank tasks always process their whole prompt, their state is never reused
     // a request with knock-outs ("intervene") too: its KV state is not the model's, so it neither reuses nor leaves any
     bool is_stateless() const {
-        return type == SERVER_TASK_TYPE_EMBEDDING || type == SERVER_TASK_TYPE_RERANK || params.intervene_any();
+        return type == SERVER_TASK_TYPE_EMBEDDING || type == SERVER_TASK_TYPE_RERANK || params.intervene_any() || params.trace_gdn;
     }
 };
 
@@ -731,5 +734,7 @@ struct server_task_result_router : server_task_result {
 void parse_intervene(const json & v, std::vector<llama_intervene_item> & items, int32_t & from_pos);
 json intervene_to_json(const std::vector<llama_intervene_item> & items, int32_t from_pos);
 
+// "trace": {"gdn": ...} -> enabled, top_k and max_pos (throws std::invalid_argument with a "gdn: ..." message)
+void parse_gdn(const json & v, bool & enabled, int32_t & top_k, int32_t & max_pos);
 // "trace": {"checkpoints": ...} -> ascending blocks and top_k (throws std::invalid_argument with a "checkpoints: ..." message)
 void parse_checkpoints(const json & v, std::vector<int32_t> & blocks, int32_t & top_k);
