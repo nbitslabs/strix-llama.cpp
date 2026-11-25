@@ -6,6 +6,7 @@
 #include "ggml-cpu.h"
 #include "gguf.h"
 
+#include <chrono>
 #include <cstdio>
 
 #include <algorithm>
@@ -134,6 +135,7 @@ void server_moe_trace::begin_batch(const std::vector<llama_pos> & positions) {
 
 void server_moe_trace::begin_batch() {
     col_pos.clear();
+    gdn_capture_us = 0;
     for (auto & l : gdn) {
         l.q.clear(); l.read.clear(); l.z.clear(); l.y.clear(); l.output.clear();
     }
@@ -967,28 +969,38 @@ std::vector<float> server_trace_gdn_norm(int s, int h, const float * read, const
 
 void server_trace_gdn_shares(int s, int h, int n, int out_dim, const ggml_fp16_t * v, const float * weights, const float * read, const float * factors, const ggml_fp16_t * out_weight, const float * output, std::vector<double> & shares, std::vector<double> & heads) {
     const int width = s*h;
-    std::vector<float> g(width, 0);
+    // g = W_out^T O: the one pass over the (fp16) projection weight per token; rows are converted in bulk, a scalar
+    // conversion per element was the hot spot (out_dim*width calls per block)
+    std::vector<float> g(width, 0), wrow(width), vrow(width);
     double out_norm = 0;
     for (int row = 0; row < out_dim; ++row) {
         out_norm += (double) output[row]*output[row];
-        for (int j = 0; j < width; ++j) { g[j] += ggml_fp16_to_fp32(out_weight[row*width + j])*output[row]; }
+        ggml_fp16_to_fp32_row(out_weight + (size_t) row*width, wrow.data(), width);
+        const float o = output[row];
+        for (int j = 0; j < width; ++j) { g[j] += wrow[j]*o; }
+    }
+    std::vector<double> read_norm(h, 0);
+    for (int head = 0; head < h; ++head) {
+        for (int d = 0; d < s; ++d) { read_norm[head] += (double) read[head*s + d]*read[head*s + d]; }
     }
     shares.assign(n, 0);
     heads.assign(n*h, 0);
-    for (int head = 0; head < h; ++head) {
-        double read_norm = 0;
-        for (int d = 0; d < s; ++d) { read_norm += (double) read[head*s + d]*read[head*s + d]; }
-        for (int i = 0; i < n; ++i) {
-            double dot = 0, projected = 0;
+    for (int i = 0; i < n; ++i) {
+        ggml_fp16_to_fp32_row(v + (size_t) i*width, vrow.data(), width);
+        double projected = 0;
+        for (int head = 0; head < h; ++head) {
+            const float w = weights[i*h + head];
+            double dot = 0, proj = 0;
             for (int d = 0; d < s; ++d) {
                 const int j = head*s + d;
-                const double c = (double) weights[i*h + head]*ggml_fp16_to_fp32(v[i*width + j]);
+                const double c = (double) w*vrow[j];
                 dot += c*read[j];
-                projected += c*factors[j]*g[j];
+                proj += c*factors[j]*g[j];
             }
-            heads[i*h + head] = read_norm > 0 ? dot/read_norm : 0;
-            shares[i] += out_norm > 0 ? projected/out_norm : 0;
+            heads[i*h + head] = read_norm[head] > 0 ? dot/read_norm[head] : 0;
+            projected += proj;
         }
+        shares[i] = out_norm > 0 ? projected/out_norm : 0;
     }
 }
 
@@ -1146,8 +1158,10 @@ void server_moe_trace::capture_gdn(ggml_tensor * t, int kind, int32_t il) {
         kind == TRACE_KIND_GDN_BETA || kind == TRACE_KIND_GDN_GATE ? l.h : kind == TRACE_KIND_GDN_OUT ? l.out_dim : l.s*l.h;
     if (width != expected || (!headed && t->ne[2] != 1)) { return; }
     const int32_t base = ubatch_base + ubatch_n_tok - (int32_t) nt;
+    const auto t_start = std::chrono::steady_clock::now();
     std::vector<uint8_t> buf(ggml_nbytes(t));
     ggml_backend_tensor_get(t, buf.data(), 0, buf.size());
+    gdn_capture_us += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t_start).count();
     for (int j = 0; j < nt; ++j) {
         const int col = base + j;
         if (col < 0 || col >= (int) col_pos.size() || col_pos[col] < 0) { continue; }
@@ -1254,12 +1268,18 @@ json server_moe_trace::gdn_json(int32_t col, int64_t n_pos, int32_t top_k) {
             out.y = trace_gdn_error(y.data(), l.y.at(col).data(), width);
         }
     };
+    static const bool timing = [] { const char * e = getenv("LLAMA_TRACE_GDN_TIMING"); return e && strcmp(e, "1") == 0; }();
+    const auto t_start = std::chrono::steady_clock::now();
     const size_t count = std::min<size_t>(16, gdn.size());
     std::vector<std::thread> workers;
     for (size_t worker = 0; worker < count; ++worker) {
         workers.emplace_back([&, worker] { for (size_t i = worker; i < gdn.size(); i += count) { compute(i); } });
     }
     for (auto & worker : workers) { worker.join(); }
+    if (timing) {
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_start).count();
+        LOG_INF("gdn timing: n_pos=%lld compute %.1f ms over %zu blocks, capture %.1f ms in this batch\n", (long long) n_pos, ms, gdn.size(), gdn_capture_us/1000.0);
+    }
     json out = {{"blocks", json::array()}, {"share", json::array()}, {"heads", json::array()}, {"gates", json::array()}, {"fade", json::array()}};
     double a = 0, b = 0, c = 0, y = 0, sum = 0;
     for (size_t i = 0; i < gdn.size(); ++i) {

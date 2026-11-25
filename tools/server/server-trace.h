@@ -109,6 +109,7 @@ struct server_moe_trace {
     std::vector<gdn_layer> gdn;
     std::vector<bool> gdn_layers;
     std::vector<llama_pos> col_pos;
+    double gdn_capture_us = 0;        // device->host copy time of the gdn taps in the current batch (LLAMA_TRACE_GDN_TIMING=1)
     // once per model: norm weights from the loaded model, W_out dequantized from the GGUF files at model_path (the engine
     // repacks dense q8_0 weights in place on the GPU, so their bytes cannot be read back)
     bool gdn_prepare(const llama_model * model, const std::string & model_path, std::string & err);
