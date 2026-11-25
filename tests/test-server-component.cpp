@@ -1064,7 +1064,9 @@ static void test_gdn(testing & t) {
         for (int r = 0; r < D; ++r) { output[r] += ggml_fp16_to_fp32(matrix[r*W + j])*read[j]*factors[j]; }
     }
     std::vector<double> shares, heads;
-    server_trace_gdn_shares(S, H, N, D, v.data(), weights.data(), read.data(), factors.data(), matrix.data(), output.data(), shares, heads);
+    std::vector<float> g(W);
+    server_trace_gdn_project(W, D, matrix.data(), output.data(), g.data());
+    server_trace_gdn_shares(S, H, N, D, v.data(), weights.data(), read.data(), factors.data(), g.data(), output.data(), shares, heads);
     double total = 0;
     for (double x : shares) { total += x; }
     t.assert_true("gdn projected shares sum to one", std::abs(total - 1) < 1e-5);

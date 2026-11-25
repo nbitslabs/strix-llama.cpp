@@ -1263,6 +1263,7 @@ private:
     void destroy() {
         moe_trace.lens = {}; // release the host head before the model can be reloaded
         moe_trace.gdn.clear(); // attribution weights belong to this model
+        moe_trace.gdn_dev.reset(); // and so does the device copy of W_out^T
 
         spec.reset();
 

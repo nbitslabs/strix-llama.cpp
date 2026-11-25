@@ -33,9 +33,13 @@
 std::vector<float> server_trace_gdn_sweep(int s, int h, int kh, int n, const ggml_fp16_t * k, const float * beta, const float * a, const float * q);
 std::vector<float> server_trace_gdn_forward(int s, int h, int kh, int n, const ggml_fp16_t * k, const ggml_fp16_t * v, const float * beta, const float * a, const float * q);
 std::vector<float> server_trace_gdn_norm(int s, int h, const float * read, const float * norm, bool shared, const float * z, float eps);
-void server_trace_gdn_shares(int s, int h, int n, int out_dim, const ggml_fp16_t * v, const float * weights, const float * read, const float * factors, const ggml_fp16_t * out_weight, const float * output, std::vector<double> & shares, std::vector<double> & heads);
+// g = W_out^T O on the CPU from fp16 rows of W_out ([out_dim][width]); the server normally gets g from the device
+void server_trace_gdn_project(int width, int out_dim, const ggml_fp16_t * out_weight, const float * output, float * g);
+// block shares s_i = <W_out y_i, O>/|O|^2 through g = W_out^T O, and per-head shares <c_i, o_h>/|o_h|^2
+void server_trace_gdn_shares(int s, int h, int n, int out_dim, const ggml_fp16_t * v, const float * weights, const float * read, const float * factors, const float * g, const float * output, std::vector<double> & shares, std::vector<double> & heads);
 
 struct server_trace_head; // CPU copy of the output head for checkpoints, defined in server-trace.cpp
+struct server_trace_gdn_device; // W_out^T of every GDN block on the device for the per-token projection, defined in server-trace.cpp
 
 struct server_trace_lens_mix;
 
@@ -100,13 +104,14 @@ struct server_moe_trace {
         float eps = 0;
         bool over_cap = false;
         std::vector<float> norm;
-        std::vector<ggml_fp16_t> out_weight;
+        std::vector<ggml_fp16_t> out_weight; // fp16 rows of W_out; emptied once the device holds W_out^T (kept for the self-check)
         std::vector<ggml_fp16_t> k, v;
         std::vector<float> beta, a;
         std::vector<unsigned char> present;
         std::unordered_map<int32_t, std::vector<float>> q, read, z, y, output;
     };
     std::vector<gdn_layer> gdn;
+    std::shared_ptr<server_trace_gdn_device> gdn_dev; // nullptr = the projection runs on the CPU from out_weight
     std::vector<bool> gdn_layers;
     std::vector<llama_pos> col_pos;
     double gdn_capture_us = 0;        // device->host copy time of the gdn taps in the current batch (LLAMA_TRACE_GDN_TIMING=1)

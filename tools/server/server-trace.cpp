@@ -967,17 +967,23 @@ std::vector<float> server_trace_gdn_norm(int s, int h, const float * read, const
     return factors;
 }
 
-void server_trace_gdn_shares(int s, int h, int n, int out_dim, const ggml_fp16_t * v, const float * weights, const float * read, const float * factors, const ggml_fp16_t * out_weight, const float * output, std::vector<double> & shares, std::vector<double> & heads) {
-    const int width = s*h;
-    // g = W_out^T O: the one pass over the (fp16) projection weight per token; rows are converted in bulk, a scalar
-    // conversion per element was the hot spot (out_dim*width calls per block)
-    std::vector<float> g(width, 0), wrow(width), vrow(width);
-    double out_norm = 0;
+void server_trace_gdn_project(int width, int out_dim, const ggml_fp16_t * out_weight, const float * output, float * g) {
+    // one pass over the fp16 weight per token (rows converted in bulk; a scalar conversion per element was the hot spot)
+    std::vector<float> wrow(width);
+    std::fill(g, g + width, 0.0f);
     for (int row = 0; row < out_dim; ++row) {
-        out_norm += (double) output[row]*output[row];
         ggml_fp16_to_fp32_row(out_weight + (size_t) row*width, wrow.data(), width);
         const float o = output[row];
         for (int j = 0; j < width; ++j) { g[j] += wrow[j]*o; }
+    }
+}
+
+void server_trace_gdn_shares(int s, int h, int n, int out_dim, const ggml_fp16_t * v, const float * weights, const float * read, const float * factors, const float * g, const float * output, std::vector<double> & shares, std::vector<double> & heads) {
+    const int width = s*h;
+    std::vector<float> vrow(width);
+    double out_norm = 0;
+    for (int row = 0; row < out_dim; ++row) {
+        out_norm += (double) output[row]*output[row];
     }
     std::vector<double> read_norm(h, 0);
     for (int head = 0; head < h; ++head) {
@@ -1079,6 +1085,30 @@ struct trace_gguf_shards {
     }
 };
 
+// W_out^T of every GDN block as one f16 tensor on the model's device: the per-token projection g = W_out^T O is a
+// batched mat-vec there (36 x 31 MB read from device memory) instead of a 1.1 GB pass over host memory, which cost
+// ~50 ms per token on the CPU.
+struct server_trace_gdn_device {
+    ggml_context * ctx = nullptr;
+    ggml_backend_t backend = nullptr;
+    ggml_backend_buffer_t buffer = nullptr;
+    ggml_tensor * wt = nullptr;  // [out_dim, width, n_blocks] f16: wt[m, j, b] = W_out_b[row m][col j]
+    ggml_tensor * o  = nullptr;  // [out_dim, 1, n_blocks] f32
+    ggml_tensor * g  = nullptr;  // [width, 1, n_blocks] f32 = mul_mat(wt, o)
+    ggml_cgraph  * graph = nullptr;
+
+    ~server_trace_gdn_device() {
+        ggml_backend_buffer_free(buffer);
+        ggml_backend_free(backend);
+        ggml_free(ctx);
+    }
+};
+
+static bool trace_gdn_selfcheck() {
+    static const bool on = [] { const char * e = getenv("LLAMA_TRACE_GDN_SELFCHECK"); return e && strcmp(e, "1") == 0; }();
+    return on;
+}
+
 bool server_moe_trace::gdn_prepare(const llama_model * model, const std::string & model_path, std::string & err) {
     if (!gdn.empty()) { return true; }
     trace_gguf_shards files;
@@ -1143,6 +1173,46 @@ bool server_moe_trace::gdn_prepare(const llama_model * model, const std::string 
         prepared.push_back(std::move(l));
     }
     if (prepared.empty()) { err = "gdn: model has no recurrent blocks"; return false; }
+
+    // W_out^T onto the device that holds the model (same device as the first GDN block's ssm_out); the CPU path
+    // from out_weight stays as the fallback when the device cannot be used
+    auto D = std::make_shared<server_trace_gdn_device>();
+    const ggml_tensor * anchor = find("blk." + std::to_string(prepared[0].il) + ".ssm_out.weight");
+    ggml_backend_dev_t dev = anchor && anchor->buffer ? ggml_backend_buft_get_device(ggml_backend_buffer_get_type(anchor->buffer)) : nullptr;
+    if (dev && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+        D->backend = ggml_backend_dev_init(dev, nullptr);
+    }
+    const int64_t nb = (int64_t) prepared.size(), width = (int64_t) s*h, out_dim = prepared[0].out_dim;
+    if (D->backend) {
+        D->ctx = ggml_init({4*ggml_tensor_overhead() + ggml_graph_overhead_custom(8, false), nullptr, true});
+    }
+    if (D->ctx) {
+        D->wt = ggml_new_tensor_3d(D->ctx, GGML_TYPE_F16, out_dim, width, nb);
+        D->o  = ggml_new_tensor_3d(D->ctx, GGML_TYPE_F32, out_dim, 1, nb);
+        D->g  = ggml_mul_mat(D->ctx, D->wt, D->o);
+        D->graph = ggml_new_graph_custom(D->ctx, 8, false);
+        ggml_build_forward_expand(D->graph, D->g);
+        D->buffer = ggml_backend_alloc_ctx_tensors(D->ctx, D->backend);
+    }
+    if (D->buffer) {
+        std::vector<ggml_fp16_t> t((size_t) width*out_dim);
+        for (int64_t b = 0; b < nb; ++b) {
+            const auto & W = prepared[b].out_weight; // [out_dim][width]
+            for (int64_t m = 0; m < out_dim; ++m) {
+                for (int64_t j = 0; j < width; ++j) {
+                    t[(size_t) j*out_dim + m] = W[(size_t) m*width + j];
+                }
+            }
+            ggml_backend_tensor_set(D->wt, t.data(), (size_t) b*width*out_dim*sizeof(ggml_fp16_t), t.size()*sizeof(ggml_fp16_t));
+            if (!trace_gdn_selfcheck()) {
+                prepared[b].out_weight = {}; // the host copy is only needed for the self-check's W_out y
+            }
+        }
+        gdn_dev = std::move(D);
+        LOG_INF("gdn: W_out^T of %lld blocks on %s (%.0f MB)\n", (long long) nb, ggml_backend_name(gdn_dev->backend), (double) ggml_nbytes(gdn_dev->wt)/1e6);
+    } else {
+        LOG_WRN("gdn: device projection unavailable, W_out^T O runs on the CPU (slower)\n");
+    }
     gdn = std::move(prepared);
     return true;
 }
@@ -1211,20 +1281,43 @@ static double trace_gdn_error(const float * a, const float * b, int n) {
 }
 
 json server_moe_trace::gdn_json(int32_t col, int64_t n_pos, int32_t top_k) {
-    static const bool selfcheck = [] { const char * e = getenv("LLAMA_TRACE_GDN_SELFCHECK"); return e && strcmp(e, "1") == 0; }();
+    const bool selfcheck = trace_gdn_selfcheck();
     struct result { json share, heads, gates, fade; std::string note; double a = 0, b = 0, c = 0, y = 0, sum = 0; };
     std::vector<result> results(gdn.size());
-    auto compute = [&](size_t index) {
-        const auto & l = gdn[index];
-        auto & out = results[index];
+    auto ready = [&](const gdn_layer & l, std::string & note) {
         if (n_pos > gdn_max_pos || l.over_cap) {
-            out.note = "gdn skipped: n_pos " + std::to_string(n_pos) + " exceeds max_pos " + std::to_string(gdn_max_pos);
-            return;
+            note = "gdn skipped: n_pos " + std::to_string(n_pos) + " exceeds max_pos " + std::to_string(gdn_max_pos);
+            return false;
         }
         if (n_pos <= 0 || n_pos > (int64_t) l.present.size() ||
                 std::any_of(l.present.begin(), l.present.begin() + n_pos, [](unsigned char mask) { return mask != 15; }) ||
                 !l.q.count(col) || !l.read.count(col) || !l.z.count(col) || !l.y.count(col) || !l.output.count(col)) {
-            out.note = "gdn skipped: missing captured positions or current column";
+            note = "gdn skipped: missing captured positions or current column";
+            return false;
+        }
+        return true;
+    };
+    // g = W_out^T O for every block in one device mat-vec (zeros for blocks that are skipped)
+    std::vector<float> g_all;
+    if (gdn_dev) {
+        const int64_t width = gdn_dev->g->ne[0], out_dim = gdn_dev->o->ne[0];
+        std::vector<float> o_all((size_t) out_dim*gdn.size(), 0.0f);
+        for (size_t i = 0; i < gdn.size(); ++i) {
+            std::string note;
+            if (ready(gdn[i], note)) {
+                const auto & output = gdn[i].output.at(col);
+                std::copy(output.begin(), output.end(), o_all.begin() + (size_t) i*out_dim);
+            }
+        }
+        ggml_backend_tensor_set(gdn_dev->o, o_all.data(), 0, o_all.size()*sizeof(float));
+        ggml_backend_graph_compute(gdn_dev->backend, gdn_dev->graph);
+        g_all.resize((size_t) width*gdn.size());
+        ggml_backend_tensor_get(gdn_dev->g, g_all.data(), 0, g_all.size()*sizeof(float));
+    }
+    auto compute = [&](size_t index) {
+        const auto & l = gdn[index];
+        auto & out = results[index];
+        if (!ready(l, out.note)) {
             return;
         }
         const int n = (int) n_pos, width = l.s*l.h;
@@ -1232,8 +1325,17 @@ json server_moe_trace::gdn_json(int32_t col, int64_t n_pos, int32_t top_k) {
         const auto & output = l.output.at(col);
         const auto weights = server_trace_gdn_sweep(l.s, l.h, l.kh, n, l.k.data(), l.beta.data(), l.a.data(), l.q.at(col).data());
         const auto factors = server_trace_gdn_norm(l.s, l.h, read.data(), l.norm.data(), l.norm.size() == (size_t) l.s, l.z.at(col).data(), l.eps);
+        std::vector<float> g_cpu;
+        const float * g = nullptr;
+        if (gdn_dev) {
+            g = g_all.data() + (size_t) index*width;
+        } else {
+            g_cpu.resize(width);
+            server_trace_gdn_project(width, l.out_dim, l.out_weight.data(), output.data(), g_cpu.data());
+            g = g_cpu.data();
+        }
         std::vector<double> shares, heads;
-        server_trace_gdn_shares(l.s, l.h, n, l.out_dim, l.v.data(), weights.data(), read.data(), factors.data(), l.out_weight.data(), output.data(), shares, heads);
+        server_trace_gdn_shares(l.s, l.h, n, l.out_dim, l.v.data(), weights.data(), read.data(), factors.data(), g, output.data(), shares, heads);
         out.sum = std::abs(std::accumulate(shares.begin(), shares.end(), 0.0) - 1.0);
         out.share = json::array(); out.heads = json::array(); out.gates = json::array(); out.fade = json::array();
         for (double share : shares) { out.share.push_back(trace_gdn_round(share)); }
@@ -1261,10 +1363,12 @@ json server_moe_trace::gdn_json(int32_t col, int64_t n_pos, int32_t top_k) {
                 out.b = std::max(out.b, trace_gdn_error(forward.data() + head*l.s, read.data() + head*l.s, l.s));
             }
             for (int j = 0; j < width; ++j) { y[j] = read[j]*factors[j]; }
-            for (int r = 0; r < l.out_dim; ++r) {
-                for (int j = 0; j < width; ++j) { projected[r] += ggml_fp16_to_fp32(l.out_weight[r*width + j])*y[j]; }
+            if (!l.out_weight.empty()) {
+                for (int r = 0; r < l.out_dim; ++r) {
+                    for (int j = 0; j < width; ++j) { projected[r] += ggml_fp16_to_fp32(l.out_weight[r*width + j])*y[j]; }
+                }
+                out.c = trace_gdn_error(projected.data(), output.data(), l.out_dim);
             }
-            out.c = trace_gdn_error(projected.data(), output.data(), l.out_dim);
             out.y = trace_gdn_error(y.data(), l.y.at(col).data(), width);
         }
     };
