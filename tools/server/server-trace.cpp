@@ -56,6 +56,8 @@ static bool trace_match_layer(const char * name, const char * prefix, int32_t & 
     return true;
 }
 
+static bool trace_gdn_selfcheck(); // LLAMA_TRACE_GDN_SELFCHECK=1, defined with the gdn code below
+
 static int trace_classify(const char * name, int32_t & il) {
     const char * names[] = {"q_conv_predelta", "k_conv_predelta", "v_conv_predelta", "beta_sigmoid", "gate", "z", "attn_output", "final_output", "linear_attn_out"};
     const char * copies[] = {"q_conv_trace", "k_conv_trace", "v_conv_trace", "beta_trace", "gate_trace", "z_trace", "attn_output_trace", "final_output_trace", "linear_attn_out_trace"};
@@ -166,7 +168,8 @@ bool server_moe_trace::eval_cb(struct ggml_tensor * t, bool ask, void * user_dat
         wanted = (self->want_block_update || ((self->want_attention || self->want_gdn) && il == 0)) && il >= 0 && il <= self->n_layer &&
                  (self->resid_wanted.empty() || self->resid_wanted[il]);
     } else if (kind >= TRACE_KIND_GDN_Q && kind <= TRACE_KIND_GDN_OUT) {
-        wanted = self->want_gdn && il >= 0 && il < (int32_t) self->gdn_layers.size() && self->gdn_layers[il];
+        wanted = self->want_gdn && il >= 0 && il < (int32_t) self->gdn_layers.size() && self->gdn_layers[il] &&
+                 (kind != TRACE_KIND_GDN_Y || trace_gdn_selfcheck()); // the normed output is only compared in the self-check
     } else if (kind == TRACE_KIND_ATTENTION) {
         wanted = self->want_attention && il >= 0 && il < self->n_layer;
     } else if (kind == TRACE_KIND_HEADIN) {
@@ -1267,11 +1270,11 @@ void server_moe_trace::capture_gdn(ggml_tensor * t, int kind, int32_t il) {
     }
 }
 
+// shares, gates and fades are O(1): six decimals keep the JSON short (a printf/strtod round trip per number cost
+// ~10 ms per token over the ~36k numbers of an entry)
 static double trace_gdn_round(double x) {
-    if (!std::isfinite(x) || x == 0) { return 0; }
-    char text[32];
-    snprintf(text, sizeof(text), "%.6g", x);
-    return strtod(text, nullptr);
+    if (!std::isfinite(x)) { return 0; }
+    return std::round(x*1e6)/1e6;
 }
 
 static double trace_gdn_error(const float * a, const float * b, int n) {
@@ -1291,7 +1294,7 @@ json server_moe_trace::gdn_json(int32_t col, int64_t n_pos, int32_t top_k) {
         }
         if (n_pos <= 0 || n_pos > (int64_t) l.present.size() ||
                 std::any_of(l.present.begin(), l.present.begin() + n_pos, [](unsigned char mask) { return mask != 15; }) ||
-                !l.q.count(col) || !l.read.count(col) || !l.z.count(col) || !l.y.count(col) || !l.output.count(col)) {
+                !l.q.count(col) || !l.read.count(col) || !l.z.count(col) || (selfcheck && !l.y.count(col)) || !l.output.count(col)) {
             note = "gdn skipped: missing captured positions or current column";
             return false;
         }
