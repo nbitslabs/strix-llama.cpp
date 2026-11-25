@@ -4,6 +4,9 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
+#include "gguf.h"
+
+#include <cstdio>
 
 #include <algorithm>
 #include <numeric>
@@ -989,8 +992,85 @@ void server_trace_gdn_shares(int s, int h, int n, int out_dim, const ggml_fp16_t
     }
 }
 
-bool server_moe_trace::gdn_prepare(const llama_model * model, std::string & err) {
+// The GGUF shards of the loaded model, metadata only. The engine repacks dense q8_0 weights in place on the GPU (MMB
+// "dense R2"), and reading such a tensor back aborts, so the GDN attribution takes W_out from the files: same bytes the
+// engine loaded, dequantized once on the CPU.
+struct trace_gguf_shards {
+    struct shard { std::string path; gguf_context * meta = nullptr; };
+    std::vector<shard> shards;
+
+    ~trace_gguf_shards() {
+        for (auto & s : shards) {
+            if (s.meta) { gguf_free(s.meta); }
+        }
+    }
+
+    bool open(const std::string & model_path, std::string & err) {
+        gguf_init_params p = { /*.no_alloc =*/ true, /*.ctx =*/ nullptr };
+        gguf_context * first = gguf_init_from_file(model_path.c_str(), p);
+        if (!first) { err = "gdn: cannot read the model file " + model_path; return false; }
+        shards.push_back({model_path, first});
+        int split_count = 1, split_no = 0;
+        if (int64_t k = gguf_find_key(first, "split.count"); k >= 0) { split_count = gguf_get_val_u16(first, k); }
+        if (int64_t k = gguf_find_key(first, "split.no"); k >= 0) { split_no = gguf_get_val_u16(first, k); }
+        if (split_count <= 1) { return true; }
+        char prefix[4096], path[4096];
+        if (!llama_split_prefix(prefix, sizeof(prefix), model_path.c_str(), split_no, split_count)) {
+            err = "gdn: cannot derive the shard names of " + model_path;
+            return false;
+        }
+        for (int i = 0; i < split_count; ++i) {
+            if (i == split_no) { continue; }
+            llama_split_path(path, sizeof(path), prefix, i, split_count);
+            gguf_context * g = gguf_init_from_file(path, p);
+            if (!g) { err = std::string("gdn: cannot read the model shard ") + path; return false; }
+            shards.push_back({path, g});
+        }
+        return true;
+    }
+
+    // the named [ne0, ne1] tensor as fp16 rows, scaled; dequantized through the on-disk type's traits
+    bool read_f16(const std::string & name, int64_t ne0, int64_t ne1, float scale, std::vector<ggml_fp16_t> & out, std::string & err) {
+        for (auto & s : shards) {
+            const int64_t id = gguf_find_tensor(s.meta, name.c_str());
+            if (id < 0) { continue; }
+            const ggml_type type = gguf_get_tensor_type(s.meta, id);
+            const auto * tt = ggml_get_type_traits(type);
+            const size_t row_size = ggml_row_size(type, ne0);
+            if (gguf_get_tensor_size(s.meta, id) != row_size*ne1 || (type != GGML_TYPE_F32 && tt->to_float == nullptr)) {
+                err = "gdn: " + name + " has an unexpected shape or type in " + s.path;
+                return false;
+            }
+            std::vector<uint8_t> buf(row_size*ne1);
+            FILE * f = fopen(s.path.c_str(), "rb");
+            const size_t off = gguf_get_data_offset(s.meta) + gguf_get_tensor_offset(s.meta, id);
+            const bool ok = f && fseeko(f, (off_t) off, SEEK_SET) == 0 && fread(buf.data(), 1, buf.size(), f) == buf.size();
+            if (f) { fclose(f); }
+            if (!ok) { err = "gdn: cannot read " + name + " from " + s.path; return false; }
+            out.resize(ne0*ne1);
+            std::vector<float> row(ne0);
+            for (int64_t r = 0; r < ne1; ++r) {
+                if (type == GGML_TYPE_F32) {
+                    memcpy(row.data(), buf.data() + r*row_size, ne0*sizeof(float));
+                } else {
+                    tt->to_float(buf.data() + r*row_size, row.data(), ne0);
+                }
+                if (scale != 1.0f) {
+                    for (float & x : row) { x *= scale; }
+                }
+                ggml_fp32_to_fp16_row(row.data(), out.data() + r*ne0, ne0);
+            }
+            return true;
+        }
+        err = "gdn: " + name + " is not in the model files";
+        return false;
+    }
+};
+
+bool server_moe_trace::gdn_prepare(const llama_model * model, const std::string & model_path, std::string & err) {
     if (!gdn.empty()) { return true; }
+    trace_gguf_shards files;
+    if (!files.open(model_path, err)) { return false; }
     char arch[128] = {}, text[128] = {};
     llama_model_meta_val_str(model, "general.architecture", arch, sizeof(arch));
     if (strcmp(arch, "qwen4exp") != 0) {
@@ -1045,15 +1125,8 @@ bool server_moe_trace::gdn_prepare(const llama_model * model, std::string & err)
             }
             out_scale = scalar[0];
         }
-        l.out_weight.resize((size_t) s*h*l.out_dim);
-        std::vector<float> row;
-        for (int r = 0; r < l.out_dim; ++r) {
-            if (!trace_tensor_f32(out, r, 1, row)) {
-                err = "gdn: output weight cannot be dequantized at block " + std::to_string(il);
-                return false;
-            }
-            for (float & x : row) { x *= out_scale; }
-            ggml_fp32_to_fp16_row(row.data(), l.out_weight.data() + (size_t) r*s*h, s*h);
+        if (!files.read_f16(prefix + ".ssm_out.weight", s*h, l.out_dim, out_scale, l.out_weight, err)) {
+            return false;
         }
         prepared.push_back(std::move(l));
     }

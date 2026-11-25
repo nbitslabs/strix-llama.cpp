@@ -2200,7 +2200,7 @@ private:
                     return false;
                 }
                 std::string err;
-                if (!moe_trace.gdn_prepare(model_tgt, err)) {
+                if (!moe_trace.gdn_prepare(model_tgt, params_base.model.path, err)) {
                     send_error(task, err, ERROR_TYPE_NOT_SUPPORTED);
                     return false;
                 }
